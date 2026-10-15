@@ -1,6 +1,6 @@
 # Taphonomy
 
-[![CI](https://github.com/bilalmughal1/taphonomy/actions/workflows/ci.yml/badge.svg)](https://github.com/bilalmughal1/taphonomy/actions/workflows/ci.yml)
+[![CI](https://github.com/fahadbilalsaleem/taphonomy/actions/workflows/ci.yml/badge.svg)](https://github.com/fahadbilalsaleem/taphonomy/actions/workflows/ci.yml)
 
 Taphonomy recovers deleted files, and files whose directories were lost to
 a quick format, from FAT32 disk images. It opens evidence read-only, reports
@@ -72,7 +72,7 @@ tools:
 
 ```sh
 sudo apt install fdisk gdisk dosfstools mtools xz-utils
-git clone https://github.com/bilalmughal1/taphonomy
+git clone https://github.com/fahadbilalsaleem/taphonomy
 cd taphonomy
 cargo build --release
 ./scripts/generate-fixtures.sh

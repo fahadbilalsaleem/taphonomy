@@ -4,7 +4,7 @@
 **Status:** Active development; M12 complete
 **Version:** 0.1.0
 **Owner:** Fahad Bilal Saleem
-**Repository:** <https://github.com/bilalmughal1/taphonomy>
+**Repository:** <https://github.com/fahadbilalsaleem/taphonomy>
 **Primary Environment:** Linux via WSL2 on Windows
 **Development Model:** Local-first, evidence-preserving, test-driven
 
