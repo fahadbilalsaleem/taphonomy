@@ -977,7 +977,7 @@ fn le_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::evidence::tests::MemoryImage;
 
@@ -985,7 +985,7 @@ mod tests {
     const VOLUME_LENGTH: u64 = 30_592;
     const START_LBA: u32 = 128;
 
-    fn extent() -> VolumeExtent {
+    pub(crate) fn extent() -> VolumeExtent {
         VolumeExtent {
             start_lba: START_LBA,
             sector_count: VOLUME_LENGTH as u32,
@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     /// A valid region for the synthetic volume, sealed.
-    fn valid() -> Vec<u8> {
+    pub(crate) fn valid() -> Vec<u8> {
         let mut r = vec![0u8; 12 * 512];
         r[OFF_JUMP..OFF_JUMP + 3].copy_from_slice(&JUMP_BOOT);
         r[OFF_FILE_SYSTEM_NAME..OFF_FILE_SYSTEM_NAME + 8].copy_from_slice(&FILE_SYSTEM_NAME);
@@ -1436,7 +1436,7 @@ mod tests {
     /// A valid region with 4,096-byte sectors that fills the same partition:
     /// 3,824 of them are 15,663,104 bytes, the partition's length in bytes,
     /// though the count differs from 30,592.
-    fn valid_4096() -> Vec<u8> {
+    pub(crate) fn valid_4096() -> Vec<u8> {
         let mut r = vec![0u8; 12 * 4096];
         r[..512].copy_from_slice(&valid()[..512]);
         r[OFF_BYTES_PER_SECTOR_SHIFT] = 12;
@@ -1651,7 +1651,7 @@ mod tests {
 
     /// An image holding each `(offset, bytes)` pair, the offset counted from
     /// the volume's start.
-    fn image_with_regions(regions: &[(u64, &[u8])]) -> MemoryImage {
+    pub(crate) fn image_with_regions(regions: &[(u64, &[u8])]) -> MemoryImage {
         let start = START_LBA as u64 * 512;
         let mut image = MemoryImage::new(start + VOLUME_LENGTH * 512);
         for (offset, bytes) in regions {
@@ -1762,12 +1762,17 @@ mod tests {
         ));
     }
 
+    /// A valid region that declares two FATs: a TexFAT volume, sealed.
+    pub(crate) fn texfat() -> Vec<u8> {
+        let mut r = valid();
+        r[OFF_NUMBER_OF_FATS] = 2;
+        seal(&mut r);
+        r
+    }
+
     #[test]
     fn a_texfat_candidate_found_by_search_is_texfat() {
-        let mut backup = valid();
-        backup[OFF_NUMBER_OF_FATS] = 2;
-        seal(&mut backup);
-        let mut image = image_with_backup_at(&[0u8; 12 * 512], &backup, 9);
+        let mut image = image_with_backup_at(&[0u8; 12 * 512], &texfat(), 9);
 
         assert!(matches!(
             parse_boot_region(&mut image, extent()),

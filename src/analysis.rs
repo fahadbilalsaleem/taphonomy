@@ -21,6 +21,10 @@ use std::path::Path;
 
 use crate::Error;
 use crate::evidence::EvidenceReader;
+use crate::exfat_boot::{BootRegion, ExFatBootFailure, ExFatBootSector};
+use crate::exfat_directory::{
+    DirectorySummary, ExFatBitmapEntry, ExFatDirectoryError, ExFatFile, ExFatPosition, SetRefusal,
+};
 use crate::fat_directory::{
     DeletedDirectory, DeletedDirectoryRefusal, DeletedKind, Directory, DirectoryError, Entry,
     EntryKind, FirstByte, associate, begins_directory, enumerate_deleted_directory,
@@ -32,11 +36,16 @@ use crate::fat_recovery::{
 };
 use crate::fat32::{Fat32BootSector, Fat32Error, parse_boot_sector};
 use crate::filesystem::{
-    Filesystem, Identification, VBR_SIZE, VolumeExtent, declared_type_matches, identify,
+    Filesystem, Identification, UnknownReason, VBR_SIZE, VolumeExtent, declared_type_matches,
+    identify,
 };
 use crate::hash::Sha256Digest;
 use crate::partition::{Anomaly, MbrPartition, ParseError, PartitionTable, SECTOR_SIZE, parse_mbr};
 use crate::validation::{Outcome, Validation, validate};
+
+pub mod exfat;
+
+use exfat::{ExFatNotRead, ExFatReached};
 
 /// What the operator asked for.
 ///
@@ -167,6 +176,17 @@ pub enum Event<'a> {
         type_match: Option<bool>,
     },
 
+    /// A partition whose first sector identified nothing, identified as
+    /// exFAT from its backup boot region.
+    ///
+    /// Recorded in place of [`Event::PartitionIdentified`], and followed by
+    /// the volume's analysis, or by why the region found is not analysed.
+    /// `sector_zero` is why the volume's first sector identified nothing.
+    ExFatIdentifiedFromBackup {
+        partition: &'a MbrPartition,
+        sector_zero: &'a UnknownReason,
+    },
+
     /// A FAT32 volume's boot sector was refused.
     BootSectorRejected(&'a Fat32Error),
 
@@ -268,6 +288,78 @@ pub enum Event<'a> {
         entry: &'a Entry,
         error: &'a RecoveryError,
     },
+
+    /// An exFAT volume's validated boot region, and which region it came
+    /// from. `ADR-0019` section 3.
+    ExFatBootRegion(&'a ExFatBootSector),
+
+    /// An exFAT volume's boot regions were refused, or a valid backup was
+    /// found at more than one sector size.
+    ExFatBootRejected(&'a ExFatBootFailure),
+
+    /// A valid exFAT boot region declaring two FATs: TexFAT, which is
+    /// identified and not analysed. The region it was read from.
+    ExFatTexFat(BootRegion),
+
+    /// An exFAT volume's root directory could not be read, wholly or in part.
+    ExFatRootDirectoryUnread(&'a ExFatDirectoryError),
+
+    /// An exFAT directory is about to be read. Its entries follow, one event
+    /// each, then [`Event::ExFatDirectoryEnd`] or
+    /// [`Event::ExFatRootDirectoryUnread`] or [`Event::ExFatDirectoryNotRead`].
+    ExFatDirectoryStart { reached: ExFatReached<'a> },
+
+    /// A live file or directory in an exFAT directory. The name is UTF-16
+    /// code units as stored.
+    ExFatEntry {
+        position: ExFatPosition,
+        file: &'a ExFatFile,
+    },
+
+    /// An exFAT volume's label, as UTF-16 code units.
+    ExFatVolumeLabel {
+        position: ExFatPosition,
+        label: &'a [u16],
+    },
+
+    /// An exFAT volume's allocation bitmap entry. Its contents are not read.
+    ExFatBitmap {
+        position: ExFatPosition,
+        bitmap: &'a ExFatBitmapEntry,
+    },
+
+    /// An exFAT entry or entry set that was not used, and why. Counted as a
+    /// gap.
+    ExFatSetRefused {
+        position: ExFatPosition,
+        refusal: &'a SetRefusal,
+    },
+
+    /// An exFAT directory was read to its end.
+    ExFatDirectoryEnd {
+        reached: ExFatReached<'a>,
+        summary: &'a DirectorySummary,
+    },
+
+    /// A named exFAT directory whose contents were not read, wholly or in
+    /// part. Anything printed since its [`Event::ExFatDirectoryStart`] was
+    /// read before the failure.
+    ExFatDirectoryNotRead {
+        reached: ExFatReached<'a>,
+        reason: ExFatNotRead<'a>,
+    },
+
+    /// The volume held more directory clusters than the cap allows reading.
+    /// `directories_unread` directories were counted and not read.
+    ExFatDirectoryCapReached { cap: u32, directories_unread: usize },
+
+    /// More exFAT directories were named than the queue may hold. The
+    /// `directories_unread` that would have exceeded `bound` were counted as
+    /// not read and never queued.
+    ExFatQueueBoundReached {
+        bound: usize,
+        directories_unread: usize,
+    },
 }
 
 /// Receives the events of one run, in the order they happened.
@@ -287,6 +379,11 @@ pub trait Sink {
 /// reported under its full path would otherwise grow quadratically. The
 /// Sleuth Kit's directory walk uses the same number. A DCF card nests two.
 pub const MAX_DEPTH: usize = 128;
+
+/// The MBR partition type NTFS and exFAT both use. `ADR-0019` section 3: the
+/// only declared type for which a partition nothing identified is tried as
+/// exFAT.
+const EXFAT_OR_NTFS_TYPE: u8 = 0x07;
 
 /// A directory named by an entry and not yet read.
 struct Pending {
@@ -337,13 +434,15 @@ pub struct RunCounts {
     /// A partition holding no filesystem this tool could identify.
     unidentified: usize,
 
-    /// A partition whose filesystem was identified and is not FAT32.
+    /// A partition whose filesystem was identified and is neither FAT32 nor
+    /// exFAT, or is TexFAT, which is exFAT with two FATs.
     unsupported: usize,
 
-    /// A FAT32 volume whose boot sector was refused.
+    /// A FAT32 or exFAT volume whose boot sector or boot regions were
+    /// refused.
     boot_rejected: usize,
 
-    /// A FAT32 volume whose root directory could not be enumerated.
+    /// A FAT32 or exFAT volume whose root directory could not be enumerated.
     root_unread: usize,
 
     /// A directory that was named and whose contents were not read.
@@ -393,6 +492,21 @@ pub struct RunCounts {
 
     /// A deleted entry whose run would pass the last data cluster.
     run_out_of_range: usize,
+
+    /// An exFAT entry or entry set that was not used: its checksum was
+    /// wrong, it was malformed, or it was not recognised. `ADR-0019`
+    /// Decision C.
+    exfat_sets_refused: usize,
+
+    /// An unused exFAT File entry: a deleted entry set, which this tool does
+    /// not examine. One per set, so a run cannot report an exFAT volume
+    /// completely analysed while skipping them. `SAFETY.md` section 12.
+    exfat_deleted_sets_not_examined: usize,
+
+    /// An exFAT directory with entries of a type other than zero after its
+    /// end marker, which the specification says it does not have. One per
+    /// directory. The entries are counted and not interpreted.
+    exfat_end_marker_residue: usize,
 }
 
 impl RunCounts {
@@ -507,6 +621,21 @@ impl RunCounts {
         self.free_runs
     }
 
+    /// An exFAT entry or entry set that was not used.
+    pub const fn exfat_sets_refused(&self) -> usize {
+        self.exfat_sets_refused
+    }
+
+    /// An unused exFAT File entry, a deleted set this tool did not examine.
+    pub const fn exfat_deleted_sets_not_examined(&self) -> usize {
+        self.exfat_deleted_sets_not_examined
+    }
+
+    /// An exFAT directory holding entries after its end marker.
+    pub const fn exfat_end_marker_residue(&self) -> usize {
+        self.exfat_end_marker_residue
+    }
+
     /// Everything the run did not analyse, counted once per occurrence.
     ///
     /// The eleven kinds `ADR-0014` Appendix B.4 enumerates, the twelfth
@@ -531,6 +660,9 @@ impl RunCounts {
             + self.directories_unread
             + self.listings_may_continue
             + self.orphan_search_stopped
+            + self.exfat_sets_refused
+            + self.exfat_deleted_sets_not_examined
+            + self.exfat_end_marker_residue
     }
 
     /// How much of the evidence the run covered.
@@ -712,6 +844,24 @@ fn report_partition<R: EvidenceReader>(
     }
 
     let id = identify(&vbr);
+    let extent = VolumeExtent {
+        start_lba: p.start_lba,
+        sector_count: p.sector_count,
+    };
+
+    // `ADR-0019` section 3. An exFAT volume keeps a second copy of its boot
+    // region, so a damaged first sector can hide one. Only a partition the
+    // table declares as 0x07, which NTFS also uses, is tried, and a real
+    // NTFS volume never gets here because its first sector identifies it.
+    // It is tried before the partition's heading is recorded, because what
+    // it finds decides what the heading says.
+    if let Identification::Unknown { reason } = &id
+        && p.partition_type == EXFAT_OR_NTFS_TYPE
+        && exfat::report_unidentified_0x07(evidence, p, reason, extent, counts, sink)
+    {
+        return;
+    }
+
     let type_match = id
         .filesystem()
         .and_then(|filesystem| declared_type_matches(p.partition_type, filesystem));
@@ -727,6 +877,10 @@ fn report_partition<R: EvidenceReader>(
     // same finding as one nothing could identify.
     match id.filesystem() {
         Some(Filesystem::Fat32) => {}
+        Some(Filesystem::ExFat) => {
+            exfat::report_identified(evidence, p, extent, counts, sink);
+            return;
+        }
         Some(_) => {
             counts.unsupported += 1;
             return;
@@ -736,11 +890,6 @@ fn report_partition<R: EvidenceReader>(
             return;
         }
     }
-
-    let extent = VolumeExtent {
-        start_lba: p.start_lba,
-        sector_count: p.sector_count,
-    };
 
     match parse_boot_sector(&vbr, extent) {
         Ok(boot) => {

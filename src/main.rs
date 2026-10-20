@@ -18,10 +18,13 @@ use std::process::ExitCode;
 
 use taphonomy::EvidenceFile;
 use taphonomy::Sha256Digest;
+use taphonomy::analysis::exfat::{ExFatNotRead, ExFatReached};
 use taphonomy::analysis::{
     Coverage, DirectoryPart, Event, MAX_DEPTH, NotReadReason, Options, Reached, RunCounts, Sink,
 };
 use taphonomy::confidence::Confidence;
+use taphonomy::exfat_boot::{BootRegion, ExFatBootSector};
+use taphonomy::exfat_directory::{ExFatPosition, escaped_name};
 use taphonomy::fat_directory::{
     DeletedKind, Directory, Entry, EntryKind, FirstByte, associate, recovered_name,
 };
@@ -326,6 +329,16 @@ impl Sink for StdoutSink {
                 identification,
                 type_match,
             } => print_partition_identified(partition, identification, type_match),
+            Event::ExFatIdentifiedFromBackup {
+                partition,
+                sector_zero,
+            } => {
+                println!(
+                    "partition {}   filesystem exFAT, identified from its backup boot region",
+                    partition.index
+                );
+                println!("    sector 0             {sector_zero}");
+            }
             Event::BootSectorRejected(error) => println!("    BOOT SECTOR REJECTED: {error}"),
             Event::BootSector(boot) => print_boot_sector(boot),
             Event::RootDirectoryUnread(error) => {
@@ -453,7 +466,179 @@ impl Sink for StdoutSink {
             } => {
                 println!("        {:<9} NOT EXTRACTED: {error}", "");
             }
+            Event::ExFatBootRegion(boot) => print_exfat_boot_region(boot),
+            Event::ExFatBootRejected(failure) => {
+                println!("    BOOT REGION REJECTED: {failure}");
+            }
+            Event::ExFatTexFat(region) => {
+                println!(
+                    "    TexFAT: two FATs in the {} boot region, not supported",
+                    exfat_region_name(region)
+                );
+            }
+            Event::ExFatRootDirectoryUnread(error) => {
+                println!("    ROOT DIRECTORY NOT ENUMERATED: {error}");
+            }
+            Event::ExFatDirectoryStart { reached } => {
+                println!("    {}", exfat_heading(reached));
+            }
+            Event::ExFatEntry { position, file } => {
+                let name = escaped_name(&file.name);
+                let place = exfat_position(position);
+                if file.is_directory() {
+                    println!(
+                        "      {place} {:<13} {name:<13} cluster {}",
+                        "directory", file.first_cluster
+                    );
+                } else {
+                    let valid = if file.valid_data_length == file.data_length {
+                        String::new()
+                    } else {
+                        format!(", {} valid", file.valid_data_length)
+                    };
+                    println!(
+                        "      {place} {:<13} {name:<13} {} bytes{valid}, cluster {}",
+                        "file", file.data_length, file.first_cluster
+                    );
+                }
+            }
+            Event::ExFatVolumeLabel { position, label } => println!(
+                "      {} {:<13} {}",
+                exfat_position(position),
+                "volume label",
+                escaped_name(label)
+            ),
+            Event::ExFatBitmap { position, bitmap } => println!(
+                "      {} {:<13} cluster {}, {} bytes",
+                exfat_position(position),
+                "bitmap",
+                bitmap.first_cluster,
+                bitmap.data_length
+            ),
+            Event::ExFatSetRefused { position, refusal } => println!(
+                "      {} {:<13} {refusal}",
+                exfat_position(position),
+                "not used"
+            ),
+            Event::ExFatDirectoryEnd { summary, .. } => {
+                println!(
+                    "      entries            {}, {} files, {} directories",
+                    summary.entries_read, summary.files, summary.directories
+                );
+                if summary.unused_file_sets > 0 {
+                    println!(
+                        "      deleted entry sets {}, not examined",
+                        summary.unused_file_sets
+                    );
+                }
+                if summary.entries_after_end_marker > 0 {
+                    println!(
+                        "      entries after end marker {}, not read",
+                        summary.entries_after_end_marker
+                    );
+                }
+            }
+            Event::ExFatDirectoryNotRead { reached, reason } => {
+                println!("    {}", exfat_heading(reached));
+                match reason {
+                    ExFatNotRead::TooDeep => {
+                        println!("      NOT READ: deeper than {MAX_DEPTH} levels below the root");
+                    }
+                    ExFatNotRead::Error(error) => println!("      NOT READ: {error}"),
+                }
+            }
+            Event::ExFatDirectoryCapReached {
+                cap,
+                directories_unread,
+            } => println!(
+                "    {directories_unread} {} not read: the volume has more than {cap} directory clusters",
+                directories(directories_unread)
+            ),
+            Event::ExFatQueueBoundReached {
+                bound,
+                directories_unread,
+            } => println!(
+                "    {directories_unread} {} not read: more than {bound} were waiting to be read",
+                directories(directories_unread)
+            ),
         }
+    }
+}
+
+/// The heading an exFAT directory is reported under.
+///
+/// The path is built from names that are UTF-16 in the evidence, escaped as
+/// everywhere else, and never joined with anything but a slash the escape
+/// leaves no way to forge.
+fn exfat_heading(reached: ExFatReached<'_>) -> String {
+    match reached {
+        ExFatReached::Root => "root directory".to_string(),
+        ExFatReached::Walked { components } => {
+            let mut path = String::new();
+            for name in components {
+                path.push('/');
+                path.push_str(&escaped_name(name));
+            }
+            format!("directory {path}")
+        }
+    }
+}
+
+fn exfat_region_name(region: BootRegion) -> &'static str {
+    match region {
+        BootRegion::Main => "main",
+        BootRegion::Backup => "backup",
+    }
+}
+
+/// Prints an exFAT volume's boot region, in the lines FAT32's boot sector
+/// has where the meaning is the same.
+fn print_exfat_boot_region(boot: &ExFatBootSector) {
+    let found = if boot.located_by_search {
+        ", found by trying each sector size"
+    } else {
+        ""
+    };
+    println!(
+        "    boot region          {}{found}",
+        exfat_region_name(boot.region)
+    );
+    println!("    bytes per sector     {}", boot.bytes_per_sector());
+    println!(
+        "    sectors per cluster  {}",
+        1u32 << boot.sectors_per_cluster_shift
+    );
+    println!("    cluster count        {}", boot.cluster_count);
+    println!("    first data sector    {}", boot.cluster_heap_offset);
+    println!("    root cluster         {}", boot.root_cluster);
+    println!("    volume id            {:#010x}", boot.volume_serial);
+
+    if !boot.observations.is_empty() {
+        println!("    boot region observations");
+        for o in &boot.observations {
+            println!("      {o}");
+        }
+    }
+}
+
+/// The width of the position column on an exFAT entry line: that of
+/// `c4294967295 s1048575`, the largest cluster number and the last slot of
+/// a 32 MiB cluster, which holds 1,048,576 entries. No position a volume
+/// can hold is wider, so every entry keeps one line and its columns.
+const EXFAT_POSITION_WIDTH: usize = 20;
+
+/// The `c{cluster} s{slot}` position column of an exFAT entry line.
+fn exfat_position(position: ExFatPosition) -> String {
+    let place = format!("c{} s{}", position.cluster, position.slot);
+    format!("{place:<EXFAT_POSITION_WIDTH$}")
+}
+
+/// The noun for a count of directories.
+fn directories(count: usize) -> &'static str {
+    if count == 1 {
+        "directory"
+    } else {
+        "directories"
     }
 }
 
@@ -679,6 +864,15 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     print_gap("directories not read", counts.directories_unread());
     print_gap("listings that may continue", counts.listings_may_continue());
     print_gap("orphan searches stopped", counts.orphan_search_stopped());
+    print_gap("entry sets not used", counts.exfat_sets_refused());
+    print_gap(
+        "deleted sets not examined",
+        counts.exfat_deleted_sets_not_examined(),
+    );
+    print_gap(
+        "entries after end marker",
+        counts.exfat_end_marker_residue(),
+    );
 
     // Only `--recover` produces an artifact, so without it the line would
     // report a zero that the invocation already determined.
@@ -914,5 +1108,49 @@ fn first_byte_detail(first: Option<FirstByte>, surviving: &[u8; 10]) -> String {
         // Unreachable: this arm is only reached for a deleted short entry,
         // which is exactly when `associate` answers.
         None => "first byte destroyed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FITS: ExFatPosition = ExFatPosition {
+        cluster: 5,
+        slot: 0,
+    };
+
+    /// The largest cluster number, and the last slot of a 32 MiB cluster.
+    const WIDEST: ExFatPosition = ExFatPosition {
+        cluster: u32::MAX,
+        slot: 1_048_575,
+    };
+
+    #[test]
+    fn a_short_exfat_position_is_padded_to_the_column() {
+        assert_eq!(exfat_position(FITS), format!("c5 s0{}", " ".repeat(15)));
+    }
+
+    #[test]
+    fn the_widest_exfat_position_fills_the_column_exactly() {
+        assert_eq!(exfat_position(WIDEST), "c4294967295 s1048575");
+    }
+
+    /// The widest position a volume can hold stays on its entry's line, and
+    /// the columns after it begin where every other line has them.
+    #[test]
+    fn the_widest_exfat_position_keeps_one_line_and_the_columns() {
+        let widest = format!("      {} {:<13} x", exfat_position(WIDEST), "file");
+        let short = format!("      {} {:<13} x", exfat_position(FITS), "file");
+
+        assert_eq!(widest.lines().count(), 1);
+        assert_eq!(widest.find("file"), short.find("file"));
+    }
+
+    #[test]
+    fn one_directory_is_singular() {
+        assert_eq!(directories(1), "directory");
+        assert_eq!(directories(0), "directories");
+        assert_eq!(directories(2), "directories");
     }
 }
