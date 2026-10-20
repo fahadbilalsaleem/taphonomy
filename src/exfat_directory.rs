@@ -1,5 +1,5 @@
 //! exFAT directories: following a directory's clusters, and reading the
-//! entry sets in them.
+//! entry sets in them; and reading a live file's content.
 //!
 //! ADR-0019 section 3. The root directory is always a FAT chain
 //! (specification section 3.1.10); every other directory follows its entry's
@@ -29,6 +29,15 @@
 //! examined in this milestone: an unused File entry is counted, and nothing
 //! in its secondaries is interpreted. The allocation bitmap's entry is
 //! located and range checked, and its contents are not read.
+//!
+//! # Content
+//!
+//! [`ExFatReader::read_content`] reads a live file's data: a contiguous run
+//! where `NoFatChain` is set, otherwise the chain, which is followed
+//! through the FAT and must be exactly as long as `DataLength` needs before
+//! any data is read. Bytes past `ValidDataLength` are handed over as zeros
+//! and never read (ADR-0019 Decision F). Data is handed over in chunks, so
+//! memory does not grow with the file. Deleted files are not read here.
 //!
 //! # Names
 //!
@@ -119,6 +128,10 @@ const MAX_NAME_UNITS: usize = 255;
 
 /// Bytes read from the evidence at a time while streaming a directory.
 const READ_CHUNK_BYTES: usize = 4096;
+
+/// Most bytes of a file's content read, or handed over, at a time. A cluster
+/// can be 32 MiB (section 3.1.9), so a cluster is read in pieces of this.
+pub const CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 
 /// A FAT entry marking its cluster bad, and one ending a chain.
 /// Section 4.1.3.
@@ -519,6 +532,84 @@ impl From<Error> for ExFatDirectoryError {
     }
 }
 
+/// Why a live file's content could not be read.
+///
+/// Every error but `Evidence` is found before any byte of the content is
+/// handed over.
+#[derive(Debug)]
+pub enum ExFatContentError {
+    /// The evidence could not be read.
+    Evidence(Error),
+
+    /// The entry is a directory: its data is entries, not content.
+    Directory,
+
+    /// The entry's allocation fails the checks a listing applies to it.
+    Allocation(SetRefusal),
+
+    /// A FAT entry links to a cluster outside the cluster heap, or to a free
+    /// or reserved one.
+    LinkOutOfRange { from: u32, to: u32 },
+
+    /// The chain reaches a cluster the FAT marks bad.
+    BadCluster { cluster: u32 },
+
+    /// A FAT entry that the FAT region does not hold.
+    FatOutOfRange { cluster: u32 },
+
+    /// The chain ends at `cluster`, before the `needed` clusters
+    /// `DataLength` takes.
+    ChainEndsEarly { cluster: u32, needed: u64 },
+
+    /// The chain goes on past `cluster`, the last of the `needed` clusters
+    /// `DataLength` takes.
+    ///
+    /// The specification does not say whether a chain may be longer than
+    /// its data needs. It is refused here as a choice of this project, not a
+    /// rule of the specification.
+    ChainLongerThanData { cluster: u32, needed: u64 },
+}
+
+impl fmt::Display for ExFatContentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(e) => write!(f, "{e}"),
+            Self::Directory => f.write_str("a directory has no file content to read"),
+            Self::Allocation(refusal) => write!(f, "{refusal}"),
+            Self::LinkOutOfRange { from, to } => {
+                write!(f, "cluster {from} links to {to}, outside the cluster heap")
+            }
+            Self::BadCluster { cluster } => write!(f, "chain reaches bad cluster {cluster}"),
+            Self::FatOutOfRange { cluster } => {
+                write!(f, "the FAT does not hold an entry for cluster {cluster}")
+            }
+            Self::ChainEndsEarly { cluster, needed } => write!(
+                f,
+                "chain ends at cluster {cluster}, short of the {needed} clusters the data length needs"
+            ),
+            Self::ChainLongerThanData { cluster, needed } => write!(
+                f,
+                "chain goes on past cluster {cluster}, the last of the {needed} the data length needs"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExFatContentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Evidence(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for ExFatContentError {
+    fn from(e: Error) -> Self {
+        Self::Evidence(e)
+    }
+}
+
 /// Where a directory's data is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirectorySource {
@@ -737,6 +828,117 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         );
         summary.clusters_read = cursor.clusters_taken;
         result.map(|()| summary)
+    }
+
+    /// Reads a live file's content, handing it to `visit` in order, in
+    /// chunks of at most [`CONTENT_CHUNK_BYTES`].
+    ///
+    /// Bytes up to `ValidDataLength` are read from the file's clusters, each
+    /// cluster at most once. The rest, up to `DataLength`, are handed over
+    /// as zeros and never read: ADR-0019 Decision F, specification section
+    /// 7.6.5. A chain is followed through the whole FAT before any data is
+    /// read, so a malformed chain is refused with nothing handed over.
+    /// Memory held is one chunk, whatever the file's size.
+    ///
+    /// An evidence error part way through leaves what was handed over
+    /// incomplete; the caller decides what that means.
+    pub fn read_content(
+        &mut self,
+        file: &ExFatFile,
+        visit: &mut dyn FnMut(&[u8]),
+    ) -> Result<(), ExFatContentError> {
+        if file.is_directory() {
+            return Err(ExFatContentError::Directory);
+        }
+        // The checks a listing applied, again, because the fields are
+        // public: every cluster below is in the heap, and the lengths agree.
+        self.check_allocation(
+            false,
+            file.first_cluster,
+            file.data_length,
+            file.valid_data_length,
+            file.no_fat_chain,
+        )
+        .map_err(ExFatContentError::Allocation)?;
+
+        let cluster_bytes = self.boot.cluster_bytes() as u64;
+        let needed = file.data_length.div_ceil(cluster_bytes);
+        if needed == 0 {
+            return Ok(());
+        }
+        if !file.no_fat_chain {
+            self.check_chain(file.first_cluster, needed)?;
+        }
+
+        let mut chunk = vec![0u8; file.data_length.min(CONTENT_CHUNK_BYTES as u64) as usize];
+
+        let mut cluster = file.first_cluster;
+        let mut valid_left = file.valid_data_length;
+        while valid_left > 0 {
+            let in_cluster = valid_left.min(cluster_bytes);
+            let mut offset = self.cluster_offset(cluster);
+            let mut cluster_left = in_cluster;
+            while cluster_left > 0 {
+                let take = cluster_left.min(chunk.len() as u64) as usize;
+                self.reader.read_exact_at(offset, &mut chunk[..take])?;
+                visit(&chunk[..take]);
+                offset += take as u64;
+                cluster_left -= take as u64;
+            }
+
+            valid_left -= in_cluster;
+            if valid_left > 0 {
+                cluster = if file.no_fat_chain {
+                    cluster + 1
+                } else {
+                    match self.content_link(cluster)? {
+                        Link::Next(next) => next,
+                        _ => return Err(ExFatContentError::ChainEndsEarly { cluster, needed }),
+                    }
+                };
+            }
+        }
+
+        let mut zeros_left = file.data_length - file.valid_data_length;
+        chunk.fill(0);
+        while zeros_left > 0 {
+            let take = zeros_left.min(chunk.len() as u64) as usize;
+            visit(&chunk[..take]);
+            zeros_left -= take as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Follows a file's chain from `first` through the FAT: links 1 to
+    /// `needed - 1` must each name a next cluster in the heap, and link
+    /// `needed` must end the chain. Reads no data.
+    fn check_chain(&mut self, first: u32, needed: u64) -> Result<(), ExFatContentError> {
+        // No cluster repeats, with none remembered: each cluster has one
+        // successor, so a repeat would loop forever and never reach
+        // end-of-chain.
+        let mut cluster = first;
+        for _ in 1..needed {
+            match self.content_link(cluster)? {
+                Link::Next(next) => cluster = next,
+                _ => return Err(ExFatContentError::ChainEndsEarly { cluster, needed }),
+            }
+        }
+        match self.content_link(cluster)? {
+            Link::End => Ok(()),
+            _ => Err(ExFatContentError::ChainLongerThanData { cluster, needed }),
+        }
+    }
+
+    /// What the FAT says follows `cluster` in a file's chain: the next
+    /// cluster, or the end. Anything else is an error naming the cluster.
+    fn content_link(&mut self, cluster: u32) -> Result<Link, ExFatContentError> {
+        match self.fat_link(cluster)? {
+            None => Err(ExFatContentError::FatOutOfRange { cluster }),
+            Some(Link::Bad) => Err(ExFatContentError::BadCluster { cluster }),
+            Some(Link::Invalid(to)) => Err(ExFatContentError::LinkOutOfRange { from: cluster, to }),
+            Some(link) => Ok(link),
+        }
     }
 
     fn cursor_for(&self, source: DirectorySource) -> Cursor {
@@ -1303,11 +1505,18 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
     /// What the FAT says about `cluster`, reading its sector if it is not the
     /// one held.
     fn link_of(&mut self, cluster: u32) -> Result<Link, ExFatDirectoryError> {
+        self.fat_link(cluster)?
+            .ok_or(ExFatDirectoryError::FatOutOfRange { cluster })
+    }
+
+    /// What the FAT says about `cluster`, or `None` where the FAT region
+    /// holds no entry for it.
+    fn fat_link(&mut self, cluster: u32) -> Result<Option<Link>, Error> {
         let shift = self.boot.bytes_per_sector_shift;
         let byte = cluster as u64 * 4;
         let sector = byte >> shift;
         if sector >= self.boot.fat_length as u64 {
-            return Err(ExFatDirectoryError::FatOutOfRange { cluster });
+            return Ok(None);
         }
 
         if self.fat_sector_index != Some(sector) {
@@ -1321,12 +1530,12 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
 
         let value = le_u32(&self.fat_sector, (byte & ((1u64 << shift) - 1)) as usize);
         let last = self.boot.cluster_count as u64 + 1;
-        Ok(match value {
+        Ok(Some(match value {
             FAT_END_OF_CHAIN => Link::End,
             FAT_BAD_CLUSTER => Link::Bad,
             v if v >= 2 && v as u64 <= last => Link::Next(v),
             v => Link::Invalid(v),
-        })
+        }))
     }
 }
 
@@ -2877,5 +3086,419 @@ pub(crate) mod tests {
                 .to_string()
                 .is_empty()
         );
+    }
+
+    // --- content ----------------------------------------------------------------
+
+    /// Where the synthetic volume's cluster heap begins, in bytes.
+    const HEAP_BYTE_OFFSET: u64 = 64 * 512;
+
+    /// Evidence that records the offset and length of every read made of it.
+    struct Recording<'a> {
+        image: &'a mut MemoryImage,
+        reads: Vec<(u64, usize)>,
+    }
+
+    impl EvidenceReader for Recording<'_> {
+        fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+            self.reads.push((offset, buf.len()));
+            self.image.read_exact_at(offset, buf)
+        }
+    }
+
+    /// What reading one file's content did.
+    struct ContentRead {
+        result: Result<(), ExFatContentError>,
+        chunks: Vec<Vec<u8>>,
+        reads: Vec<(u64, usize)>,
+    }
+
+    impl ContentRead {
+        fn bytes(&self) -> Vec<u8> {
+            self.chunks.concat()
+        }
+
+        /// Reads that reached the cluster heap, as `(offset, length)`.
+        fn data_reads(&self) -> Vec<(u64, usize)> {
+            self.reads
+                .iter()
+                .copied()
+                .filter(|&(offset, _)| offset >= HEAP_BYTE_OFFSET)
+                .collect()
+        }
+    }
+
+    fn read_content_of(
+        image: &mut MemoryImage,
+        boot: &ExFatBootSector,
+        file: &ExFatFile,
+    ) -> ContentRead {
+        let mut recording = Recording {
+            image,
+            reads: Vec::new(),
+        };
+        let mut chunks = Vec::new();
+        let result = ExFatReader::new(&mut recording, boot, extent(), Limits::DEFAULT)
+            .read_content(file, &mut |chunk| chunks.push(chunk.to_vec()));
+        ContentRead {
+            result,
+            chunks,
+            reads: recording.reads,
+        }
+    }
+
+    fn read_file(vol: &mut Vol, file: &ExFatFile) -> ContentRead {
+        let boot = vol.boot.clone();
+        read_content_of(&mut vol.image, &boot, file)
+    }
+
+    /// A live regular file, built directly rather than read from an entry.
+    fn content_file(first: u32, valid: u64, length: u64, no_fat_chain: bool) -> ExFatFile {
+        ExFatFile {
+            name: utf16("f"),
+            attributes: 0x20,
+            first_cluster: first,
+            data_length: length,
+            valid_data_length: valid,
+            no_fat_chain,
+        }
+    }
+
+    /// Bytes that say which cluster they were read from, and are never zero.
+    fn cluster_data(cluster: u32) -> Vec<u8> {
+        vec![cluster as u8; 512]
+    }
+
+    fn fill_clusters(vol: &mut Vol, clusters: &[u32]) {
+        for &cluster in clusters {
+            vol.image
+                .write(Vol::cluster_offset(cluster), &cluster_data(cluster));
+        }
+    }
+
+    fn data_of(clusters: &[u32]) -> Vec<u8> {
+        clusters.iter().flat_map(|&c| cluster_data(c)).collect()
+    }
+
+    /// Asserts every read of the heap lies inside one of `allowed`, each a
+    /// cluster and the bytes of it that may be read.
+    fn assert_reads_within(read: &ContentRead, allowed: &[(u32, u64)]) {
+        for &(offset, length) in &read.data_reads() {
+            let end = offset + length as u64;
+            assert!(
+                allowed.iter().any(|&(cluster, bytes)| {
+                    let start = Vol::cluster_offset(cluster);
+                    offset >= start && end <= start + bytes
+                }),
+                "read of {length} bytes at {offset} is outside what may be read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_contiguous_file_is_read_as_one_run_and_its_fat_entries_are_ignored() {
+        let mut vol = Vol::new();
+        let clusters = [10, 11, 12, 13];
+        fill_clusters(&mut vol, &clusters);
+        // Entries that would refuse the file if they were consulted.
+        for &cluster in &clusters {
+            vol.fat(cluster, FAT_BAD_CLUSTER);
+        }
+
+        let read = read_file(&mut vol, &content_file(10, 2048, 2048, true));
+        read.result.as_ref().expect("the run is read");
+        assert_eq!(read.bytes(), data_of(&clusters));
+        assert_eq!(
+            read.reads.len(),
+            read.data_reads().len(),
+            "the FAT was read"
+        );
+    }
+
+    #[test]
+    fn a_chain_in_four_out_of_order_runs_is_read_in_chain_order() {
+        let mut vol = Vol::new();
+        let chain = [20, 21, 5, 6, 40, 12, 13];
+        vol.chain(&chain);
+        fill_clusters(&mut vol, &chain);
+
+        let read = read_file(&mut vol, &content_file(20, 7 * 512, 7 * 512, false));
+        read.result.as_ref().expect("the chain is read");
+        assert_eq!(read.bytes(), data_of(&chain));
+        let allowed: Vec<(u32, u64)> = chain.iter().map(|&c| (c, 512)).collect();
+        assert_reads_within(&read, &allowed);
+    }
+
+    #[test]
+    fn a_data_length_that_is_not_whole_clusters_reads_only_its_bytes() {
+        let mut vol = Vol::new();
+        let chain = [7, 8, 9];
+        vol.chain(&chain);
+        fill_clusters(&mut vol, &chain);
+
+        let read = read_file(&mut vol, &content_file(7, 1124, 1124, false));
+        read.result.as_ref().expect("the chain is read");
+        assert_eq!(read.bytes(), data_of(&chain)[..1124]);
+        assert_reads_within(&read, &[(7, 512), (8, 512), (9, 100)]);
+    }
+
+    /// Valid data ends 200 bytes into the second of three clusters. Every
+    /// byte past it holds a non-zero sentinel, so a byte read past it would
+    /// show in the output as well as in the reads.
+    #[test]
+    fn bytes_past_valid_data_length_are_zeros_and_never_read() {
+        let mut vol = Vol::new();
+        let chain = [30, 31, 32];
+        vol.chain(&chain);
+        fill_clusters(&mut vol, &chain);
+
+        let read = read_file(&mut vol, &content_file(30, 712, 1536, false));
+        read.result.as_ref().expect("the chain is read");
+
+        let valid_end = Vol::cluster_offset(31) + 200;
+        for &(offset, length) in &read.data_reads() {
+            assert!(
+                offset + length as u64 <= valid_end || offset >= Vol::cluster_offset(32) + 512,
+                "read of {length} bytes at {offset} reaches valid data length"
+            );
+        }
+        assert_reads_within(&read, &[(30, 512), (31, 200)]);
+
+        let bytes = read.bytes();
+        assert_eq!(bytes.len(), 1536);
+        assert_eq!(bytes[..512], cluster_data(30));
+        assert_eq!(bytes[512..712], cluster_data(31)[..200]);
+        assert!(bytes[712..].iter().all(|&b| b == 0));
+    }
+
+    /// The chain is still checked whole, and the zeros come in chunks no
+    /// larger than one: 200 clusters is more than one chunk.
+    #[test]
+    fn a_valid_data_length_of_zero_reads_no_data_and_hands_over_zeros_in_chunks() {
+        let mut vol = Vol::new();
+        let chain: Vec<u32> = (2..=201).collect();
+        vol.chain(&chain);
+        fill_clusters(&mut vol, &chain);
+
+        let read = read_file(&mut vol, &content_file(2, 0, 200 * 512, false));
+        read.result.as_ref().expect("the chain is well formed");
+        assert!(read.data_reads().is_empty(), "{:?}", read.data_reads());
+        assert!(!read.reads.is_empty(), "the chain was not followed");
+
+        assert_eq!(read.chunks.len(), 2);
+        assert!(read.chunks.iter().all(|c| c.len() <= CONTENT_CHUNK_BYTES));
+        let bytes = read.bytes();
+        assert_eq!(bytes.len(), 200 * 512);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_data_length_of_zero_touches_nothing() {
+        for first in [0, 5] {
+            let mut vol = Vol::new();
+            let read = read_file(&mut vol, &content_file(first, 0, 0, false));
+
+            read.result.as_ref().expect("an empty file reads");
+            assert!(read.reads.is_empty(), "first cluster {first}");
+            assert!(read.chunks.is_empty(), "first cluster {first}");
+        }
+    }
+
+    /// Reads a chain file of `clusters` clusters from `first` and returns
+    /// its error, asserting no data was read and nothing handed over.
+    fn chain_error(vol: &mut Vol, first: u32, clusters: u64) -> ExFatContentError {
+        let read = read_file(
+            vol,
+            &content_file(first, clusters * 512, clusters * 512, false),
+        );
+        assert!(read.chunks.is_empty(), "bytes were handed over");
+        assert!(read.data_reads().is_empty(), "data was read");
+        read.result.expect_err("the chain should be refused")
+    }
+
+    #[test]
+    fn a_chain_that_ends_early_is_refused_at_its_end() {
+        let mut vol = Vol::new();
+        vol.chain(&[50, 51]);
+        fill_clusters(&mut vol, &[50, 51]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 50, 3),
+            ExFatContentError::ChainEndsEarly {
+                cluster: 51,
+                needed: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn a_chain_that_goes_on_past_the_data_is_refused_at_its_last_needed_cluster() {
+        let mut vol = Vol::new();
+        vol.chain(&[50, 51, 52]);
+        fill_clusters(&mut vol, &[50, 51, 52]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 50, 2),
+            ExFatContentError::ChainLongerThanData {
+                cluster: 51,
+                needed: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn a_cycle_is_refused_and_nothing_is_handed_over() {
+        let mut vol = Vol::new();
+        vol.fat(2, 3);
+        vol.fat(3, 2);
+        fill_clusters(&mut vol, &[2, 3]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 2, 2),
+            ExFatContentError::ChainLongerThanData {
+                cluster: 3,
+                needed: 2
+            }
+        ));
+        // However many clusters the length claims, the end is never reached.
+        assert!(matches!(
+            chain_error(&mut vol, 2, 5),
+            ExFatContentError::ChainLongerThanData {
+                cluster: 2,
+                needed: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn a_link_to_a_bad_cluster_is_refused() {
+        let mut vol = Vol::new();
+        vol.fat(60, 61);
+        vol.fat(61, FAT_BAD_CLUSTER);
+        fill_clusters(&mut vol, &[60, 61]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 60, 2),
+            ExFatContentError::BadCluster { cluster: 61 }
+        ));
+    }
+
+    #[test]
+    fn a_link_outside_the_cluster_heap_is_refused() {
+        let mut vol = Vol::new();
+        vol.fat(60, CLUSTER_COUNT + 2);
+        fill_clusters(&mut vol, &[60]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 60, 2),
+            ExFatContentError::LinkOutOfRange { from: 60, to } if to == CLUSTER_COUNT + 2
+        ));
+    }
+
+    /// A FAT of one sector holds entries for clusters 0 to 127 only.
+    #[test]
+    fn a_fat_entry_outside_the_fat_is_refused() {
+        let mut vol = Vol::new();
+        vol.boot.fat_length = 1;
+        vol.chain(&[100, 150]);
+        fill_clusters(&mut vol, &[100, 150]);
+
+        assert!(matches!(
+            chain_error(&mut vol, 100, 2),
+            ExFatContentError::FatOutOfRange { cluster: 150 }
+        ));
+    }
+
+    #[test]
+    fn a_directory_is_refused() {
+        let mut vol = Vol::new();
+        vol.chain(&[70]);
+        let mut file = content_file(70, 512, 512, false);
+        file.attributes = ATTRIBUTE_DIRECTORY;
+
+        let read = read_file(&mut vol, &file);
+        assert!(matches!(read.result, Err(ExFatContentError::Directory)));
+        assert!(read.reads.is_empty());
+        assert!(read.chunks.is_empty());
+    }
+
+    /// A caller can build a file the walk would have refused; it is refused
+    /// here too, before a cluster number outside the heap is used.
+    #[test]
+    fn an_allocation_a_listing_would_refuse_is_refused() {
+        let mut vol = Vol::new();
+        for file in [
+            content_file(1, 512, 512, false),
+            content_file(201, 1024, 1024, true),
+            content_file(10, 1024, 512, false),
+        ] {
+            let read = read_file(&mut vol, &file);
+            assert!(
+                matches!(read.result, Err(ExFatContentError::Allocation(_))),
+                "{file:?}"
+            );
+            assert!(read.reads.is_empty());
+        }
+    }
+
+    /// Clusters of 128 KiB, the default above 32 GB: each is read in pieces
+    /// no larger than a chunk, and the zeros after valid data likewise.
+    #[test]
+    fn a_cluster_larger_than_a_chunk_is_read_in_chunks() {
+        let cluster_bytes: u64 = 128 * 1024;
+        let mut boot = boot();
+        boot.sectors_per_cluster_shift = 8;
+        boot.cluster_count = 4;
+        boot.fat_length = 1;
+        boot.volume_length = 64 + 4 * 256;
+        let heap = HEAP_BYTE_OFFSET;
+        let mut image = MemoryImage::new(heap + 4 * cluster_bytes);
+        let pattern: Vec<u8> = (0..2 * cluster_bytes)
+            .map(|i| (i % 251) as u8 + 1)
+            .collect();
+        image.write(heap, &pattern);
+
+        let valid = cluster_bytes + 1000;
+        let read = read_content_of(
+            &mut image,
+            &boot,
+            &content_file(2, valid, 2 * cluster_bytes, true),
+        );
+        read.result.as_ref().expect("the run is read");
+
+        assert_eq!(
+            read.reads,
+            [
+                (heap, CONTENT_CHUNK_BYTES),
+                (heap + CONTENT_CHUNK_BYTES as u64, CONTENT_CHUNK_BYTES),
+                (heap + cluster_bytes, 1000),
+            ]
+        );
+        assert!(read.chunks.iter().all(|c| c.len() <= CONTENT_CHUNK_BYTES));
+        let bytes = read.bytes();
+        assert_eq!(bytes.len() as u64, 2 * cluster_bytes);
+        assert_eq!(bytes[..valid as usize], pattern[..valid as usize]);
+        assert!(bytes[valid as usize..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn every_content_error_names_what_failed() {
+        assert!(
+            ExFatContentError::ChainLongerThanData {
+                cluster: 77,
+                needed: 2
+            }
+            .to_string()
+            .contains("77")
+        );
+        assert!(
+            ExFatContentError::ChainEndsEarly {
+                cluster: 78,
+                needed: 3
+            }
+            .to_string()
+            .contains("78")
+        );
+        assert!(!ExFatContentError::Directory.to_string().is_empty());
     }
 }
