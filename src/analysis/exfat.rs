@@ -529,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn a_subdirectory_chain_longer_than_its_length_is_a_gap() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        // One cluster of length, two of chain: the second is allocation
+        // the directory's length does not cover (section 7.6.7).
+        vol.put(2, 0, &directory("sub", 3, 1));
+        vol.chain(&[3, 4]);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(counts.directories_unread(), 1);
+        assert_eq!(counts.volumes_analysed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+        assert!(
+            transcript.contains(&"not read /sub error".to_string()),
+            "{transcript:?}"
+        );
+    }
+
+    #[test]
     fn a_directory_below_the_depth_limit_is_not_read_and_is_counted() {
         let mut vol = Vol::new();
         // Cluster c holds one directory, at c + 1, so cluster 2 is the root

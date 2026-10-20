@@ -19,7 +19,9 @@
 //! to a cluster the FAT marks bad, and the total number of clusters read as
 //! directories all stop the directory they occur in, with the reason. The
 //! last is a safety bound this module chose, [`MAX_DIRECTORY_CLUSTERS`]; the
-//! specification has no such limit.
+//! specification has no such limit. A subdirectory's allocation must be
+//! exactly its `DataLength` (section 7.6.7), so a chain that goes on past
+//! that length, and a first cluster with a length of 0, stop it too.
 //!
 //! # What is and is not used
 //!
@@ -457,6 +459,14 @@ pub enum ExFatDirectoryError {
     /// A directory's chain ends before its data length is covered.
     ChainEndsEarly { cluster: u32 },
 
+    /// A directory's chain goes on past `cluster`, the last its data length
+    /// needs. A directory's length is its whole allocation, section 7.6.7.
+    ChainLongerThanData { cluster: u32 },
+
+    /// A subdirectory whose first cluster is `cluster` and whose data length
+    /// is 0. A directory's length is its whole allocation, section 7.6.7.
+    ClusterWithoutData { cluster: u32 },
+
     /// A directory's chain spans more than the directory limit.
     ChainTooLong { limit_bytes: u64 },
 
@@ -495,6 +505,15 @@ impl fmt::Display for ExFatDirectoryError {
                     f,
                     "chain ends at cluster {cluster}, short of the directory's length"
                 )
+            }
+            Self::ChainLongerThanData { cluster } => {
+                write!(
+                    f,
+                    "chain goes on past cluster {cluster}, the last the directory's length needs"
+                )
+            }
+            Self::ClusterWithoutData { cluster } => {
+                write!(f, "first cluster {cluster} with a data length of 0")
             }
             Self::ChainTooLong { limit_bytes } => {
                 write!(f, "chain spans more than {limit_bytes} bytes")
@@ -810,6 +829,20 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         source: DirectorySource,
         visit: &mut dyn FnMut(DirItem<'_>),
     ) -> Result<DirectorySummary, ExFatDirectoryError> {
+        // Section 7.6.7: a directory's length is its whole allocation, so a
+        // cluster with no length is allocation that would go unread.
+        if let DirectorySource::Subdirectory {
+            first_cluster,
+            data_length: 0,
+            ..
+        } = source
+            && first_cluster != 0
+        {
+            return Err(ExFatDirectoryError::ClusterWithoutData {
+                cluster: first_cluster,
+            });
+        }
+
         let is_root = matches!(source, DirectorySource::Root { .. });
         let mut cursor = self.cursor_for(source);
         let mut summary = DirectorySummary::default();
@@ -1410,7 +1443,28 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         let next = if cursor.clusters_taken == 0 {
             cursor.first_cluster
         } else if cursor.data_left == Some(0) {
-            return Ok(false);
+            // The length is covered, so a chain must end here: a directory's
+            // length is its whole allocation (section 7.6.7), and only
+            // end-of-chain may be a chain's last entry (section 4.1.3).
+            if cursor.contiguous {
+                return Ok(false);
+            }
+            return match cursor.link {
+                // A chain's cluster always has its link once entered; `None`
+                // is only the state before the first cluster.
+                Some(Link::End) | None => Ok(false),
+                Some(Link::Next(_)) => Err(ExFatDirectoryError::ChainLongerThanData {
+                    cluster: cursor.cluster,
+                }),
+                Some(Link::Invalid(to)) => Err(ExFatDirectoryError::LinkOutOfRange {
+                    from: cursor.cluster,
+                    to,
+                }),
+                // Refused when the cluster was entered; handled, not assumed.
+                Some(Link::Bad) => Err(ExFatDirectoryError::BadCluster {
+                    cluster: cursor.cluster,
+                }),
+            };
         } else if cursor.contiguous {
             cursor.cluster + 1
         } else {
@@ -2272,6 +2326,109 @@ pub(crate) mod tests {
             result,
             Err(ExFatDirectoryError::ChainEndsEarly { cluster: 10 })
         ));
+    }
+
+    /// One cluster of length, as a chain from cluster 10.
+    fn one_cluster_chain() -> DirectorySource {
+        DirectorySource::Subdirectory {
+            first_cluster: 10,
+            data_length: 512,
+            no_fat_chain: false,
+        }
+    }
+
+    #[test]
+    fn a_chain_that_goes_on_past_the_directorys_length_is_a_fault() {
+        let mut vol = Vol::new();
+        vol.chain(&[10, 11]);
+        // The zeros after the file are an end marker.
+        vol.put(10, 0, &file("a", 0, 0));
+
+        let (result, seen) = walk(&mut vol, one_cluster_chain(), Limits::DEFAULT);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatDirectoryError::ChainLongerThanData { cluster: 10 })
+            ),
+            "{result:?}"
+        );
+        // What was read before the fault stands.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(matches!(&seen[0], Seen::File(_, f) if f.name == utf16("a")));
+    }
+
+    #[test]
+    fn a_longer_chain_is_a_fault_without_an_end_marker_too() {
+        let mut vol = Vol::new();
+        vol.chain(&[10, 11]);
+        vol.fill_unused(10);
+
+        let (result, _) = walk(&mut vol, one_cluster_chain(), Limits::DEFAULT);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatDirectoryError::ChainLongerThanData { cluster: 10 })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_last_link_outside_the_heap_is_a_fault() {
+        // Section 4.1.3: only end-of-chain may end a chain, so a last link
+        // outside the heap, or to free cluster 0, is not an end.
+        for to in [5000u32, 0] {
+            let mut vol = Vol::new();
+            vol.fat(10, to);
+            vol.fill_unused(10);
+
+            let (result, _) = walk(&mut vol, one_cluster_chain(), Limits::DEFAULT);
+            assert!(
+                matches!(result, Err(ExFatDirectoryError::LinkOutOfRange { from: 10, to: t }) if t == to),
+                "{to}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subdirectory_with_a_cluster_and_no_data_is_a_fault() {
+        for no_fat_chain in [false, true] {
+            let mut vol = Vol::new();
+            vol.chain(&[10]);
+            vol.put(10, 0, &file("hidden", 0, 0));
+            let source = DirectorySource::Subdirectory {
+                first_cluster: 10,
+                data_length: 0,
+                no_fat_chain,
+            };
+
+            let (result, seen) = walk(&mut vol, source, Limits::DEFAULT);
+            assert!(
+                matches!(
+                    result,
+                    Err(ExFatDirectoryError::ClusterWithoutData { cluster: 10 })
+                ),
+                "{no_fat_chain}: {result:?}"
+            );
+            assert!(seen.is_empty(), "{no_fat_chain}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn a_contiguous_directory_ignores_the_fat_after_its_last_cluster() {
+        let mut vol = Vol::new();
+        // A FAT entry that would continue a chain: a contiguous run must
+        // not consult it.
+        vol.fat(10, 11);
+        vol.fill_unused(10);
+        let source = DirectorySource::Subdirectory {
+            first_cluster: 10,
+            data_length: 512,
+            no_fat_chain: true,
+        };
+
+        let (result, _) = walk(&mut vol, source, Limits::DEFAULT);
+        assert_eq!(result.expect("the directory reads").clusters_read, 1);
     }
 
     #[test]
