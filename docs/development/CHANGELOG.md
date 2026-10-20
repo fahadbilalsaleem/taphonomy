@@ -7,6 +7,30 @@ history.
 
 ## Unreleased
 
+### Added
+
+- exFAT volumes are analysed, read-only (`ADR-0019`, `ADR-0021`):
+  - the boot region, from the backup region when the main one is
+    refused, found by trying each sector size when needed;
+  - every directory the root reaches;
+  - every live file and directory, with a live file's content readable
+    through the library.
+
+  Deleted entry sets are counted and not examined. TexFAT is identified
+  and not analysed.
+- A partition of type `0x07` whose first sector identifies nothing is
+  tried as exFAT from its backup boot region. It is reported as
+  "filesystem exFAT, identified from its backup boot region".
+- Three new coverage lines: "entry sets not used", "deleted sets not
+  examined" and "entries after end marker". Each is a gap.
+- A subdirectory whose allocation exceeds its DataLength is reported as
+  a directory not read. That covers a chain that goes on, a last link
+  that is not end-of-chain, and a first cluster with a DataLength of 0.
+- New public modules `taphonomy::exfat_boot`,
+  `taphonomy::exfat_directory` and `taphonomy::analysis::exfat`, and
+  fourteen `Event` variants whose names begin `ExFat`. No stability is
+  promised for these yet (`ADR-0021` section 14).
+
 ### Fixed
 
 - A recovered file's name now includes its partition, so two FAT32
@@ -32,6 +56,9 @@ history.
   still re-exported from `fat_recovery`, so existing paths keep working.
 - The read-back of a written artifact reads in 64 KiB chunks and not in
   cluster-sized ones. What is written, hashed and reported is unchanged.
+- An exFAT partition, previously counted as a filesystem identified and
+  not analysed, is now analysed, so a run's coverage on an exFAT disk
+  changes accordingly.
 
 ## 0.1.0 - 2026-09-24
 

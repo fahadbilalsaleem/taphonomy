@@ -348,3 +348,74 @@ Mobile recovery and advanced application recovery should remain later research t
 No recovery implementation should begin yet.
 
 The immediate objective is to establish the development language, evidence abstraction, testing laboratory, and first recovery target using evidence from existing implementations and technical specifications.
+
+---
+
+## 2026-10-20, exFAT: a cluster chain longer than its DataLength
+
+### Objective
+
+Decide what an exFAT reader should do with a chain that goes on past
+what an entry's DataLength needs, before recording M14's decisions in
+`ADR-0021`.
+
+### Sources
+
+* Microsoft, *exFAT file system specification*, the Markdown source in
+  `MicrosoftDocs/win32`, `desktop-src/FileIO/exfat-specification.md`,
+  SHA-256
+  `09454c9663cbd7b33c6dfe3ad37baa1351779ad5ab73034c53fcf864ccdee825`,
+  downloaded twice with the same digest. Sections 4.1.3, 6.2.3,
+  6.3.4.2, 7.6.7, 8.2.
+* exfatprogs, `fsck/fsck.c`, commit `8b42748`: `check_clus_chain`,
+  called through `check_inode` from `read_file` for every File entry
+  set, directories included. GPL-2.0-or-later; read, not copied.
+* Linux, `fs/exfat/inode.c` and `cache.c`, commit `f47d223`:
+  `exfat_map_cluster` and `exfat_get_cluster`. GPL-2.0-or-later; read,
+  not copied.
+* The Sleuth Kit, tag `sleuthkit-4.12.1` (`8049377`):
+  `tsk/fs/fatfs_meta.c`, `fatfs_make_data_runs`, which
+  `tsk/fs/exfatfs.c` line 478 installs as exFAT's attribute loader.
+  Common Public License 1.0; read, not copied.
+
+### Findings
+
+1. For a directory, the specification settles it. §7.6.7: DataLength is
+   "the entire size of the associated allocation". §4.1.3: `FFFFFFFFh`
+   "is the only valid value for the last FatEntry of any given cluster
+   chain". A longer chain, or a first cluster with a DataLength of 0,
+   breaks both.
+2. For a file, it does not. §6.2.3 says DataLength is the size of the
+   data the allocation contains. §6.3.4.2 sizes a contiguous allocation
+   from DataLength. No clause says whether a chain may be longer.
+3. exfatprogs' checker treats a longer chain as an error,
+   `ER_FILE_SMALLER_SIZE` ("more clusters are allocated"), for files and
+   directories, and repairs it by truncating. It also treats a first
+   cluster with a DataLength of 0 as an error, `ER_FILE_FIRST_CLUS`.
+4. The Linux driver and The Sleuth Kit never look: each maps only the
+   clusters the size needs and stops.
+5. At `8ea143c` Taphonomy refused a longer chain for file content and,
+   for a directory, read to DataLength and stopped without looking at
+   the last link. A read-only scan of EXP-0009's images A and B found
+   neither shape on either; each has one live subdirectory.
+
+### Implications
+
+A checker reports the condition as damage; a reader that only needs the
+data never sees it. Taphonomy reports on evidence and takes the
+checker's view. `780d6f0` made a directory with either shape a
+directory not read, counted as a gap; `ADR-0021` Decisions I and L
+record both rules.
+
+### Confidence
+
+High for findings 1 to 4: the specification and three code bases, each
+read at a pinned revision. Finding 5 rests on a scan written separately
+from Taphonomy and on its two-image scope.
+
+### Follow-up
+
+* A file with a first cluster and a DataLength of 0 is still accepted;
+  recorded in `KNOWN_ISSUES.md`.
+* No fixture holds either directory shape. One would need a volume
+  edited after it was made, because no tool measured here writes one.

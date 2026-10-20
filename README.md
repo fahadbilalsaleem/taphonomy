@@ -25,6 +25,12 @@ the measurement is linked.
 * Reads every FAT32 directory the root reaches: a live one along its
   cluster chain, a deleted one from its first cluster
   ([ADR-0016](docs/decisions/ADR-0016-m11-subdirectory-traversal-decisions.md)).
+* Reads exFAT volumes: the boot region, from its backup when the first
+  sector is damaged; every directory; every live file, whose content
+  the library reads. Deleted exFAT files are counted and not yet
+  examined
+  ([ADR-0019](docs/decisions/ADR-0019-exfat-decisions.md),
+  [ADR-0021](docs/decisions/ADR-0021-m14-exfat-analysis-decisions.md)).
 * Finds directories that nothing names, such as the tree a quick format
   leaves behind, and offers the files they list for recovery
   ([ADR-0017](docs/decisions/ADR-0017-m12-orphaned-directory-decisions.md),
@@ -134,8 +140,9 @@ about the evidence and also exits 0.
 
 Taphonomy is early, and deliberately narrow.
 
-* Only FAT32 is analysed. FAT12 and FAT16 are identified and not read;
-  exFAT and NTFS are identified and reported as unsupported.
+* FAT32 is analysed and recovered from, and exFAT is analysed
+  read-only. FAT12 and FAT16 are identified and not read; NTFS and
+  TexFAT are identified and reported as unsupported.
 * It reads disk images, not physical devices, and only MBR partition
   tables with 512-byte sectors.
 * Recovery assumes a file's clusters were contiguous. Deletion erases the
@@ -189,11 +196,9 @@ research in [RESEARCH_LOG.md](docs/development/RESEARCH_LOG.md); changes in
 
 Not yet implemented, in this order:
 
-1. exFAT, the filesystem of most cards larger than 32 GB. It moved first
-   after EXP-0009 measured what Windows 10 leaves when it deletes from
-   exFAT: the entry set, and even a fragmented file's chain, survive,
-   which FAT32 never allows. ADR-0019 sets its scope and the test it must
-   pass.
+1. Recovering deleted exFAT files. Reading exFAT is done; recovery must
+   meet the conditions ADR-0019 sets, and pass its test on EXP-0009's
+   image B.
 2. FAT12 and FAT16, where ten of the fifteen deleted files in EXP-0008
    were out of reach.
 3. Long file names.

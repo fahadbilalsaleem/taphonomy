@@ -396,3 +396,111 @@ its creation and its removal; no test or fixture reaches it.
 
 Found while moving the code in M13 (`ADR-0020` Decision E) and preserved
 exactly. Not fixed.
+
+---
+
+## exFAT directory walk: worst-case memory is computed, not measured
+
+At both of the walk's safety bounds, `MAX_DIRECTORY_CLUSTERS` and
+`MAX_QUEUED_DIRECTORIES`, the memory held is about 0.67 GB, or about
+0.71 GB with allocator overhead. The figure is computed from the types'
+sizes and has not been measured on a running process.
+
+Recorded in `ADR-0021` section 5.
+
+---
+
+## A read failure while probing a `0x07` partition is not reported
+
+A partition of type `0x07` whose first sector identifies nothing is
+probed for an exFAT backup boot region. If a read fails during that
+probe, the failure is not reported, and the partition is counted as
+unidentified rather than unread.
+
+Recorded in `ADR-0021` section 3 and `ADR-0014` Appendix E.
+
+---
+
+## A read failure during the exFAT backup search stops the search
+
+When the main boot region of an exFAT partition is refused, the backup
+is searched for by trying each sector size. A read failure ends the
+search at once: the sizes not yet tried are not tried, and the
+partition is reported as unread (`search_backup` in
+`src/exfat_boot.rs`).
+
+Recorded in `ADR-0021` section 3.
+
+---
+
+## If the exFAT root fails part way, its subdirectories are not counted
+
+The root is read first, and the subdirectories it names are queued. If
+the root then fails, the walk of that volume stops. The subdirectories
+already queued are neither read nor counted as directories not read.
+The root's failure is the gap counted (`root_unread`), and the volume is
+not counted as analysed (`report_volume` in `src/analysis/exfat.rs`).
+
+Found while documenting M14 (2026-10-20). Not fixed.
+
+---
+
+## An exFAT file with a first cluster and a DataLength of 0 is accepted
+
+exfatprogs' checker treats such an entry as an error
+(`ER_FILE_FIRST_CLUS`). Taphonomy has refused it for a directory since
+`780d6f0`, and still accepts it for a file.
+
+Recorded in `ADR-0021` sections 5 and 10.
+
+---
+
+## A contiguous exFAT file is read one cluster at a time
+
+`ExFatReader::read_content` reads a file whose clusters are one
+contiguous run cluster by cluster, as it reads a chain. Its speed has
+not been measured, so nothing is changed.
+
+Seen in `read_content` in `src/exfat_directory.rs`. Not fixed.
+
+---
+
+## `ExFatReader::read_content` leaves partial output on an evidence error
+
+Every other error is found before the first byte is handed over. A read
+failure part way through leaves the bytes already handed over, and
+they stand. M15, which writes content through `ArtifactWriter`, must
+call `abort` on such an error.
+
+Recorded in `ADR-0021` section 8 and `ADR-0020` Decision C.
+
+---
+
+## exFAT NameHash is not verified
+
+A File set's NameHash (specification section 7.6.4) is not checked.
+Checking it needs the up-case table, and it proves only a mismatch.
+
+Recorded in `ADR-0021` section 14.
+
+---
+
+## Allocations of exFAT benign secondaries are neither read nor counted
+
+A benign secondary entry after a set's names is ignored. Where it
+describes an allocation, as a Vendor Allocation entry does
+(specification section 7.9), those clusters are neither read nor
+counted as a gap.
+
+Recorded in `ADR-0021` section 14.
+
+---
+
+## Most exFAT gap kinds are reached only by unit tests
+
+EXP-0009's images A and B reach one exFAT gap kind, "deleted sets not
+examined", and no other. The other two new kinds, and the exFAT cases
+of the older kinds, are reached only by unit tests on volumes built in
+memory. No fixture holds them.
+
+Recorded in `ADR-0014` Appendix E.

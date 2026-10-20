@@ -2,13 +2,13 @@
 
 > **Status notice:** This document describes an intended architecture. A
 > section becomes binding only when corresponding code and tests exist.
-> Section 47 records which sections that is true of, as of 2026-09-24.
+> Section 47 records which sections that is true of, as of 2026-10-20.
 
 **Project:** Taphonomy
 **Document:** Architecture Specification
 **Version:** 0.1.0
 **Status:** Partly implemented; see section 47
-**Last Updated:** 2026-09-24
+**Last Updated:** 2026-10-20
 
 ---
 
@@ -1154,7 +1154,7 @@ No component described here should be interpreted as implemented unless correspo
 # 47. Implementation Map
 
 Which sections of this document now have corresponding code, as of
-2026-09-24. Where a section is marked built, it is binding; where it is not,
+2026-10-20. Where a section is marked built, it is binding; where it is not,
 it remains intent. `ADR-0011` Decision A defines the distinction.
 
 **Built.**
@@ -1162,18 +1162,18 @@ it remains intent. `ADR-0011` Decision A defines the distinction.
 | Section | Where |
 | --- | --- |
 | 5.2 Evidence Management | `src/evidence.rs` opens evidence read-only; `src/hash.rs` computes SHA-256 (`ADR-0004`) |
-| 5.4 Analysis | `src/partition.rs` (MBR, `ADR-0005`), `src/filesystem.rs`, `src/fat.rs`, `src/fat32.rs`, `src/fat_directory.rs` |
+| 5.4 Analysis | `src/partition.rs` (MBR, `ADR-0005`), `src/filesystem.rs`, `src/fat.rs`, `src/fat32.rs`, `src/fat_directory.rs`; exFAT in `src/exfat_boot.rs`, `src/exfat_directory.rs` and `src/analysis/exfat.rs` (`ADR-0019`, `ADR-0021`) |
 | 5.5 Recovery | `src/fat_recovery.rs` assesses and reads a deleted file (`ADR-0010`); `src/extraction.rs` hashes and writes the artifact (`ADR-0015`, `ADR-0020`) |
 | 15 Evidence Boundary | `EvidenceFile`; asserted by `tests/read_only.rs` |
 | 16 Reader Abstraction | The `EvidenceReader` trait, `read_exact_at` (`ADR-0007`) |
 | 18 Output Boundary | A destination holding the evidence is refused; each artifact is read back after writing (`ADR-0015`) |
-| 19 Error Model | Typed errors: `Error`, `ParseError`, `DirectoryError`, `RecoveryError`, `DigestParseError` |
+| 19 Error Model | Typed errors: `Error`, `ParseError`, `DirectoryError`, `RecoveryError`, `DigestParseError`, `ExFatError`, `ExFatBootFailure`, `ExFatDirectoryError`, `ExFatContentError`, `SetRefusal` |
 | 22 Determinism | Fixtures byte-identical on every build (`ADR-0006`, `scripts/verify-fixtures.sh`) |
 | 23 Concurrency | None is introduced; the tool is single-threaded |
 | 24 State Management | No global mutable state |
 | 28 Local-First | One dependency, `sha2`; nothing reaches a network |
 | 36 Candidate vs Verified Artifact | `src/confidence.rs` (`ADR-0003`, `ADR-0014`) |
-| 38, 39, 40 Testing, Fixtures, Laboratory | Unit tests, eleven integration harnesses, generated fixtures, `docs/development/EXPERIMENTS.md` |
+| 38, 39, 40 Testing, Fixtures, Laboratory | Unit tests, fourteen integration harnesses, generated fixtures, `docs/development/EXPERIMENTS.md` |
 
 **In part.**
 
@@ -1181,7 +1181,7 @@ it remains intent. `ADR-0011` Decision A defines the distinction.
 | --- | --- |
 | 5.6 Validation | Comparison against an operator's reference digest (`ADR-0013`); no structural validation |
 | 5.7 Reporting | A text report on standard output, with coverage (`ADR-0014`); no structured report |
-| 7 Filesystem Implementations | FAT32 only; FAT12, FAT16, exFAT and NTFS are identified and not analysed |
+| 7 Filesystem Implementations | FAT32 is analysed and recovered from; exFAT is analysed read-only, with deleted files not yet examined; FAT12, FAT16, NTFS and TexFAT are identified and not analysed |
 | 17 Virtual Evidence | Raw disk images and an in-memory test double; no physical or segmented evidence |
 | 13, 26 Dependency Direction, CLI Boundary | A binary over a library crate; `src/analysis.rs` (`ADR-0018`) is an application layer between the CLI and the domain modules it calls; no further internal layering exists |
 | 20 Result Model | An event stream and counts, `taphonomy::analysis::Event` and `RunCounts` (`ADR-0018`); no operation identity and no serialised result |
