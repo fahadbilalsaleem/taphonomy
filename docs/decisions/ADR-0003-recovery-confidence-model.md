@@ -378,3 +378,39 @@ outstanding.
 No decision in this ADR is amended. The six definitions in §3.2 stand as
 written, including the five no code path constructs. §§4.1 to 4.6 stand as
 rules. A level that is not implemented is not retired, and §7 is unaffected.
+
+---
+
+## Appendix C: a second level reachable (2026-10-21)
+
+M15 recovers deleted exFAT files, whose extent is read from surviving
+metadata, and `ADR-0022` Decision A classifies each such artifact
+`UNVERIFIED`. This appendix records the change to the subset Appendix B
+recorded, so that a reader holding only the ADR series can reconcile
+§3.2 with what the tool produces.
+
+| Section | Subject | State at M15 |
+| --- | --- | --- |
+| §3.2 | Six-level taxonomy | Two variants implemented: `RECONSTRUCTED` for FAT32, `UNVERIFIED` for exFAT. The other four are recorded and not constructed. |
+| §4.1 | Single level | Satisfied. Each artifact carries one level. |
+| §4.2 | No upgrade without evidence | Applied. A digest match raises neither level: `ADR-0014` Decision A for FAT32, `ADR-0022` Decision A for exFAT. |
+| §4.4 | Default on uncertainty | Applied, and extended to ordering: where two deleted sets cannot be ordered, both are refused (`ADR-0019` Appendix C). |
+| §4.5 | `RECONSTRUCTED` is not an ordering | Governs FAT32 artifacts. exFAT artifacts are not `RECONSTRUCTED`, because their extent is not inferred. |
+| §4.7 | Aggregate reporting | Implemented for two levels: the summary line lists each level with a count above zero. |
+
+`UNVERIFIED` is assigned under the reading of its evidence column that
+`ADR-0022` section 3 records: no format-aware validator exists. That
+reading is confined to an extent read from metadata. Appendix B.2's
+reasoning for FAT32 is unchanged.
+
+**§4.7's distribution clause now engages.** Appendix B.3 found that the
+clause, which forbids describing a session as successful where an
+artifact is below `STRUCTURALLY_VALID` without stating the
+distribution, did not engage, because `RECONSTRUCTED` lies outside the
+ordering. `UNVERIFIED` lies inside it, below `STRUCTURALLY_VALID`, so a
+run with an exFAT artifact meets the clause. It is satisfied as B.3
+describes: the status word names coverage, not success, and the
+`artifacts` line states the count of every level present.
+
+No decision of this ADR is amended. The six definitions of §3.2 stand
+as written, and §4.1 to §4.6 stand as rules.

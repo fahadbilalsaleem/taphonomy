@@ -198,3 +198,97 @@ by the method of `ADR-0018` §5.
 M15, the recovery of deleted files, does not merge until items 1 and 2
 hold, with item 4 for its own change. Nothing in §6's four items, or in
 §5, changes.
+
+---
+
+## Appendix C: condition 2 compares modification too, and only times that can be ordered (2026-10-21)
+
+Section 4's condition 2 orders deleted sets by creation time. EXP-0011
+tested it on NIST's twenty exFAT images, made on macOS, against the
+tags NIST wrote into every block and, for macOS's own files, which NIST
+did not tag, against their format. With deleted directories read for
+their claims, as M15 reads them (`ADR-0022` Decision K), it recovers 658
+sets correctly and 3 wrongly. Two of the three are stale data no rule
+found prevents (`ADR-0022` section 15). The third is on dfr-13,
+`/Ursa/B104-beta=s-s=D=s-s=C-1.txt`, whose cluster holds segment 3 of
+`B083-alpha=s-s=C=a-a=D-2.txt`. NIST's build steps for that image append
+to files after others are created. A file created earlier and extended
+later into a rival's freed clusters is still the earlier by creation
+time, so the rule recovers the rival over data the extension wrote.
+
+**Condition 2 becomes:** no other deleted entry set that claims any of
+those clusters was created, or last modified, at the same time as this
+set's creation or later. Equal times still refuse every set that shares
+them.
+
+**Which times are compared.** A set's creation key is its
+CreateTimestamp, Create10msIncrement and CreateUtcOffset (§7.4.5). Its
+modification key is its LastModifiedTimestamp, LastModified10msIncrement
+and LastModifiedUtcOffset (§7.4.6). Two keys are compared only where:
+
+* both UtcOffset bytes have OffsetValid set (§7.4.10.2) and are the same
+  byte; and
+* every field of both is in range: DoubleSeconds 0 to 29, Minute 0 to
+  59, Hour 0 to 23, Month 1 to 12, Day from 1 to the last day of that
+  month (§7.4.8), and 10msIncrement 0 to 199 (§7.4.9).
+
+They are then compared as local times: year, month, day, hour, minute,
+and DoubleSeconds times 2000 plus 10msIncrement times 10 milliseconds.
+Where two keys cannot be compared, the two sets cannot be ordered, and
+condition 2 does not hold for either.
+
+**Why the offset bytes must be equal, not converted.** §7.4.10 makes
+the timestamps local and the offset their distance from UTC. Converting
+both to UTC would be the specification's reading, but Nordvik and
+Axelsson (*It is about time*, FSI: Digital Investigation 42-43 (2022)
+301476) measured that macOS writes the offset with its sign switched,
+and EXP-0011 saw it independently: NIST's offset byte `0x90` reads as
+UTC+4 h, where NIST's log records the deletions in EDT, UTC-4 h. A
+conversion would order a macOS-written set against a Windows-written
+one wrongly. Comparing local times under the same byte is immune to that
+error. A sign error between two sets carrying the same wrong byte
+cuts both ways equally and leaves their order unchanged. An offset
+marked valid and wrong in some other way cannot be detected, and is a
+recorded limit.
+
+**What it costs.** On NIST's twenty images, with deleted directories
+read for their claims:
+
+| | Right | Wrong |
+| --- | ---: | ---: |
+| Section 4 as written | 658 | 3 |
+| As amended here | 656 | 2 |
+
+No other decision changes. The two correct sets it refuses, dfr-13's
+`B148-beta=s-s=C=a-a=D-1.txt` and `B151-beta=s-s=C=a-a=D-4.txt`, hold
+their own data although a rival
+claiming their clusters was modified after they were created. That is
+the price of failing closed. On EXP-0009's images A and B the amendment
+changes no decision: section 6 item 1's 99, 3, 16, 1 and 6 still hold
+on B, and A's 96, 4, 16 and 6 on A, measured under this amendment with
+an implementation written apart from Taphonomy and from EXP-0009's
+scripts (EXP-0011, rule `moe`). On every one of these images, all the
+deleted sets of a volume carry one valid offset byte (`0x90`, or `0x94`
+on NIST's dfr-15 and dfr-17), so no two sets with different bytes claim
+a cluster and the rule on offsets changes no decision; unit tests hold
+it. A
+volume does hold differing bytes: on dfr-15, seven live sets carry
+`0xEC` (UTC-5 h) beside deleted sets carrying `0x94` (UTC+5 h), the
+pattern of two writers of which one switched the sign. Which systems
+wrote them was not established. The rule's cost on a volume whose files
+span a daylight-saving change, where offset bytes differ and pairs are
+refused, is not measured.
+
+**Claims seen.** Condition 2 is judged over the claims the walk saw,
+and every claim it could not see is counted as a gap (`ADR-0022`
+section 5). Deleted directories are read for their claims where they
+can be (`ADR-0022` Decision K); eleven of NIST's twenty volumes hold one
+that cannot be. Read literally, "recovered only if all of these hold"
+would refuse every set on a volume holding an unseen claim, and the
+audit's proposal that did so, counting every deleted directory, recovers
+nothing on NIST's images. The project decided on 2026-10-21 to judge
+over the claims seen. A recovery therefore states "no later claim among
+the sets examined".
+
+Section 4's other conditions, section 5, and section 6's four items are
+unchanged. Section 6 item 1's figures hold under the amended rule.

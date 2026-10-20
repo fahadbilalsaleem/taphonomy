@@ -1189,3 +1189,98 @@ kind 3 as unread. `ADR-0021` section 3 records it as a known limitation.
 §11's trigger, a deleted file's extent established from surviving
 evidence, is not met by M14, which recovers nothing. M15 meets it, and
 `ADR-0022` takes it up.
+
+---
+
+## Appendix F: exFAT recovery replaces one gap kind, adds seven, and assigns `UNVERIFIED` (2026-10-21)
+
+M15 recovers deleted exFAT files (`ADR-0022`). This appendix records
+how its findings are counted under §B.5, and what it changes in
+Decisions A and E.
+
+**One kind is replaced.** `exfat_deleted_sets_not_examined` ("deleted
+sets not examined", Appendix E) counted every unused File entry,
+because M14 examined none. M15 examines them, so the count is replaced
+by what the examination found.
+
+**Four new kinds**, each counted once per occurrence, each a gap:
+
+* `exfat_deleted_sets_unusable`, printed "deleted sets not used": an
+  unused File entry whose set, with InUse restored, fails its
+  SetChecksum or a check of `ADR-0021` section 4, or is cut short by a
+  live entry. Its fields are not trusted, so its content and its claim
+  were not analysed.
+* `exfat_deleted_directories_unread`, printed "deleted directories not
+  read": a usable deleted set that is a directory and that could not be
+  read for its claims, because a cluster of it is in use again or was
+  read already, or its allocation is malformed (`ADR-0022` Decision K).
+  The claims its contents held are unseen.
+* `exfat_sets_in_deleted_directories`, printed "sets in deleted
+  directories not examined": a set read inside a deleted directory. Its
+  allocation is a claim (`ADR-0022` section 5), and the set is not
+  decided or recovered until M16.
+* `exfat_orphan_streams`, printed "orphaned stream entries": an unused
+  Stream Extension outside any set, whose File entry was overwritten.
+  It names clusters with no time and no checksum, so it is a claim that
+  cannot be ordered (`ADR-0022` section 5) and a file that cannot be
+  examined. An unused File Name entry outside a set names no clusters
+  and is not counted, as `ADR-0021` section 4 decided for M14. Unused
+  benign secondaries outside a set stay as `ADR-0021` section 14 left
+  every benign secondary's allocation: neither read nor counted, and
+  recorded in `KNOWN_ISSUES.md`.
+
+**Three existing kinds gain exFAT counterparts**, each a gap, each
+kept in a count of its own, because FAT32's counts feed arithmetic and
+caveats that exFAT must not change (`ADR-0022` section 11):
+
+* "entries not assessed": an exFAT deleted set whose conditions could
+  not be decided, because the bitmap's chain or its check against the
+  walk failed (`ADR-0022` Decision E), a bound was reached before it was
+  recorded (Decision J), or the evidence could not be read while
+  deciding it;
+* "entries not extracted": an exFAT set that passed every condition and
+  whose content could not be read;
+* "artifacts not written": an exFAT artifact read and not handed to the
+  operator, as for FAT32.
+
+The summary prints each line once, with the FAT32 and exFAT counts
+summed, so a run with no exFAT volume prints what it prints today.
+
+**Findings, not gaps.** A set refused under one of `ADR-0019` section
+4's conditions, or holding no data, was analysed and the answer was no.
+FAT32 counts the same findings (`refused`, `empty`) outside §B.5's sum,
+and exFAT does too. Each is counted by the condition it failed. So is a
+set that passed conditions 4, 1 and 2 when `--recover` was not passed,
+whose condition 3 was not checked: it is the counterpart of FAT32's
+free run not read.
+
+**Reached by.** On EXP-0009's images A and B, none of the new kinds or
+counterparts occurs, so both report `complete` with M15, where both
+reported `incomplete` with M14. On NIST's twenty exFAT images (EXP-0011)
+every volume holds at least one deleted directory. Eleven deleted
+directories cannot be read, each `/.Trashes/501`, whose cluster is in
+use again, and 27 sets lie inside the deleted directories that can be.
+Three unused secondaries lie outside any set: a File Name entry in
+dfr-08's root, and entries of types `66h` and `71h` inside deleted
+directories. None is a Stream Extension, so none is counted. On the
+Linux image of `forensics-samples`, the four deleted directories are
+read for their claims and their 18 sets are counted as not examined.
+The orphan stream, the unusable deleted set and every counterpart are
+reached by unit tests on volumes built in memory.
+
+**Decision A for exFAT.** §11's third trigger, "a means is found to
+establish a deleted file's extent from surviving evidence rather than
+assumption", is met by exFAT and not by FAT32. `ADR-0022` Decision A
+takes it up: an exFAT artifact is `UNVERIFIED`, constant, never raised
+by a match. Decision A's structure carries over unchanged, with the
+level stating the method and the comparison reported beside it. For
+FAT32, Decision A stands as written.
+
+**Decision E and §3.4.** Decision E said `UNVERIFIED` is not assigned,
+and §3.4 found it misdescribed FAT32's case, reading its "validation"
+as M8's reference comparison. `ADR-0022` section 3 reads it as
+`ADR-0003` section 3.2's format-aware validator, for exFAT, where the
+extent comes from metadata. Section 3.4's finding stands for FAT32,
+whose extent is inferred and which therefore stays `RECONSTRUCTED`.
+`STRUCTURALLY_VALID`, `PARTIAL` and `UNRECOVERABLE` remain unreachable,
+and `VERIFIED` remains unreached.

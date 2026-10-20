@@ -2509,3 +2509,414 @@ are unaffected. The last rule is correct on this image; it detects data
 that is only zeros, not stale data of any other kind, and its test of
 creation time can meet a tie. The body is not rewritten; every
 measurement in it is unchanged.
+
+---
+
+## EXP-0011: The recovery rules of ADR-0019 against public exFAT images
+
+**Date:** 2026-10-21
+**Milestone:** before M15; informs ADR-0022 and ADR-0019 Appendix C
+**Related:** ADR-0019 sections 4 and 6; EXP-0009 and its Appendix A;
+EXP-0008
+
+---
+
+### Question
+
+Before any recovery code exists:
+
+1. Does ADR-0019 section 4 recover only files whose data is their own,
+   on exFAT volumes deleted by systems other than the one EXP-0009
+   measured?
+2. Does each rule proposed for M15 in the audit of 2026-10-20 improve
+   that, and what does each cost?
+3. What do macOS and Linux leave when they delete from exFAT?
+
+### Why it matters
+
+ADR-0019 section 4 was derived from one Windows volume. ADR-0019
+section 6 requires NIST's exFAT images before any public claim about
+exFAT recovery. A rule that is right on the volume it was built from is
+not shown right by that volume.
+
+### Hypothesis
+
+No prediction was recorded before measuring. The audit of 2026-10-20
+made recommendations, not predictions. The statements below restate
+those recommendations as testable claims, and were written after the
+measurement. They are scored, but they are not a protocol in EXP-0009's
+sense.
+
+1. H1: on NIST's images, section 4 recovers no file whose clusters hold
+   another file's data.
+2. H2: comparing a rival's last modification as well as its creation
+   refuses no correct file.
+3. H3: refusing every set on a volume holding a claim the walk cannot
+   see costs little, because such claims are rare.
+4. H4: macOS and Linux leave the FAT chain of a deleted file, as
+   Windows does.
+5. H5: on every volume, every cluster used as structure is marked in
+   use in the allocation bitmap.
+6. H6, written after the first scoring: NIST's tags judge every
+   recovery.
+
+### Input
+
+**NIST CFReDS deleted-file-recovery images**, the twenty exFAT
+("xfat") images listed at
+<https://cfreds-archive.nist.gov/dfr-test-images.html>, downloaded
+2026-10-20, with the layout document `setup-july-10-2012.pdf`
+(SHA-256
+`86b5a888e60f1127ac77e57929dd64bd4346af882f904ddd45ba7d90afbc803e`).
+NIST made them on macOS (`diskutil` output in the document). Nine have
+a GPT and eleven an MBR partition of type `0x07`. Compressed:
+
+```text
+4ce2864c1ab4353fb26fc3bd7d5a2ec8fb90cfccaa14e26aef646305efb1ddc5  dfr-01-xfat.dd.bz2
+84727f96984bcac0b61f9fa67b376a5b8884ef83e42d4a17455b4c0a1f21a951  dfr-02-xfat.dd.bz2
+271edaa5ec7dad75bf9d5be235b164ef16acb6554c18c2c96ef35ec840bb5555  dfr-03-xfat.dd.bz2
+b6f7ab11bce20bd02ff6c1b689ca35098cb8b8757c411bd765a9e46ad58f73c7  dfr-04-xfat.dd.bz2
+c4f01410d6f0a7f759f867eb6ca7945d550e624cb421edd91d478c35c470b855  dfr-05-braid-xfat.dd.bz2
+ce0472cc193d0923e787dab8cce99c5000826a06cd69efc5507097e3e25c3ec8  dfr-05-nest-xfat.dd.bz2
+0ce5d5dde2d351b6fc076901d9342ecec3719b93c53c8e224cebbc4f228d1f57  dfr-05-xfat.dd.bz2
+0c5b06fe0cef21f46533b214d3f0ecfe2fe1b499a7027a4389e50ca49b9ba4a9  dfr-06-xfat.dd.bz2
+da47c444bb520ba1241c46cad7740dd698815bfe9b18c98b8f89521146da2f3f  dfr-07-one-xfat.dd.bz2
+f239191e0441931cbf9024c01fc1dd4db5b2e291be2e525aa663252038bebdf6  dfr-07-two-xfat.dd.bz2
+15720cdb99927ad2c333130fb308718165cb09c1404737e7c638d9d9b51ca65b  dfr-07-xfat.dd.bz2
+8a5caac60b4d802dcdb1000d784eb604dddaad47abc736c5ed4558ba844c990a  dfr-08-xfat.dd.bz2
+d506e79b4aa2e62fe29fee50d543b886db19a5b895d3f1f3acb50f08536531c5  dfr-09-xfat.dd.bz2
+2f76f3b41613ff5b5ed40608998934f5c259c0dff5ec8c68fd6a3ec870ea6daf  dfr-10-xfat.dd.bz2
+7fc36a9f1f51b7b867c6ee09e5366db071991e1d2bfb103717764c7f09326389  dfr-11-xfat.dd.bz2
+8a84d6a8152cfe0a414a744ec47b445586ed728adbd56752f50301b8b06b6301  dfr-12-xfat.dd.bz2
+d140b849e883747638b517426133176d1a47b8917802271fc8dd0ae678d13280  dfr-13-xfat.dd.bz2
+4924532286809be83f269443b0d2822c0c50b493757c1cc18990de05071abfc1  dfr-15-xfat.dd.bz2
+5661beda4b6160129ee058c4276b3cb6f2ed8e1a036fd607167dbf558516f8fa  dfr-16-xfat.dd.bz2
+3c7d1b7d170980ae26f063ae997c5a90d0335716122ee5a8c4480b003e803d19  dfr-17-xfat.dd.bz2
+```
+
+Expanded with `bzip2 -dc`:
+
+```text
+bb3755982959e189d7cfc7a4819553406e5c64e67a11d6b875ea1d4f23fa745b  dfr-01-xfat.dd
+e0647de7136edcddb0b0be842a5a344b0b0e7a987f43afb1eccdb256c2eb01c8  dfr-02-xfat.dd
+65d9663bb9469b9432d1164bce7123ef3e3434a3e1dc5d04e72212244ed64789  dfr-03-xfat.dd
+aa294805bef0da4630126cb3dc3c20db48b3508ab06bb4958c025ad85d0d4ae5  dfr-04-xfat.dd
+5cf7e6e429af3cf3ddd08c3f5ef73ce074a4cfe1b11752587e48d9a23112d64a  dfr-05-braid-xfat.dd
+f717b39e7bdbfeb5c88c9ceb7205f3bf2205ed3405a4d71fedc270362c199b20  dfr-05-nest-xfat.dd
+770873d206449cc55512ea3d06eb9a64dc0c300282fc03f267a3bef974647a1a  dfr-05-xfat.dd
+6ff1e2967dd5a2f183af972b52ad128c3aecf3e1b722ff286fffdbe7bef6d615  dfr-06-xfat.dd
+91f1171b434f500ee66e3bc4a0ed2cf7184b021d35c71a6081bdff759e5ba61a  dfr-07-one-xfat.dd
+b3585b73f02de39c597ac7729ca544a5ff205372008e103886a6d3101d418d7f  dfr-07-two-xfat.dd
+9cdcdda1944b4ed2ce9c4ba4361936b77bf05caca8a54161d7480560c51f15a8  dfr-07-xfat.dd
+0bcc2868cf92eb627c75d7d0505de991759a81b717e949891058fd8ef225ba5c  dfr-08-xfat.dd
+e9005b6f8207e85b64acfd78bb5de88ed969686273e9efec87b4bfd31b3751a1  dfr-09-xfat.dd
+c102ef096ffa38979dfeaefed563bc7fb23f900ae4d0f5aad05656e28e6d0449  dfr-10-xfat.dd
+c598a1034e095ba103e3c885b09ed0aa05daebd32d4f9b174973b26378110dcc  dfr-11-xfat.dd
+5f234b36b41b9f47279d78221a3e7f93ea7efc43c807f801e31cf25f159e76d1  dfr-12-xfat.dd
+b44230b25744da359acc96b5fd885f240c970aa019c149beb548073ba27befcf  dfr-13-xfat.dd
+8c5d468e7086852a40e2c2e0a3887cbef664fce9e723ae568c1d69e9ec049fed  dfr-15-xfat.dd
+49a0b87c933486a8a79c0d1804918a18adfe5e1e2122ad0aa5b5c95cbfc30af3  dfr-16-xfat.dd
+fc0c1f200e9955abbae3c5d19db5e531d5f55417524de816943ad72dce6cd147  dfr-17-xfat.dd
+```
+
+**EXP-0009's images A and B** (`f9ad9b94…`, `a0ffa520…`), deleted by
+Windows 10.
+
+**`forensics-samples`** by João Eriberto Mota Filho,
+<https://github.com/eribertomota/forensics-samples>, commit `b938bbe`.
+The images are under the MIT licence and the original files under
+CC-BY-SA-4.0, per its README. `fs.exfat.xz`
+(`6aa8868301b0288cd3f9d751c1779fd79570f7cb1bb9568d70d0a27d74c00d70`)
+expands to `fs.exfat`
+(`98d518601199a32054158bb3a759e12b554fd2ebcc5960541caf9e1a907198d0`).
+Made on Linux by `cp -a` of the originals, then `rm -rf` of every
+directory whose name ends in `2`. `fs.multiple.xz`
+(`5c2be233b134a162048bae0ebecb38ec320eb404e6b74c6ada31ece31a072447`)
+was read by Taphonomy only.
+
+No image was written to, and none is committed.
+
+### Environment
+
+WSL2 on the author's machine, Python 3 run with `-I`, Taphonomy built at
+`a89a122` into a separate target directory.
+
+### Method
+
+Every figure below is printed by one command,
+`scripts/experiments/exp-0011-run.sh WORKDIR`, whose header names the
+inputs it expects. It checks every input's digest before and after the
+runs, and prints `FAIL` for any step that fails. On 2026-10-21 it printed
+none, and every digest was unchanged after the runs.
+
+* `exp-0011-scan.py` reads the exFAT volume of an image's first MBR or
+  GPT partition from the specification, and lists every entry set, live
+  and deleted: checksum with InUse restored, the three timestamps with
+  their 10 ms fields and offset bytes, the allocation as runs, whether a
+  chain ends in `FFFFFFFFh`, and which clusters the bitmap marks in use.
+  With `--deleted-dirs` it also reads a deleted directory whose clusters
+  are all free and were not read before, and marks the sets found in it
+  as deleted. It was written apart from EXP-0009's scripts and from
+  Taphonomy.
+* `exp-0011-score-nist.py` decides every deleted set under each rule
+  and scores it against NIST's ground truth. NIST's tool tags every
+  512-byte block: "File X" for block 0, "Block n Segment s file X" after
+  it, "Tail X" last, and "Empty Sector … not used" where nothing was
+  written. A recovery is **right** when its blocks are blocks 0, 1, 2 …
+  of one file in order and the tag names the entry. Where NIST tagged a
+  non-ASCII name with an ASCII stand-in (dfr-04), only the order is
+  checked. It is **wrong** when it holds another file's blocks, blocks
+  out of order, or unwritten sectors. macOS's own files carry no tag,
+  and are judged by their format instead: an AppleDouble file (`._*`)
+  begins `00 05 16 07`, an fseventsd log (named by 16 hexadecimal
+  digits) is gzip, `1f 8b`, and `fseventsd-uuid` is a UUID. A file
+  holding another format is **wrong**. The format proves the format,
+  not identity. A file of no known format would be **unjudged**; none
+  was recovered.
+* `exp-0011-score-exp9.py` does the same for images A and B against
+  EXP-0009's generator, re-implemented from its documented format and
+  checked against EXP-0009's four target digests.
+* `exp-0011-score-linux.py` compares each deleted file on `fs.exfat`
+  with the published original by SHA-256.
+* `exp-0011-check-bitmap.py` checks the bitmap's chain, and whether
+  every cluster of the root, each directory read, the bitmap and the
+  up-case table is marked in use.
+* Second method for NIST: `exp-0011-pdf-text.py` turns NIST's layout
+  document into text, and `exp-0011-sector-list.py` compares the extent
+  of each recovery with the document's `Sector List` for that file. The
+  extraction is partial.
+
+The rules scored:
+
+| Variant | Rule |
+| --- | --- |
+| `adr` | ADR-0019 section 4 as written, creation times compared in UTC by the stored offsets |
+| `m` | and a rival last modified at or after this set's creation also refuses it |
+| `o` | times compared only where both offset bytes are valid and equal and every field is in range; otherwise refused |
+| `e` | ValidDataLength 0 with data, and a first cluster with DataLength 0, refused |
+| `moe` | `m`, `o` and `e` together: the rule ADR-0019 Appendix C and ADR-0022 adopt |
+| `u` | any orphan secondary, unreadable deleted directory or unusable set refuses every set on the volume |
+| `lit` | `moe`, and any deleted directory at all also refuses every set: section 4's "only if all of these hold" read literally |
+| `adrc`, `moec` | `adr` and `moe` with deleted directories read for their claims, nothing inside them decided: what M15 does |
+
+Two tables per image: deleted directories not read (`unread`), and
+read (`read`). `adrc` and `moec` are scored on the `read` tables. On
+them, a set inside a deleted directory counts among the refused, since
+it is not recovered.
+
+### Expected result
+
+Not applicable: see Hypothesis.
+
+### Actual result
+
+| | Result |
+| --- | --- |
+| H1 | False. Three wrong recoveries with claims read, eight without (below). |
+| H2 | False. It refuses 2 correct files, and one wrong one. |
+| H3 | False. Every NIST volume holds a deleted directory. |
+| H4 | True of macOS. Not exercised for Linux. |
+| H5 | True on all 23 images checked. |
+| H6 | False. macOS's own files carry no tag, and are judged by format. |
+
+**NIST, all twenty, totals:**
+
+| Table | Variant | Recovered right | Recovered wrong | Refused right | Refused wrong |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `unread` | `adr` | 658 | 8 | 7 | 35 |
+| `unread` | `m`, `mo`, `moe` | 656 | 7 | 9 | 36 |
+| `unread` | `o`, `e` | as `adr` | | | |
+| `unread` | `u` | 644 | 8 | 21 | 35 |
+| `unread` | `lit` | 0 | 0 | 665 | 43 |
+| `read` | `adrc` | 658 | 3 | 33 | 41 |
+| `read` | `moec` (M15) | 656 | 2 | 35 | 42 |
+| `read` | `adr` | 681 | 4 | 10 | 40 |
+| `read` | `moe` (M16) | 679 | 2 | 12 | 42 |
+| `read` | `lit` | 0 | 0 | 691 | 44 |
+
+No recovery under any variant is unjudged, and none holds unwritten
+sectors. Under `adrc` and `moec`, "refused right" includes the 23
+correct sets inside readable deleted directories, which those variants
+do not recover.
+
+**NIST, per image, recovered right / wrong:**
+
+```text
+image               sets  unread    unread    claims    read
+                          adr       moe       moec      moe
+dfr-01-xfat            4     1/1       1/1       1/0       3/0
+dfr-02-xfat            4     1/1       1/1       1/1       1/1
+dfr-03-xfat            4     1/1       1/1       1/0       3/0
+dfr-04-xfat           15    12/1      12/1      12/0      14/0
+dfr-05-braid-xfat      4     3/0       3/0       3/0       3/0
+dfr-05-nest-xfat       5     2/1       2/1       2/0       4/0
+dfr-05-xfat            5     2/1       2/1       2/1       3/1
+dfr-06-xfat            3     2/0       2/0       2/0       2/0
+dfr-07-one-xfat        4     2/0       2/0       2/0       2/0
+dfr-07-two-xfat        3     1/0       1/0       1/0       1/0
+dfr-07-xfat            5     4/0       4/0       4/0       4/0
+dfr-08-xfat           15    14/0      14/0      14/0      14/0
+dfr-09-xfat          262   261/0     261/0     261/0     261/0
+dfr-10-xfat          262   261/0     261/0     261/0     261/0
+dfr-11-xfat            4     1/0       1/0       1/0       5/0
+dfr-12-xfat            8     3/1       3/1       3/0      11/0
+dfr-13-xfat          121    84/1      82/0      82/0      84/0
+dfr-15-xfat            2     1/0       1/0       1/0       1/0
+dfr-16-xfat            2     1/0       1/0       1/0       1/0
+dfr-17-xfat            2     1/0       1/0       1/0       1/0
+```
+
+"sets" counts deleted sets outside deleted directories (the `unread`
+tables). Columns are recovered right / wrong.
+
+**The wrong recoveries.**
+
+* dfr-13, `/Ursa/B104-beta=s-s=D=s-s=C-1.txt`: its cluster holds
+  segment 3 of `B083-alpha=s-s=C=a-a=D-2.txt`, from that file's block 24.
+  NIST's build steps for dfr-13 append to files after others are
+  created. `m` refuses it, and also refuses
+  `/Taurus/B148-beta=s-s=C=a-a=D-1.txt` and
+  `/Taurus/B151-beta=s-s=C=a-a=D-4.txt`, which hold their own data. These
+  three are the only decisions that differ between `adrc` and `moec`.
+* `/.Trashes/._501` at cluster 10 on dfr-01, 03, 04, 05-nest and 12,
+  recovered under every variant but `lit` on the `unread` tables, holds
+  gzip data, not AppleDouble. On each, a set inside the deleted
+  `/.fseventsd` claims cluster 10, so reading deleted directories for
+  their claims refuses all five.
+* `/.Trashes/._501` on dfr-02 and dfr-05 holds gzip data under every
+  variant but `lit`. On dfr-05 a deleted fseventsd log inside the
+  deleted `/.fseventsd` claims the same cluster, and its creation and
+  modification times are both earlier than `._501`'s creation. On
+  dfr-02 no entry the walk finds claims the cluster. Neither is
+  prevented by any rule scored.
+* Under `adr` on the `read` tables, which recover inside deleted
+  directories, one fseventsd log inside the deleted `/.fseventsd` of
+  dfr-02 holds another format; `m` refuses it.
+
+**The second method.** 54 of the recoveries under `moe` on the `read`
+tables could be compared with NIST's sector lists. 47 equal them. The
+other 7 differ only through the text extraction: five have a page number
+joined to their last sector (`391-39881` for 391 to 398, on page 81),
+one has its tail sector listed apart (`2400 TAIL/Betelgeuse` in the
+layout history), and one lists the same two runs in ascending order. 627
+have no list in the extracted text. NIST's list of overlaps ("A x B:
+overlap") names pairs of files, not which wrote last. In dfr-12, the
+files written at step 5 into sectors freed at step 4 hold their own
+data by their tags.
+
+**Deleted directories.** Every NIST volume holds at least one: macOS's
+`/.Trashes/501` and others. On eleven, `/.Trashes/501`'s cluster is in
+use again, so it cannot be read. 27 sets lie inside those that can be.
+Reading them for their claims prevents five wrong recoveries (above).
+Recovering them as well adds 23 correct recoveries, among them the
+targets of DFR-11 and DFR-12, and no wrong one. macOS leaves the
+entries inside a deleted directory marked in use.
+
+**macOS and the FAT chain.** The 14 fragmented deleted files of DFR-02,
+03, 05, 05-braid, 05-nest and 12 are recovered by their chains, each
+right. The 8 sets refused under condition 4 are all on dfr-13. Each
+chain ends before its DataLength is covered, because later files
+reused its clusters.
+
+**Offsets.** On every NIST volume, all deleted sets carry one offset
+byte: `0x90` (valid, UTC+4 h), or `0x94` (UTC+5 h) on dfr-15 and
+dfr-17. NIST's log records the deletions in EDT, UTC-4 h, so `0x90` is
+the sign-switched offset Nordvik and Axelsson (2022) report of macOS.
+On dfr-15, seven live sets carry `0xEC` (UTC-5 h) beside sets carrying
+`0x94`. Which systems wrote them was not established. No two deleted
+sets with different bytes claim a cluster, so `o` changes nothing.
+
+**Unused secondaries outside a set.** Three: a File Name entry in
+dfr-08's root, and entries of types `66h` and `71h` inside deleted
+directories. No unused Stream Extension lies outside a set anywhere.
+
+**EXP-0009, against the generator**, identical under `adr-0019`, `c2m`
+(`m`) and `moe`:
+
+* B: 99 recovered, each equal to the file written, `FRAG.bin` by its
+  chain; 3 refused under condition 2; `FILL006.bin` under condition 1;
+  16 under condition 3; 6 with no data.
+* A: 96 recovered, each right; 4 refused under condition 1, the clusters
+  of the live `FRAG.bin`; 16 under condition 3; 6 with no data.
+
+No deleted set on either is unusable, all 125 on B included.
+
+**Linux.** `fs.exfat` holds 4 deleted directories in its root, which
+hold 18 deleted files. Read with deleted directories, all 18 equal the
+originals by SHA-256. All are contiguous, so the FAT chain was not
+exercised. Every offset byte is `0x80` (valid, UTC+0), which is what
+Nordvik and Axelsson report of the native Linux driver. Taphonomy at
+`a89a122` lists the 18 live files with the originals' names and sizes.
+In `fs.multiple`, the exFAT partition declares 103,809,024 bytes in a
+partition of 41,943,040, running into the NTFS partition after it, and
+Taphonomy refuses its boot region, as ADR-0021 section 3 decides.
+
+**The bitmap.** On A, B, the twenty NIST images and `fs.exfat`, the
+bitmap is one cluster, its chain ends in `FFFFFFFFh`, and every
+structure cluster is marked in use.
+
+**How many clusters deleted sets claim.** On every image, the clusters
+claimed by deleted sets, deleted directories read, are at most 1.00
+times the volume's cluster count: NIST's dfr-06, one large file.
+
+**Taphonomy at `a89a122`** reads NIST's eleven MBR images without
+error, counting their deleted sets as not examined. It reports the nine
+GPT images as "GPT not analysed".
+
+### Conclusion
+
+1. **ADR-0019 section 4 recovered wrong files on a public set.** One is
+   an append: creation time does not say who wrote a cluster last.
+   Adding the rival's modification time removes it, at a cost of 2
+   correct files in 658. ADR-0019 Appendix C adopts it.
+2. **Claims inside deleted directories matter.** Left unread, they let
+   five files be recovered over data a deleted directory's file wrote.
+   ADR-0022 Decision K reads deleted directories for their claims.
+3. **Two wrong recoveries remain.** Under the rule adopted, M15's
+   configuration recovers 656 correct files and 2 wrong ones on NIST's
+   images, both macOS's own `._501` holding stale data that is not
+   zeros. No rule scored prevents them except refusing everything.
+4. **Refusing a whole volume for any unseen claim is not usable.** Read
+   literally it recovers nothing on any NIST image. ADR-0022 Decision D
+   judges condition 2 over the claims seen and counts the rest as gaps.
+5. **macOS leaves FAT chains on deletion, as Windows does.** A deleted
+   fragmented exFAT file is recoverable by its chain from both.
+6. **Deleted directories hold recoverable files on macOS and Linux.**
+   Recovering them is M16.
+7. **The offset rule, the two refused shapes, and reading the bitmap as
+   a chain are exercised by no public image found.** Unit tests must
+   hold them.
+
+### Limitations
+
+1. The scripts' rules are a second implementation, not Taphonomy's.
+   M15 must be run against the same images and agree.
+2. The second method covers 54 of the recoveries.
+3. macOS's own files are judged by format, which proves the format and
+   not identity: a recovered file of the right format could still be
+   another file of that format.
+4. Only part of NIST's layout document survived text extraction.
+5. The NIST images are from 2011 and 2012, made on one macOS release.
+   The Linux image was made in 2020 by one copy and one `rm -rf`.
+6. The scripts do not implement ADR-0022's bitmap gate, orphan-stream
+   claims, bounds or hand-back rule. None of these arises on these
+   images, where no deleted set is unusable and no Stream Extension is
+   orphaned. They read a deleted directory only where every cluster is
+   free and none was read before, as ADR-0022 Decision K does.
+
+### External practice
+
+NIST's page notes that tests 02, 03, 05, 05-braid and 05-nest "often
+produce interesting results, especially for the FAT images", because a
+tool that has only a first cluster and a size guesses at the rest. On
+exFAT the chain answers that question where the deleting system kept
+it.
+
+### Next action
+
+1. ADR-0022, ADR-0019 Appendix C, ADR-0014 Appendix F, ADR-0003
+   Appendix C.
+2. M15, accepted against these images (ADR-0022 section 14).
+3. M16: recovering inside deleted directories, against DFR-11, DFR-12
+   and the Linux image.
+4. GPT, so that NIST's nine GPT images can be run through Taphonomy.

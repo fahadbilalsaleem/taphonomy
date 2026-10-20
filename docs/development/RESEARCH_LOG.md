@@ -419,3 +419,98 @@ from Taphonomy and on its two-image scope.
   recorded in `KNOWN_ISSUES.md`.
 * No fixture holds either directory shape. One would need a volume
   edited after it was made, because no tool measured here writes one.
+
+---
+
+## 2026-10-21, exFAT: deleted entry sets, the allocation bitmap and timestamps
+
+### Objective
+
+Establish, before M15, how established implementations treat deleted
+exFAT entry sets and the allocation bitmap, what the specification
+says about timestamps and their UTC offsets, and what is known of
+attacks on the bitmap, so that ADR-0022 rests on more than one source.
+
+### Sources
+
+* Microsoft, *exFAT file system specification*, the Markdown source in
+  `MicrosoftDocs/win32`, SHA-256
+  `09454c9663cbd7b33c6dfe3ad37baa1351779ad5ab73034c53fcf864ccdee825`,
+  a third download with the same digest. Sections 6.2.1.4, 7.1 to
+  7.1.5.1, 7.4 to 7.4.10.2.
+* The Sleuth Kit, commit `51d8672`: `tsk/fs/exfatfs.c`,
+  `exfatfs_meta.c`, `exfatfs_dent.c`, `fatfs_meta.c`. Common Public
+  License 1.0; read, not copied.
+* TestDisk, commit `0aa4bc2`: `src/exfat_dir.c`. GPL-2.0-or-later;
+  read, not run, not copied.
+* exfatprogs, commit `8b42748`: `fsck/fsck.c`, `read_bitmap`.
+  GPL-2.0-or-later; read, not copied.
+* Linux, commit `f47d223`: `fs/exfat/balloc.c`, `dir.c`, `fatent.c`.
+  GPL-2.0-or-later; read, not copied.
+* CVE-2025-40307, the cve.org record, and its fix in `balloc.c`
+  (`exfat_test_bitmap_range`).
+* R. Nordvik and S. Axelsson, *It is about time: Do exFAT
+  implementations handle timestamps correctly?*, Forensic Science
+  International: Digital Investigation 42-43 (2022) 301476, CC BY,
+  DOI 10.1016/j.fsidi.2022.301476, confirmed through Crossref. Its
+  corrigendum (DOI 10.1016/j.fsidi.2023.301542) was not read.
+
+### Findings
+
+1. **Deleted sets.** On Windows, deletion clears the InUse bit of each
+   entry of the set and changes nothing else in it (EXP-0009). Linux
+   does the same per entry (`exfat_remove_entries`, which can also clear
+   only a set's trailing entries) and writes no FAT entry when it frees
+   clusters.
+2. **The Sleuth Kit never checks a SetChecksum.** `exfatfs_dent.c`
+   stores the field in `expected_check_sum` and nothing reads it.
+   Checked twice, by different searches. A deleted file is recovered
+   from its first cluster onward, skipping allocated clusters, with the
+   chain and NoFatChain ignored (`fatfs_meta.c`). This confirms in the
+   source what EXP-0009 inferred from its output.
+3. **TestDisk follows the FAT for every deleted file, NoFatChain
+   ignored**, although §6.3.4.2 says those entries are then not to be
+   interpreted. Where the first link is 0 it takes the next clusters
+   whose FAT entry is 0. It reads to DataLength, not ValidDataLength,
+   checks no SetChecksum and no bitmap, and continues after a read
+   error.
+4. **The bitmap is a chain.** §7.1.3: its FirstCluster is "the first
+   cluster of the cluster chain, as the FAT describes". The Sleuth Kit,
+   exfatprogs and Linux all read it as contiguous from that cluster.
+5. **A crafted bitmap is a known attack.** CVE-2025-40307: a volume
+   whose bitmap leaves the bitmap's own clusters free made Linux
+   reallocate them. Linux now refuses to mount unless they are marked
+   in use.
+6. **Timestamps are local.** §7.4.5 to §7.4.10: each timestamp is a
+   local time, with a 10 ms field of 0 to 199 for creation and
+   modification, and an offset in 15-minute steps with an OffsetValid
+   bit. With OffsetValid 0 an implementation "shall treat" the time as
+   having the reader's current offset, which for evidence means the
+   offset is unknown.
+7. **Implementations differ.** Nordvik and Axelsson measured that
+   Windows 10 follows the specification, macOS writes the offset with
+   its sign switched, exfat-fuse 1.3 writes `0x00` (invalid), and the
+   native Linux driver writes `0x80` (UTC+0). EXP-0011 saw the macOS
+   sign on NIST's images and `0x80` on a Linux-made image.
+
+### Implications
+
+* A deleted set is used only with its checksum valid, which no prior
+  implementation read here does (ADR-0022 Decision B).
+* The bitmap is read through its chain and checked against the
+  structure the walk knows to be in use (ADR-0022 Decision E).
+* Times are ordered only under the same valid offset byte (ADR-0019
+  Appendix C).
+
+### Confidence
+
+High for findings 1 to 6, each read from source or the specification;
+finding 2 checked twice. Finding 7 rests on the paper, and on EXP-0011
+for the macOS sign and the Linux byte. TestDisk's behaviour is read,
+not measured.
+
+### Follow-up
+
+* Read the paper's corrigendum.
+* Measure Linux's deletion of a fragmented file, which EXP-0011 did not
+  exercise.
