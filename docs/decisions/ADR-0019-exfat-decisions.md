@@ -174,3 +174,27 @@ text remaining in image B is boot code, directory names, `BOOTMGR`, the
 `System Volume Information` files and one volume GUID. The entries'
 timestamps and UTC offset and the VHD footer's creation time were not
 examined.
+
+---
+
+## Appendix B: §6 gates recovery, not read-only analysis (2026-10-20)
+
+§6 lists four conditions that hold "before the exFAT code is merged".
+M14 merged exFAT code that reads a volume and recovers nothing: the boot
+region (`e7985de`), directories and live entries (`eabedde`), and live
+file content (`97c9242`). Of §6's items, 3 and 4 held when each was
+merged. Items 1 and 2 did not, and could not: they are about recovering
+deleted files from image B, which M14 does not do.
+
+§6 is read as gating the code that recovers deleted files and the claims
+§5 constrains, which are claims about deleted data. M14 makes none. It
+counts every deleted entry set as not examined, which leaves a volume
+that has them reported as incomplete (`ADR-0021` section 6), and
+`--recover` writes nothing for an exFAT volume. Item 3, live files on
+image A, was the condition that applied to M14, and
+`tests/exfat_content.rs` asserts it. Item 4 is checked for every change
+by the method of `ADR-0018` §5.
+
+M15, the recovery of deleted files, does not merge until items 1 and 2
+hold, with item 4 for its own change. Nothing in §6's four items, or in
+§5, changes.

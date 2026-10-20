@@ -1125,3 +1125,67 @@ itself invalid: a missing signature. (`LengthOverflow` is a third
 `u32`; their sum as `u64` cannot overflow, so no input reaches it. That
 appears to be unreachable at this call site, independent of this fix —
 worth a separate look, not corrected here.)
+
+---
+
+## Appendix E: exFAT adds three gap kinds and widens four (2026-10-20)
+
+M14 analyses exFAT volumes (`ADR-0021`). §A.7's taxonomy, as later
+extended, named FAT32 structures. This appendix records how exFAT's
+findings are counted. Every count below is a gap under §B.5, so a run
+that has any of them is `incomplete`, or `none` if no volume was
+analysed.
+
+**Three new kinds**, each counted once per occurrence:
+
+* `exfat_sets_refused`, printed "entry sets not used": an entry set, or
+  a single entry, that was not used because its SetChecksum was wrong,
+  it was malformed, or it was not recognised (`ADR-0019` Decision C,
+  `ADR-0021` section 4). Its content may be real and was not analysed.
+* `exfat_deleted_sets_not_examined`, printed "deleted sets not
+  examined": an unused File entry, the start of a deleted entry set.
+  M14 does not examine deleted sets; M15 does. Counting them is what
+  keeps a volume with deleted files from being reported complete
+  (`SAFETY.md` §12).
+* `exfat_end_marker_residue`, printed "entries after end marker": a
+  directory holding entries of a type other than `00h` after its end
+  marker, which the specification says cannot occur. Counted once per
+  directory; the entries are not interpreted.
+
+These are new kinds and not cases of the old ones. They describe content
+inside a directory that was read, where the old kinds describe a
+partition, volume or directory that was not.
+
+**Four existing kinds now include exFAT:**
+
+* Kind 4, identified and not analysed: TexFAT, an exFAT volume with two
+  FATs, is counted here (`unsupported`).
+* Kind 5, boot sector rejected: an exFAT volume whose main and backup
+  boot regions were both refused, or whose backup search found two
+  valid regions, is counted here (`boot_rejected`).
+* Kind 6, root not enumerated: an exFAT root that could not be read,
+  including one holding an unrecognised critical primary entry, which
+  makes the volume invalid (`root_unread`).
+* Kind 8, directory named and not read: an exFAT directory that could
+  not be read, or was read only in part, for any reason
+  `ExFatDirectoryError` names, including the allocation faults of
+  `ADR-0021` Decision L; a directory deeper than the depth bound; and
+  the directories left when a safety bound is reached
+  (`directories_unread`).
+
+**Reached by.** EXP-0009's images A and B reach
+`exfat_deleted_sets_not_examined` (122 and 125) and nothing else, so
+both report `incomplete`, measured 2026-10-20. The other two new kinds,
+and the exFAT cases of kinds 4, 5, 6 and 8, are reached by unit tests
+on volumes built in memory, not by fixtures. A copy of image A with its
+first sector zeroed reaches the backup boot region and reports the same
+as A.
+
+**One limit.** When a partition of type `0x07` whose first sector
+identifies nothing is probed for an exFAT backup region and a read
+fails, the partition is counted under kind 4 as unidentified, not under
+kind 3 as unread. `ADR-0021` section 3 records it as a known limitation.
+
+§11's trigger, a deleted file's extent established from surviving
+evidence, is not met by M14, which recovers nothing. M15 meets it, and
+`ADR-0022` takes it up.
