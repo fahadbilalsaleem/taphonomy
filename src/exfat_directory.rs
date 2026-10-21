@@ -30,7 +30,9 @@
 //! not used. Deleted entry sets, those whose `InUse` bit is clear, are not
 //! examined in this milestone: an unused File entry is counted, and nothing
 //! in its secondaries is interpreted. The allocation bitmap's entry is
-//! located and range checked, and its contents are not read.
+//! located and range checked by the walk. Its contents are read only
+//! through [`ExFatReader::open_bitmap`] and
+//! [`ExFatReader::cluster_allocated`], which the walk does not call yet.
 //!
 //! # Content
 //!
@@ -216,9 +218,10 @@ impl ExFatFile {
     }
 }
 
-/// The allocation bitmap's entry, located and range checked.
+/// The allocation bitmap's entry, located and range checked by the walk.
 ///
-/// Its contents are not read in this milestone.
+/// Its contents are read only through [`ExFatReader::open_bitmap`] and
+/// [`ExFatReader::cluster_allocated`], which the walk does not call yet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExFatBitmapEntry {
     /// First cluster of the bitmap, which the FAT describes.
@@ -226,6 +229,161 @@ pub struct ExFatBitmapEntry {
 
     /// Size of the bitmap in bytes.
     pub data_length: u64,
+}
+
+/// The allocation bitmap, located through its FAT chain (section 7.1.3).
+///
+/// Holds where the bitmap's clusters are and one sector of it, so a lookup
+/// costs at most one sector read. The runs grow with how fragmented the
+/// bitmap's chain is, and are bounded by the bitmap the volume needs: at most
+/// 2^20 clusters, whatever the evidence's size.
+#[derive(Debug)]
+pub struct ExFatBitmap {
+    /// The bitmap's clusters, in chain order, as runs of consecutive ones.
+    runs: Vec<BitmapRun>,
+
+    /// The one bitmap sector held, and its index within the bitmap.
+    sector: Vec<u8>,
+    sector_index: Option<u64>,
+
+    /// The volume the bitmap was opened on. A lookup through a reader of
+    /// another volume is refused, so the runs and the sector buffer are
+    /// never applied to a geometry they were not built for.
+    volume: BitmapVolume,
+}
+
+/// What identifies the volume a bitmap belongs to: where it starts and the
+/// geometry its runs and sector buffer were sized from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BitmapVolume {
+    volume_start: u64,
+    bytes_per_sector_shift: u8,
+    sectors_per_cluster_shift: u8,
+    cluster_heap_offset: u32,
+    cluster_count: u32,
+}
+
+impl ExFatBitmap {
+    /// Clusters the bitmap occupies.
+    pub fn clusters(&self) -> u64 {
+        self.runs.iter().map(|r| r.clusters as u64).sum()
+    }
+}
+
+/// Consecutive clusters of the bitmap: `clusters` of them from `first`,
+/// holding the bitmap's clusters from index `start` on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BitmapRun {
+    start: u32,
+    first: u32,
+    clusters: u32,
+}
+
+/// Why the allocation bitmap could not be located or read.
+#[derive(Debug)]
+pub enum ExFatBitmapError {
+    /// The evidence could not be read.
+    Evidence(Error),
+
+    /// The bitmap's first cluster lies outside the cluster heap.
+    FirstClusterOutOfRange { cluster: u32 },
+
+    /// The bitmap has fewer bits than the volume has clusters.
+    TooShort { data_length: u64, needed: u64 },
+
+    /// The bitmap is longer than the volume's clusters need, rounded up to
+    /// a whole cluster: `limit` bytes.
+    ///
+    /// A choice of this project. Section 7.1.5 allows reserved bits after
+    /// the last cluster's; mkfs.exfat writes none (`round_up(clusters, 8) /
+    /// 8`), exfatprogs' checker treats any other length as an error, and
+    /// The Sleuth Kit refuses any length but the exact one. Refusing a
+    /// longer one bounds both the chain walked and the runs held by the
+    /// bitmap's size, not the evidence's. Every image in EXP-0011 has a
+    /// bitmap of exactly the needed length, so none is refused.
+    LongerThanVolumeNeeds { data_length: u64, limit: u64 },
+
+    /// A FAT entry the FAT region does not hold.
+    FatOutOfRange { cluster: u32 },
+
+    /// The bitmap's chain reaches a cluster the FAT marks bad.
+    BadCluster { cluster: u32 },
+
+    /// A FAT entry links outside the heap, or to a free or reserved one.
+    LinkOutOfRange { from: u32, to: u32 },
+
+    /// The chain ends at `cluster`, before the `needed` clusters
+    /// `DataLength` takes.
+    ChainEndsEarly { cluster: u32, needed: u64 },
+
+    /// The chain goes on past `cluster`, the last of the `needed` clusters
+    /// `DataLength` takes. A choice of this project, as for content.
+    ChainLongerThanData { cluster: u32, needed: u64 },
+
+    /// A cluster asked about lies outside the cluster heap.
+    ClusterOutOfRange { cluster: u32 },
+
+    /// The bitmap was opened on another volume than the reader's.
+    OtherVolume,
+}
+
+impl fmt::Display for ExFatBitmapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(e) => write!(f, "{e}"),
+            Self::FirstClusterOutOfRange { cluster } => write!(
+                f,
+                "allocation bitmap first cluster {cluster} is outside the cluster heap"
+            ),
+            Self::TooShort {
+                data_length,
+                needed,
+            } => write!(
+                f,
+                "allocation bitmap of {data_length} bytes is shorter than the {needed} the volume needs"
+            ),
+            Self::LongerThanVolumeNeeds { data_length, limit } => write!(
+                f,
+                "allocation bitmap of {data_length} bytes is longer than the {limit} the volume's clusters need"
+            ),
+            Self::FatOutOfRange { cluster } => {
+                write!(f, "the FAT does not hold an entry for cluster {cluster}")
+            }
+            Self::BadCluster { cluster } => {
+                write!(f, "allocation bitmap chain reaches bad cluster {cluster}")
+            }
+            Self::LinkOutOfRange { from, to } => {
+                write!(f, "cluster {from} links to {to}, outside the cluster heap")
+            }
+            Self::ChainEndsEarly { cluster, needed } => write!(
+                f,
+                "allocation bitmap chain ends at cluster {cluster}, short of the {needed} clusters its length needs"
+            ),
+            Self::ChainLongerThanData { cluster, needed } => write!(
+                f,
+                "allocation bitmap chain goes on past cluster {cluster}, the last of the {needed} its length needs"
+            ),
+            Self::ClusterOutOfRange { cluster } => {
+                write!(f, "cluster {cluster} is outside the cluster heap")
+            }
+            Self::OtherVolume => f.write_str("allocation bitmap belongs to another volume"),
+        }
+    }
+}
+
+impl std::error::Error for ExFatBitmapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Evidence(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for ExFatBitmapError {
+    fn from(e: Error) -> Self {
+        Self::Evidence(e)
+    }
 }
 
 /// Why an entry set, or an entry, was not used.
@@ -963,6 +1121,134 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         }
     }
 
+    /// Locates the allocation bitmap's clusters through its FAT chain.
+    ///
+    /// The entry is checked again, because its fields are public. The chain
+    /// is held to the rules content is: exactly `ceil(DataLength / cluster
+    /// size)` clusters, each link but the last a next cluster in the heap,
+    /// the last the end of the chain (ADR-0022 Decision E). Reads the FAT,
+    /// and no bitmap data.
+    pub fn open_bitmap(
+        &mut self,
+        entry: &ExFatBitmapEntry,
+    ) -> Result<ExFatBitmap, ExFatBitmapError> {
+        let cluster_bytes = self.boot.cluster_bytes() as u64;
+        let last_cluster = self.boot.cluster_count as u64 + 1;
+        if entry.first_cluster < 2 || entry.first_cluster as u64 > last_cluster {
+            return Err(ExFatBitmapError::FirstClusterOutOfRange {
+                cluster: entry.first_cluster,
+            });
+        }
+        let needed_bytes = (self.boot.cluster_count as u64).div_ceil(8);
+        if entry.data_length < needed_bytes {
+            return Err(ExFatBitmapError::TooShort {
+                data_length: entry.data_length,
+                needed: needed_bytes,
+            });
+        }
+        // Bounds the walk below, and the runs it holds, by the bitmap the
+        // volume needs: at most 2^20 clusters, whatever the evidence's size.
+        // Without it a crafted length would have a cycle in the FAT followed
+        // for that many links, and a fragmented chain held a run per link.
+        let limit = needed_bytes.div_ceil(cluster_bytes) * cluster_bytes;
+        if entry.data_length > limit {
+            return Err(ExFatBitmapError::LongerThanVolumeNeeds {
+                data_length: entry.data_length,
+                limit,
+            });
+        }
+
+        let needed = entry.data_length.div_ceil(cluster_bytes);
+        let mut runs: Vec<BitmapRun> = Vec::new();
+        let mut cluster = entry.first_cluster;
+        for index in 0..needed {
+            match runs.last_mut() {
+                Some(run) if run.first as u64 + run.clusters as u64 == cluster as u64 => {
+                    run.clusters += 1;
+                }
+                // `needed` is at most ClusterCount, so the index fits.
+                _ => runs.push(BitmapRun {
+                    start: index as u32,
+                    first: cluster,
+                    clusters: 1,
+                }),
+            }
+            let link = match self.fat_link(cluster)? {
+                None => return Err(ExFatBitmapError::FatOutOfRange { cluster }),
+                Some(Link::Bad) => return Err(ExFatBitmapError::BadCluster { cluster }),
+                Some(Link::Invalid(to)) => {
+                    return Err(ExFatBitmapError::LinkOutOfRange { from: cluster, to });
+                }
+                Some(link) => link,
+            };
+            match (link, index + 1 == needed) {
+                (Link::End, true) => {}
+                (Link::Next(next), false) => cluster = next,
+                (Link::End, false) => {
+                    return Err(ExFatBitmapError::ChainEndsEarly { cluster, needed });
+                }
+                _ => return Err(ExFatBitmapError::ChainLongerThanData { cluster, needed }),
+            }
+        }
+
+        Ok(ExFatBitmap {
+            runs,
+            sector: vec![0u8; self.boot.bytes_per_sector() as usize],
+            sector_index: None,
+            volume: self.bitmap_volume(),
+        })
+    }
+
+    /// The volume this reader reads, as a bitmap records it.
+    fn bitmap_volume(&self) -> BitmapVolume {
+        BitmapVolume {
+            volume_start: self.volume_start,
+            bytes_per_sector_shift: self.boot.bytes_per_sector_shift,
+            sectors_per_cluster_shift: self.boot.sectors_per_cluster_shift,
+            cluster_heap_offset: self.boot.cluster_heap_offset,
+            cluster_count: self.boot.cluster_count,
+        }
+    }
+
+    /// Whether the bitmap marks `cluster` in use: bit `cluster - 2`, the
+    /// lowest-order bit of a byte first (section 7.1.5). Reads at most one
+    /// sector of the bitmap, and none where the sector is the one held.
+    pub fn cluster_allocated(
+        &mut self,
+        bitmap: &mut ExFatBitmap,
+        cluster: u32,
+    ) -> Result<bool, ExFatBitmapError> {
+        if bitmap.volume != self.bitmap_volume() {
+            return Err(ExFatBitmapError::OtherVolume);
+        }
+        if cluster < 2 || cluster as u64 > self.boot.cluster_count as u64 + 1 {
+            return Err(ExFatBitmapError::ClusterOutOfRange { cluster });
+        }
+        let bit = (cluster - 2) as u64;
+        let byte = bit >> 3;
+        let shift = self.boot.bytes_per_sector_shift;
+        let sector_index = byte >> shift;
+
+        if bitmap.sector_index != Some(sector_index) {
+            // Cleared first: a failed read must not leave the old index
+            // naming bytes that are no longer there.
+            bitmap.sector_index = None;
+            let cluster_bytes = self.boot.cluster_bytes() as u64;
+            // Below the chain's length: `byte` is under ceil(ClusterCount /
+            // 8), which open_bitmap held DataLength to.
+            let chain_index = (byte / cluster_bytes) as u32;
+            let run = bitmap.runs[bitmap.runs.partition_point(|r| r.start <= chain_index) - 1];
+            let held = run.first + (chain_index - run.start);
+            let within = (byte % cluster_bytes) & !((1u64 << shift) - 1);
+            let offset = self.cluster_offset(held) + within;
+            self.reader.read_exact_at(offset, &mut bitmap.sector)?;
+            bitmap.sector_index = Some(sector_index);
+        }
+
+        let in_sector = (byte & ((1u64 << shift) - 1)) as usize;
+        Ok((bitmap.sector[in_sector] >> (bit & 7)) & 1 == 1)
+    }
+
     /// What the FAT says follows `cluster` in a file's chain: the next
     /// cluster, or the end. Anything else is an error naming the cluster.
     fn content_link(&mut self, cluster: u32) -> Result<Link, ExFatContentError> {
@@ -1343,7 +1629,9 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         Ok(())
     }
 
-    /// The allocation bitmap's entry: located and range checked, never read.
+    /// The allocation bitmap's entry: located and range checked. Its
+    /// contents are read only through [`Self::open_bitmap`] and
+    /// [`Self::cluster_allocated`], which the walk does not call yet.
     fn read_bitmap(
         &self,
         entry: &RawBytes,
@@ -1908,6 +2196,194 @@ pub(crate) mod tests {
             "the walk did not reach the entry after the refused set: {seen:?}"
         );
         refusals[0].clone()
+    }
+
+    // --- the allocation bitmap ----------------------------------------------
+
+    /// Sets the bit of each of `clusters` in a bitmap whose clusters are
+    /// `held`, in order.
+    fn mark(vol: &mut Vol, held: &[u32], clusters: &[u32]) {
+        for &c in clusters {
+            let byte = (c - 2) as u64 / 8;
+            let at = Vol::cluster_offset(held[(byte / 512) as usize]) + byte % 512;
+            let mut current = [0u8; 1];
+            vol.image
+                .read_exact_at(at, &mut current)
+                .expect("in the image");
+            vol.image.write(at, &[current[0] | 1 << ((c - 2) % 8)]);
+        }
+    }
+
+    fn bitmap_at(first: u32, data_length: u64) -> ExFatBitmapEntry {
+        ExFatBitmapEntry {
+            first_cluster: first,
+            data_length,
+        }
+    }
+
+    #[test]
+    fn a_bitmap_of_one_cluster_answers_for_each_cluster() {
+        let mut vol = Vol::new();
+        vol.chain(&[3]);
+        mark(&mut vol, &[3], &[2, 9, 201]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+
+        let mut bitmap = reader.open_bitmap(&bitmap_at(3, 25)).expect("opens");
+        assert_eq!(bitmap.clusters(), 1);
+        for (cluster, allocated) in [(2, true), (3, false), (9, true), (10, false), (201, true)] {
+            assert_eq!(
+                reader
+                    .cluster_allocated(&mut bitmap, cluster)
+                    .expect("reads"),
+                allocated,
+                "cluster {cluster}"
+            );
+        }
+    }
+
+    /// The bitmap's second cluster is 20, not 11: read contiguously, the
+    /// answer for cluster 4200 would come from cluster 11, which holds none.
+    /// Cluster 11 ends a chain of its own, so a walk that took it would open
+    /// and answer wrongly rather than fail.
+    #[test]
+    fn a_bitmap_that_is_a_chain_is_read_through_the_fat() {
+        let mut vol = Vol::new();
+        vol.boot.cluster_count = 5000;
+        vol.chain(&[10, 20]);
+        vol.fat(11, FAT_END_OF_CHAIN);
+        mark(&mut vol, &[10, 20], &[4200]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+
+        let mut bitmap = reader.open_bitmap(&bitmap_at(10, 1024)).expect("opens");
+        assert_eq!(bitmap.clusters(), 2);
+        assert!(reader.cluster_allocated(&mut bitmap, 4200).expect("reads"));
+        assert!(!reader.cluster_allocated(&mut bitmap, 4201).expect("reads"));
+        assert!(!reader.cluster_allocated(&mut bitmap, 2).expect("reads"));
+    }
+
+    #[test]
+    fn a_bitmap_chain_that_ends_early_is_refused() {
+        let mut vol = Vol::new();
+        vol.boot.cluster_count = 5000;
+        vol.chain(&[10]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(10, 1024)),
+            Err(ExFatBitmapError::ChainEndsEarly {
+                cluster: 10,
+                needed: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn a_bitmap_chain_longer_than_its_length_is_refused() {
+        let mut vol = Vol::new();
+        vol.chain(&[3, 4]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(3, 25)),
+            Err(ExFatBitmapError::ChainLongerThanData {
+                cluster: 3,
+                needed: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn a_bitmap_chain_through_a_bad_or_out_of_heap_link_is_refused() {
+        let mut vol = Vol::new();
+        vol.boot.cluster_count = 5000;
+        vol.fat(10, FAT_BAD_CLUSTER);
+        vol.fat(30, 1);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(10, 1024)),
+            Err(ExFatBitmapError::BadCluster { cluster: 10 })
+        ));
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(30, 1024)),
+            Err(ExFatBitmapError::LinkOutOfRange { from: 30, to: 1 })
+        ));
+    }
+
+    /// A length past the needed bytes rounded up to a cluster is refused
+    /// before the FAT is read; one exactly at that limit is not. 200
+    /// clusters need 25 bytes, which round up to one 512-byte cluster.
+    #[test]
+    fn a_bitmap_longer_than_the_volume_needs_or_shorter_is_refused() {
+        let mut vol = Vol::new();
+        vol.chain(&[3]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(3, 513)),
+            Err(ExFatBitmapError::LongerThanVolumeNeeds {
+                data_length: 513,
+                limit: 512
+            })
+        ));
+        assert!(reader.open_bitmap(&bitmap_at(3, 512)).is_ok());
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(3, 200 * 512 + 1)),
+            Err(ExFatBitmapError::LongerThanVolumeNeeds {
+                data_length: 102_401,
+                limit: 512
+            })
+        ));
+        assert!(matches!(
+            reader.open_bitmap(&bitmap_at(3, 24)),
+            Err(ExFatBitmapError::TooShort {
+                data_length: 24,
+                needed: 25
+            })
+        ));
+        for first in [1, 202] {
+            assert!(matches!(
+                reader.open_bitmap(&bitmap_at(first, 25)),
+                Err(ExFatBitmapError::FirstClusterOutOfRange { cluster }) if cluster == first
+            ));
+        }
+    }
+
+    #[test]
+    fn a_cluster_outside_the_heap_has_no_answer() {
+        let mut vol = Vol::new();
+        vol.chain(&[3]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = reader.open_bitmap(&bitmap_at(3, 25)).expect("opens");
+        for asked in [0, 1, 202] {
+            assert!(matches!(
+                reader.cluster_allocated(&mut bitmap, asked),
+                Err(ExFatBitmapError::ClusterOutOfRange { cluster }) if cluster == asked
+            ));
+        }
+    }
+
+    /// A bitmap opened on one volume is refused by a reader of another,
+    /// whose sector size differs: its buffer and runs do not fit there.
+    #[test]
+    fn a_bitmap_is_refused_by_a_reader_of_another_volume() {
+        let mut vol = Vol::new();
+        vol.chain(&[3]);
+        let boot = vol.boot.clone();
+        let mut bitmap = {
+            let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+            reader.open_bitmap(&bitmap_at(3, 25)).expect("opens")
+        };
+        let mut other = boot.clone();
+        other.bytes_per_sector_shift = 12;
+        let mut reader = ExFatReader::new(&mut vol.image, &other, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.cluster_allocated(&mut bitmap, 2),
+            Err(ExFatBitmapError::OtherVolume)
+        ));
     }
 
     // --- checksum and names ---------------------------------------------------

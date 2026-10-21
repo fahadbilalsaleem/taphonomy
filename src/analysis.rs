@@ -546,17 +546,19 @@ impl RunCounts {
         self.unidentified
     }
 
-    /// A partition whose filesystem was identified and is not FAT32.
+    /// A partition whose filesystem was identified and is neither FAT32 nor
+    /// exFAT, or is TexFAT, which is exFAT with two FATs.
     pub const fn unsupported(&self) -> usize {
         self.unsupported
     }
 
-    /// A FAT32 volume whose boot sector was refused.
+    /// A FAT32 or exFAT volume whose boot sector or boot regions were
+    /// refused.
     pub const fn boot_rejected(&self) -> usize {
         self.boot_rejected
     }
 
-    /// A FAT32 volume whose root directory could not be enumerated.
+    /// A FAT32 or exFAT volume whose root directory could not be enumerated.
     pub const fn root_unread(&self) -> usize {
         self.root_unread
     }
@@ -640,10 +642,12 @@ impl RunCounts {
     ///
     /// The eleven kinds `ADR-0014` Appendix B.4 enumerates, the twelfth
     /// `ADR-0015` section 9 adds, the thirteenth `ADR-0016` Decision D adds,
-    /// the fourteenth `ADR-0017` Decision D adds, and a partition entry
-    /// dropped as malformed. Four of them no fixture reaches and one no
-    /// fixture can, which is why the derivation below is unit tested rather
-    /// than measured alone.
+    /// the fourteenth `ADR-0017` Decision D adds, a partition entry dropped
+    /// as malformed (`ADR-0014` Appendix D), and the three exFAT kinds
+    /// `ADR-0014` Appendix E adds. Not every kind is reached by a fixture,
+    /// and Appendices B.4 and E record which of theirs are; several are
+    /// reached only by unit tests, which is why the derivation below is unit
+    /// tested rather than measured alone.
     const fn gaps(&self) -> usize {
         self.table_unread
             + self.table_rejected

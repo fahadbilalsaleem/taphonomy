@@ -38,11 +38,11 @@
 //!
 //! A run also reports what it did not analyse. A directory that could not
 //! be read, a partition entry with no sectors or reaching past the end of
-//! the image, and a partition whose filesystem is not FAT32 are not
-//! analysed, and each such gap is counted and stated: coverage is complete,
-//! incomplete, or none. A run that analysed nothing past the evidence
-//! digest exits 3, so a caller cannot take a digest and a silent stdout for
-//! a whole analysis: ADR-0014 Appendix B.
+//! the image, and a partition whose filesystem is neither FAT32 nor exFAT
+//! are not analysed, and each such gap is counted and stated: coverage is
+//! complete, incomplete, or none. A run that analysed nothing past the
+//! evidence digest exits 3, so a caller cannot take a digest and a silent
+//! stdout for a whole analysis: ADR-0014 Appendix B.
 //!
 //! Coverage is about reach and not about correctness. A run can cover
 //! everything it could reach and still recover, for a fragmented deleted
