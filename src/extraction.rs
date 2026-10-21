@@ -1,7 +1,7 @@
 //! Writing a recovered artifact: the part of ADR-0015 that does not depend
 //! on which filesystem the bytes came from.
 //!
-//! [`ArtifactWriter`] takes the artifact's bytes in whatever pieces the
+//! `ArtifactWriter` takes the artifact's bytes in whatever pieces the
 //! caller has them, hashes every one, and, where a destination was asked
 //! for, writes the same bytes in the same pass. The file is created with
 //! `create_new`, flushed, closed and read back, and a partial file left by
@@ -13,7 +13,7 @@
 //!
 //! ADR-0015 Decision G. A read failure in the evidence voids the
 //! extraction: the hasher did not see every byte, so there is no digest and
-//! the caller calls [`ArtifactWriter::abort`]. A failure on the destination
+//! the caller calls `ArtifactWriter::abort`. A failure on the destination
 //! does not. The run read the evidence and hashed it, and a full disk says
 //! nothing about the evidence, so the digest is reported together with a
 //! statement that nothing was delivered. Everything in [`Output`] is a

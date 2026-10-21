@@ -484,7 +484,7 @@ impl Directory {
 ///
 /// Performs no I/O and cannot fail. The parameter is a fixed-size array
 /// rather than a slice so that the bounds obligation of
-/// [`crate::filesystem::le_u16`] and [`crate::filesystem::le_u32`], which
+/// `crate::filesystem::le_u16` and `crate::filesystem::le_u32`, which
 /// index without checking, is discharged by the compiler.
 ///
 /// The first byte decides deletion before the attribute decides anything,
@@ -492,7 +492,7 @@ impl Directory {
 /// specification's test for a long name requires both the masked attribute
 /// to match and the first byte not to be the deleted marker.
 ///
-/// The attribute is then read a second time, by [`classify_deleted`], to say
+/// The attribute is then read a second time, by `classify_deleted`, to say
 /// what the deleted entry was.
 pub fn classify(entry: &[u8; ENTRY_BYTES]) -> EntryKind {
     let first = entry[OFF_NAME];

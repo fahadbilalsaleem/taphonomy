@@ -556,6 +556,7 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 git diff --check
 ```
 

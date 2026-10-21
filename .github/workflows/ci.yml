@@ -53,5 +53,10 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Documentation
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Test
         run: cargo test --workspace --no-fail-fast
