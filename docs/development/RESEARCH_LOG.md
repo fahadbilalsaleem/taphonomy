@@ -514,3 +514,103 @@ not measured.
 * Read the paper's corrigendum.
 * Measure Linux's deletion of a fragmented file, which EXP-0011 did not
   exercise.
+
+---
+
+## 2026-10-21, exFAT: the up-case table, bad clusters and live files in the bitmap check
+
+### Objective
+
+Establish, before ADR-0022 Decision E's check is implemented, how
+established implementations locate the up-case table, how they treat a
+bad cluster and a second up-case entry, and whether they check live
+files against the bitmap, so that ADR-0022 Appendix A rests on more
+than the specification.
+
+### Sources
+
+* Microsoft, *exFAT file system specification*, the Markdown source
+  with SHA-256
+  `09454c9663cbd7b33c6dfe3ad37baa1351779ad5ab73034c53fcf864ccdee825`
+  (the same file as the entry above). Sections 7.1.5.1 and 7.2 to
+  7.2.5.1.
+* Linux, commit `f47d223`: `fs/exfat/balloc.c`
+  (`exfat_test_bitmap_range`, `exfat_find_free_bitmap`) and
+  `fs/exfat/nls.c` (`exfat_create_upcase_table`,
+  `exfat_load_upcase_table`). GPL-2.0-or-later; read, not copied.
+* exfatprogs, commit `8b42748`: `fsck/fsck.c` (`read_upcase_table`,
+  `check_clus_chain`, `write_bitmap`) and `mkfs/`. GPL-2.0-or-later;
+  read, built and run, not copied.
+* The Sleuth Kit, commit `51d8672`: `tsk/fs/exfatfs_meta.c`
+  (`exfatfs_copy_upcase_table_inode`). Common Public License 1.0; read,
+  not copied. Its 4.12.1 release, as installed, was run.
+* relan's exfat, commit `1264da3`: `mkfs/`. GPL-2.0-or-later (header of
+  `mkfs/uctc.c`); built and run, not copied.
+* FatFs R0.16 (`ff16.zip`, SHA-256
+  `99f7dc1f7e095356e4a9e3dbe29959090d8b948afe2bbc5441e52fdf4b85449e`),
+  ChaN's licence of one condition, retaining the notice (header of
+  `source/ff.c`): `f_mkfs`. Built and run, not copied.
+
+### Findings
+
+1. **No implementation read follows the up-case table's chain.** Linux
+   reads it as contiguous sectors from its first cluster
+   (`exfat_load_upcase_table`), exfatprogs reads it in one piece from
+   that cluster (`read_upcase_table`), and The Sleuth Kit says so in a
+   comment: "There is no FAT chain walk for the upcase table". §7.2.3
+   says the first cluster begins "the cluster chain, as the FAT
+   describes". The same split as for the bitmap.
+2. **Linux's CVE-2025-40307 fix checks only the bitmap's own clusters**
+   (`exfat_test_bitmap_range`), not the up-case table, the root or any
+   file.
+3. **exfatprogs checks every file and directory cluster against the
+   bitmap**: `check_clus_chain` reports "cluster ... is marked as free"
+   (`ER_FILE_INVALID_CLUS`). The bitmap's and the up-case table's
+   clusters it marks in use itself, silently (`write_bitmap`). It treats
+   an up-case length of 0, an odd length, or more than `0x10000 * 2`
+   bytes as an error; Linux treats a length of 0 as one.
+4. **Linux allocates without reading the FAT.**
+   `exfat_find_free_bitmap` returns the first clear bit. A bad cluster
+   whose bit is clear would be allocated.
+5. **No open-source writer read creates a bad cluster.** exfatprogs'
+   `mkfs` has no surface scan, and Linux only reads `FFFFFFF7h`
+   (`fatent.c`). Windows' `format` was not examined.
+6. **exfatprogs' checker judges neither case.** On a volume made by its
+   own `mkfs`, `fsck.exfat -n` reported clean with a free cluster set to
+   `FFFFFFF7h` in the FAT and its bit clear, with the same and its bit
+   set, and with a bit set for a cluster nothing claims. With the root's
+   up-case entry copied into its first unused slot, `-n` and `-y` both
+   reported clean and left both entries. Linux returns at the first
+   up-case entry it finds. The Sleuth Kit 4.12.1's `fls -f exfat` lists
+   both, without an error.
+7. **FatFs writes an up-case table of its own.** `f_mkfs` builds a
+   compressed table from its own case mapping (`ff.c`, "Create a
+   compressed up-case table"), 4,104 bytes, where exfatprogs and relan's
+   exfat write the recommended 5,836 (EXP-0011 Appendix A). FatFs also
+   writes the bitmap, the up-case table and the root as FAT chains
+   ("Create chains of bitmap, up-case and root directory").
+
+### Implications
+
+* ADR-0022 Appendix A: the check covers live allocations, as
+  exfatprogs' checker does (finding 3), because condition 1 alone keeps
+  a deleted set off live data.
+* A rule that the up-case table holds 5,836 bytes would be wrong
+  (finding 7); only a bound on its length is needed.
+* No tool tested refuses a second up-case entry (finding 6). ADR-0022
+  Appendix A refuses it, which costs only assessment.
+
+### Confidence
+
+High for findings 1 to 4 and 7, each read from source; finding 7 also
+measured on volumes FatFs made. Finding 5 holds for the sources read.
+Finding 6 is measured, once before and once after a restart of the
+machine, with the same results.
+
+### Follow-up
+
+* Whether Windows' `format` marks the bad clusters a surface scan finds
+  in the bitmap.
+* What Windows and macOS do with a second up-case entry. Windows needs
+  a virtual disk attached with administrator rights; macOS was not
+  available.

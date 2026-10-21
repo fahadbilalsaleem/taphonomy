@@ -491,3 +491,84 @@ read. Their figures are EXP-0011's scripts' only.
 * **GPT**, which NIST's nine GPT images need.
 * **Publication of the exFAT modules**, which still awaits the patent
   opinion (`ADR-0021` section 14).
+
+---
+
+## Appendix A: the bitmap check covers live files, and three bounds (2026-10-21)
+
+Section 7 checks the bitmap against the structure the walk knows is in
+use: the root and every directory read, the bitmap and the up-case
+table. Before it is implemented, an audit found that this leaves live
+files out, and that condition 1 is the only condition that keeps a
+deleted set off a live file's data: condition 2 compares deleted sets
+with each other. A bitmap that marks a live file's cluster free, whether
+crafted or left by a volume removed during a write, lets a deleted set
+pass condition 1 over that file. exfatprogs' checker (`8b42748`,
+`fsck/fsck.c`) treats exactly this as an error, `ER_FILE_INVALID_CLUS`,
+"cluster ... is marked as free".
+
+**The check covers live allocations.** Before any set is decided, every
+cluster of each live file's and live directory's allocation, as its set
+describes it, must be marked in use: a run where NoFatChain is set,
+otherwise the chain, followed until it has the clusters DataLength
+needs or the FAT does not go on. Every cluster reached counts. A live
+directory that was not read is covered this way too. The project
+decided this on 2026-10-21.
+
+**Three readings the implementation is to follow.**
+
+* A cluster taken as a directory's next cluster counts even where
+  reading it then failed, because the FAT marks it bad or its FAT entry
+  could not be read. That directory's allocation consumes it, which
+  §7.1.5.1 says a set bit describes, and §7.1.5.1 describes a cluster
+  the FAT marks bad as not available for allocation either way. Linux
+  (`f47d223`, `exfat_find_free_bitmap`) allocates the first clear bit
+  without reading the FAT, so a volume whose bad clusters are not marked
+  in use is not safe for Linux to write.
+* The root must hold exactly one up-case table entry: "The valid number
+  of Up-case Table directory entries is 1" (§7.2). With none, or more
+  than one, the bitmap is not believed. Linux and exfatprogs use the
+  first entry and The Sleuth Kit lists every one, none of them with an
+  error; Windows and macOS were not tested. Refusing is stricter than
+  each, and costs assessment, never a wrong recovery.
+* The up-case table is located through its FAT chain (§7.2.3), held to
+  the rules section 7 holds the bitmap's chain to. Its TableChecksum is
+  not verified: §7.2.2 requires that before the table is used, and the
+  check does not use it.
+
+**Three bounds, each this project's choice and not the
+specification's,** besides the two of section 12, which are unchanged.
+Each is to be labelled so in the code.
+
+* `MAX_UP_CASE_BYTES = 131072`: an uncompressed table, one 2-byte
+  mapping for each of 65,536 code units (§7.2.5). The specification sets
+  no maximum, and exfatprogs treats a longer table as an error. It holds
+  the chain followed to 256 clusters. A length of 0 is refused too;
+  Linux and exfatprogs treat it as an error.
+* `MAX_LIVE_ALLOCATIONS = 2^22` live sets recorded, to be a field of
+  `Limits` so a test can make it small. A record of four fields, of 4,
+  4, 1 and 1 bytes, measures 12 bytes with its alignment, which holds
+  the record to 48 MiB. A volume with more is not believed, because a live
+  file not recorded could be marked free.
+* `LIVE_CLUSTERS_PER_CLUSTER = 4`: the clusters looked up for live
+  allocations, as a multiple of ClusterCount. Each cluster belongs to
+  one allocation at a time, so a consistent volume needs at most one
+  times; four is section 12's multiple, and leaves room for allocations
+  that overlap.
+
+**When it runs.** After the walk of live directories and before any
+deleted directory is read: Decision K reads a deleted directory only
+where its clusters are free, so once one is read its clusters would
+fail the check.
+
+**Measured.** EXP-0011 Appendix A. On 29 volumes, EXP-0011's 23 and six
+made by three more formatters, every cluster of structure and of live
+allocations is marked in use, and live allocations take at most 0.9997
+times the volume's clusters. FatFs writes an up-case table of 4,104
+bytes; every other volume has the recommended 5,836. What no volume
+exercises, a bad cluster in a directory's chain, a missing or second
+up-case entry, a fragmented bitmap or up-case chain, and each bound, is
+left to unit tests, which the implementation is to carry.
+
+If the check fails, every deleted set on the volume is counted as not
+assessed, as section 7 says.

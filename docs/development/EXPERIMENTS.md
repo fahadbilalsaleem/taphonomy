@@ -2920,3 +2920,56 @@ it.
 3. M16: recovering inside deleted directories, against DFR-11, DFR-12
    and the Linux image.
 4. GPT, so that NIST's nine GPT images can be run through Taphonomy.
+
+### Appendix A: what the bitmap check looks up, and three more formatters (2026-10-21)
+
+**Question.** Before ADR-0022 Appendix A's check is implemented: does
+the bitmap of a real volume mark in use every cluster of structure and
+of live allocations, how many clusters would the live part look up, and
+do formatters other than those of EXP-0011 write the up-case table and
+the bitmap as the check expects?
+
+**Input.** EXP-0011's 23 volumes, and six made by
+`scripts/experiments/exp-0011-made-images.sh` with exfatprogs 1.4.3
+(`8b42748`, `mkfs.exfat`), relan's exfat (`1264da3`, `mkexfatfs`) and
+FatFs R0.16, each at 4,096- and at 512-byte clusters. FatFs's two also
+hold four files and a directory, one file fragmented. FatFs is a
+library; the script formats and writes through it from a small host
+program it builds.
+
+**Method.** `scripts/experiments/exp-0011-check-live.py` on each volume:
+a walk written apart from Taphonomy's that counts the clusters of the
+root and live directories, the bitmap, the up-case table and every live
+set's allocation, and lists any the bitmap marks free.
+`scripts/experiments/exp-0011-run.sh` runs both scripts after the
+measurements above, so one command still prints every figure here.
+
+**Result.**
+
+* On all 29, no cluster of structure and no cluster of a live
+  allocation is marked free.
+* Live allocations take at most 0.9997 times the volume's clusters, on
+  NIST's dfr-07-two (15,949 of 15,954).
+* Each volume has one up-case entry. FatFs writes a table of its own,
+  4,104 bytes, TableChecksum `38F509B0h`, at both cluster sizes. Every
+  other volume, EXP-0011's 23 among them, has the specification's
+  recommended table, 5,836 bytes, `E619D30Dh`.
+* Every bitmap is exactly ceil(ClusterCount / 8) bytes. The three
+  volumes made at 512-byte clusters have bitmaps of three or four
+  clusters and up-case tables of nine or twelve, which none of
+  EXP-0011's 23 has. Every bitmap and up-case chain is contiguous.
+* exfatprogs' `fsck.exfat -n` reports all six made volumes clean.
+
+**Conclusion.** The check as ADR-0022 Appendix A decides it would
+refuse none of the 29 volumes. Four times the volume's clusters leaves a
+factor of four over the densest, and the up-case bound is more than 22
+times the longest table seen. Not every
+writer uses the recommended table: a check that expected 5,836 bytes
+would refuse every volume FatFs formats.
+
+**Limitations.** No volume has a bad cluster in a directory's chain, a
+missing or second up-case entry, a fragmented bitmap or up-case chain,
+or comes near a bound, so a contiguous reading and the chain cannot be
+told apart on any of them; these are left to unit tests. The made volumes
+carry a serial number and timestamps from the clock, so their digests
+differ from run to run; the figures above do not.

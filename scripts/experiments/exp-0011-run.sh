@@ -9,11 +9,14 @@
 #   img/exp9-A.vhd img/exp9-B.vhd     from fixtures/partition
 #   linux/fs.exfat            forensics-samples' image, expanded
 #   linux/original-files/     forensics-samples' originals
+#   made/src/                 the three archives exp-0011-made-images.sh
+#                             names (Appendix A)
 # Results go to WORKDIR/final. Every input is checked by digest before and
 # after the runs. A failure prints a line starting FAIL and the run goes on,
 # so a failure is never silent.
 set -u
-W=$1
+W=${1:-}
+[ -n "$W" ] || { echo "usage: exp-0011-run.sh WORKDIR" >&2; exit 2; }
 T=$(cd "$(dirname "$0")" && pwd)
 F=$W/final
 rm -rf -- "${F:?}"
@@ -152,5 +155,13 @@ echo "== Bitmap chain and structure clusters"
 for f in "$W"/img/exp9-A.vhd "$W"/img/exp9-B.vhd "$W"/nist/img/*.dd "$W"/linux/fs.exfat; do
     python3 -I "$T/exp-0011-check-bitmap.py" "$f" || echo "FAIL bitmap $(basename "$f")"
 done
+
+echo "== Live allocations and structure against the bitmap (Appendix A)"
+for f in "$W"/img/exp9-A.vhd "$W"/img/exp9-B.vhd "$W"/nist/img/*.dd "$W"/linux/fs.exfat; do
+    python3 -I "$T/exp-0011-check-live.py" "$f" || echo "FAIL live $(basename "$f")"
+done
+
+echo "== Three more formatters (Appendix A)"
+"$T/exp-0011-made-images.sh" "$W/made" || echo "FAIL made images"
 
 check_inputs after
