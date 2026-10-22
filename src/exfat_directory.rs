@@ -33,6 +33,9 @@
 //! located and range checked by the walk. Its contents are read only
 //! through [`ExFatReader::open_bitmap`] and
 //! [`ExFatReader::cluster_allocated`], which the walk does not call yet.
+//! Where the up-case table lies, and every live set's allocation, are kept
+//! for [`ExFatReader::check_bitmap`], which checks the bitmap against what
+//! the walk knows is in use; nothing calls it yet either.
 //!
 //! # Content
 //!
@@ -93,17 +96,46 @@ pub struct Limits {
     /// Read by the caller that queues directories, and kept here so one value
     /// carries every bound a walk is held to.
     pub queued_directories: usize,
+
+    /// Most live sets whose allocation is kept for the bitmap check.
+    pub live_allocations: usize,
 }
 
 impl Limits {
-    /// [`MAX_DIRECTORY_CLUSTERS`], [`MAX_DIRECTORY_BYTES`] and
-    /// [`MAX_QUEUED_DIRECTORIES`].
+    /// [`MAX_DIRECTORY_CLUSTERS`], [`MAX_DIRECTORY_BYTES`],
+    /// [`MAX_QUEUED_DIRECTORIES`] and [`MAX_LIVE_ALLOCATIONS`].
     pub const DEFAULT: Limits = Limits {
         directory_clusters: MAX_DIRECTORY_CLUSTERS,
         directory_bytes: MAX_DIRECTORY_BYTES,
         queued_directories: MAX_QUEUED_DIRECTORIES,
+        live_allocations: MAX_LIVE_ALLOCATIONS,
     };
 }
+
+/// The most live files and directories whose allocation is kept for the
+/// bitmap check.
+///
+/// A safety bound chosen here, not a limit the specification gives. Each is
+/// 12 bytes, so the full record is 48 MiB; while it grows from half that
+/// size the old and new buffers are briefly both held, up to 72 MiB. 2^22 is
+/// eight times the files of a 2 TB card filled with 4 MB photographs. A
+/// volume with more has
+/// the rest unrecorded, and its bitmap is then not believed, because a live
+/// file the check did not see could be marked free.
+pub const MAX_LIVE_ALLOCATIONS: usize = 1 << 22;
+
+/// How many clusters the bitmap check looks up for live allocations, as a
+/// multiple of the volume's ClusterCount.
+///
+/// A safety bound chosen here, not the specification's. Each cluster belongs
+/// to one allocation at a time, so a consistent volume needs at most one
+/// times; four leaves room for allocations that overlap, and stops a volume
+/// whose millions of entries name the same long chain after four lookups
+/// per cluster of the volume, not millions. A lookup reads at most one FAT
+/// sector and one bitmap sector, so the worst case is about eight sector
+/// reads per cluster. The same multiple as ADR-0022 Decision J's links
+/// bound.
+pub const LIVE_CLUSTERS_PER_CLUSTER: u64 = 4;
 
 /// The most directories held at once, named by entries and not yet read.
 ///
@@ -132,6 +164,19 @@ const MAX_NAME_UNITS: usize = 255;
 
 /// Bytes read from the evidence at a time while streaming a directory.
 const READ_CHUNK_BYTES: usize = 4096;
+
+/// The longest up-case table whose clusters the bitmap check follows:
+/// 131,072 bytes, one 2-byte mapping for each of the 65,536 code units,
+/// uncompressed (section 7.2.5).
+///
+/// A choice of this project, not a limit the specification gives: it sets
+/// no maximum, and a compressed table that spends more than two bytes on a
+/// code unit could be longer. exfatprogs' checker refuses a longer table.
+/// The bound holds the chain followed to at most 256 clusters, whatever
+/// `DataLength` claims. The tables measured are 5,836 bytes, the
+/// specification's recommended one, and 4,104 where FatFs formatted the
+/// volume (EXP-0011 and its Appendix A).
+pub const MAX_UP_CASE_BYTES: u64 = 131_072;
 
 /// Most bytes of a file's content read, or handed over, at a time. A cluster
 /// can be 32 MiB (section 3.1.9), so a cluster is read in pieces of this.
@@ -270,8 +315,26 @@ impl ExFatBitmap {
     }
 }
 
-/// Consecutive clusters of the bitmap: `clusters` of them from `first`,
-/// holding the bitmap's clusters from index `start` on.
+/// The up-case table's entry, as the root held it. Section 7.2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct UpCaseEntry {
+    first_cluster: u32,
+    data_length: u64,
+}
+
+/// Where a live file or directory's data is, as its set describes it: the
+/// clusters `DataLength` needs, from `first_cluster`, as one run or a chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LiveAllocation {
+    first_cluster: u32,
+    clusters: u32,
+    no_fat_chain: bool,
+    directory: bool,
+}
+
+/// Consecutive clusters of a chain the walk follows for structure (the
+/// bitmap's, or the up-case table's): `clusters` of them from `first`,
+/// holding the chain's clusters from index `start` on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BitmapRun {
     start: u32,
@@ -383,6 +446,233 @@ impl std::error::Error for ExFatBitmapError {
 impl From<Error> for ExFatBitmapError {
     fn from(e: Error) -> Self {
         Self::Evidence(e)
+    }
+}
+
+impl From<ChainFault> for ExFatBitmapError {
+    fn from(fault: ChainFault) -> Self {
+        match fault {
+            ChainFault::Evidence(e) => Self::Evidence(e),
+            ChainFault::FatOutOfRange { cluster } => Self::FatOutOfRange { cluster },
+            ChainFault::BadCluster { cluster } => Self::BadCluster { cluster },
+            ChainFault::LinkOutOfRange { from, to } => Self::LinkOutOfRange { from, to },
+            ChainFault::EndsEarly { cluster, needed } => Self::ChainEndsEarly { cluster, needed },
+            ChainFault::LongerThanData { cluster, needed } => {
+                Self::ChainLongerThanData { cluster, needed }
+            }
+        }
+    }
+}
+
+/// Why a structure chain could not be followed. Each caller turns it into
+/// an error that names its structure.
+enum ChainFault {
+    Evidence(Error),
+    FatOutOfRange { cluster: u32 },
+    BadCluster { cluster: u32 },
+    LinkOutOfRange { from: u32, to: u32 },
+    EndsEarly { cluster: u32, needed: u64 },
+    LongerThanData { cluster: u32, needed: u64 },
+}
+
+impl From<Error> for ChainFault {
+    fn from(e: Error) -> Self {
+        Self::Evidence(e)
+    }
+}
+
+/// What the walk knows is in use, which the bitmap must mark so.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ExFatStructure {
+    /// A cluster of the root or of a directory.
+    Directory,
+
+    /// A cluster of the allocation bitmap itself.
+    Bitmap,
+
+    /// A cluster of the up-case table.
+    UpCaseTable,
+
+    /// A cluster of a live file's data.
+    File,
+}
+
+impl fmt::Display for ExFatStructure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Directory => "directory",
+            Self::Bitmap => "allocation bitmap",
+            Self::UpCaseTable => "up-case table",
+            Self::File => "live file",
+        })
+    }
+}
+
+/// What the bitmap check found in use: clusters of each kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExFatStructureChecked {
+    /// Clusters read as the root and as directories.
+    pub directory_clusters: u64,
+
+    /// Clusters of the allocation bitmap.
+    pub bitmap_clusters: u64,
+
+    /// Clusters of the up-case table.
+    pub up_case_clusters: u64,
+
+    /// Clusters of live files' and directories' allocations, as their sets
+    /// describe them. A directory that was read is counted here too.
+    pub live_clusters: u64,
+}
+
+/// Why the allocation bitmap is not believed (ADR-0022 Decision E).
+#[derive(Debug)]
+pub enum ExFatStructureError {
+    /// The evidence could not be read.
+    Evidence(Error),
+
+    /// A lookup in the bitmap failed.
+    Bitmap(ExFatBitmapError),
+
+    /// The root held no up-case table entry. Section 7.2 requires one.
+    NoUpCaseTable,
+
+    /// The root held `entries` up-case table entries. Section 7.2 allows
+    /// one, so none of them can be shown to be the table.
+    UpCaseTables { entries: usize },
+
+    /// The up-case table's first cluster lies outside the cluster heap.
+    UpCaseFirstClusterOutOfRange { cluster: u32 },
+
+    /// The up-case table has a `DataLength` of 0, so it holds no table.
+    UpCaseEmpty,
+
+    /// The up-case table is longer than [`MAX_UP_CASE_BYTES`], a bound this
+    /// project chose.
+    UpCaseTooLong { data_length: u64, limit: u64 },
+
+    /// A FAT entry the FAT region does not hold.
+    UpCaseFatOutOfRange { cluster: u32 },
+
+    /// The up-case table's chain reaches a cluster the FAT marks bad.
+    UpCaseBadCluster { cluster: u32 },
+
+    /// A FAT entry of the up-case table's chain links outside the heap.
+    UpCaseLinkOutOfRange { from: u32, to: u32 },
+
+    /// The up-case table's chain ends at `cluster`, before the `needed`
+    /// clusters `DataLength` takes.
+    UpCaseChainEndsEarly { cluster: u32, needed: u64 },
+
+    /// The up-case table's chain goes on past `cluster`, the last of the
+    /// `needed` clusters `DataLength` takes.
+    UpCaseChainLongerThanData { cluster: u32, needed: u64 },
+
+    /// More live sets than [`Limits::live_allocations`] were found, so
+    /// `unrecorded` of them were not kept and cannot be checked.
+    LiveAllocationsUnrecorded { bound: usize, unrecorded: u64 },
+
+    /// Live allocations name more clusters than [`LIVE_CLUSTERS_PER_CLUSTER`]
+    /// times the volume's, `limit`: a bound this project chose.
+    LiveClustersBeyondBound { limit: u64 },
+
+    /// The bitmap marks a cluster the walk knows is in use as free.
+    /// `cluster` is the lowest such, and `structure` what it belongs to.
+    MarkedFree {
+        structure: ExFatStructure,
+        cluster: u32,
+    },
+}
+
+impl fmt::Display for ExFatStructureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(e) => write!(f, "{e}"),
+            Self::Bitmap(e) => write!(f, "{e}"),
+            Self::NoUpCaseTable => f.write_str("the root holds no up-case table entry"),
+            Self::UpCaseTables { entries } => {
+                write!(f, "the root holds {entries} up-case table entries, not one")
+            }
+            Self::UpCaseFirstClusterOutOfRange { cluster } => write!(
+                f,
+                "up-case table first cluster {cluster} is outside the cluster heap"
+            ),
+            Self::UpCaseEmpty => f.write_str("up-case table has a length of 0"),
+            Self::UpCaseTooLong { data_length, limit } => write!(
+                f,
+                "up-case table of {data_length} bytes is longer than the {limit} this check follows"
+            ),
+            Self::UpCaseFatOutOfRange { cluster } => write!(
+                f,
+                "up-case table chain reaches cluster {cluster}, which the FAT holds no entry for"
+            ),
+            Self::UpCaseBadCluster { cluster } => {
+                write!(f, "up-case table chain reaches bad cluster {cluster}")
+            }
+            Self::UpCaseLinkOutOfRange { from, to } => write!(
+                f,
+                "up-case table chain: cluster {from} links to {to}, outside the cluster heap"
+            ),
+            Self::UpCaseChainEndsEarly { cluster, needed } => write!(
+                f,
+                "up-case table chain ends at cluster {cluster}, short of the {needed} clusters its length needs"
+            ),
+            Self::UpCaseChainLongerThanData { cluster, needed } => write!(
+                f,
+                "up-case table chain goes on past cluster {cluster}, the last of the {needed} its length needs"
+            ),
+            Self::LiveAllocationsUnrecorded { bound, unrecorded } => write!(
+                f,
+                "{unrecorded} live files or directories past the {bound} kept were not checked"
+            ),
+            Self::LiveClustersBeyondBound { limit } => write!(
+                f,
+                "live allocations name more than the {limit} clusters this check looks up"
+            ),
+            Self::MarkedFree { structure, cluster } => write!(
+                f,
+                "the allocation bitmap marks cluster {cluster} of the {structure} free"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExFatStructureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Evidence(e) => Some(e),
+            Self::Bitmap(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for ExFatStructureError {
+    fn from(e: Error) -> Self {
+        Self::Evidence(e)
+    }
+}
+
+impl From<ExFatBitmapError> for ExFatStructureError {
+    fn from(e: ExFatBitmapError) -> Self {
+        Self::Bitmap(e)
+    }
+}
+
+impl From<ChainFault> for ExFatStructureError {
+    fn from(fault: ChainFault) -> Self {
+        match fault {
+            ChainFault::Evidence(e) => Self::Evidence(e),
+            ChainFault::FatOutOfRange { cluster } => Self::UpCaseFatOutOfRange { cluster },
+            ChainFault::BadCluster { cluster } => Self::UpCaseBadCluster { cluster },
+            ChainFault::LinkOutOfRange { from, to } => Self::UpCaseLinkOutOfRange { from, to },
+            ChainFault::EndsEarly { cluster, needed } => {
+                Self::UpCaseChainEndsEarly { cluster, needed }
+            }
+            ChainFault::LongerThanData { cluster, needed } => {
+                Self::UpCaseChainLongerThanData { cluster, needed }
+            }
+        }
     }
 }
 
@@ -945,6 +1235,16 @@ pub struct ExFatReader<'a, R: EvidenceReader> {
     /// The one FAT sector held, and its index within the FAT.
     fat_sector: Vec<u8>,
     fat_sector_index: Option<u64>,
+
+    /// The first up-case table entry the root held, and how many it held.
+    /// Kept for the bitmap check, which needs the table's clusters.
+    up_case: Option<UpCaseEntry>,
+    up_case_entries: usize,
+
+    /// Every live file's and directory's allocation, for the bitmap check,
+    /// up to `limits.live_allocations`; and how many more were not kept.
+    live: Vec<LiveAllocation>,
+    live_unrecorded: u64,
 }
 
 impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
@@ -964,6 +1264,10 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             // At most 4096 bytes: `bytes_per_sector_shift` is at most 12.
             fat_sector: vec![0u8; boot.bytes_per_sector() as usize],
             fat_sector_index: None,
+            up_case: None,
+            up_case_entries: 0,
+            live: Vec::new(),
+            live_unrecorded: 0,
         }
     }
 
@@ -1159,37 +1463,7 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         }
 
         let needed = entry.data_length.div_ceil(cluster_bytes);
-        let mut runs: Vec<BitmapRun> = Vec::new();
-        let mut cluster = entry.first_cluster;
-        for index in 0..needed {
-            match runs.last_mut() {
-                Some(run) if run.first as u64 + run.clusters as u64 == cluster as u64 => {
-                    run.clusters += 1;
-                }
-                // `needed` is at most ClusterCount, so the index fits.
-                _ => runs.push(BitmapRun {
-                    start: index as u32,
-                    first: cluster,
-                    clusters: 1,
-                }),
-            }
-            let link = match self.fat_link(cluster)? {
-                None => return Err(ExFatBitmapError::FatOutOfRange { cluster }),
-                Some(Link::Bad) => return Err(ExFatBitmapError::BadCluster { cluster }),
-                Some(Link::Invalid(to)) => {
-                    return Err(ExFatBitmapError::LinkOutOfRange { from: cluster, to });
-                }
-                Some(link) => link,
-            };
-            match (link, index + 1 == needed) {
-                (Link::End, true) => {}
-                (Link::Next(next), false) => cluster = next,
-                (Link::End, false) => {
-                    return Err(ExFatBitmapError::ChainEndsEarly { cluster, needed });
-                }
-                _ => return Err(ExFatBitmapError::ChainLongerThanData { cluster, needed }),
-            }
-        }
+        let runs = self.structure_runs(entry.first_cluster, needed)?;
 
         Ok(ExFatBitmap {
             runs,
@@ -1197,6 +1471,206 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             sector_index: None,
             volume: self.bitmap_volume(),
         })
+    }
+
+    /// Follows a structure's chain from `first` through the FAT: exactly
+    /// `needed` clusters, each link but the last a next cluster in the heap,
+    /// the last the end of the chain. Returns the clusters as runs, in chain
+    /// order. `first` is in the heap, and `needed` is at least 1 and at most
+    /// ClusterCount for the bitmap or 256 for the up-case table
+    /// ([`MAX_UP_CASE_BYTES`] over the smallest cluster).
+    fn structure_runs(&mut self, first: u32, needed: u64) -> Result<Vec<BitmapRun>, ChainFault> {
+        let mut runs: Vec<BitmapRun> = Vec::new();
+        let mut cluster = first;
+        for index in 0..needed {
+            match runs.last_mut() {
+                Some(run) if run.first as u64 + run.clusters as u64 == cluster as u64 => {
+                    run.clusters += 1;
+                }
+                // `needed` is at most ClusterCount or 256, so the index fits.
+                _ => runs.push(BitmapRun {
+                    start: index as u32,
+                    first: cluster,
+                    clusters: 1,
+                }),
+            }
+            let link = match self.fat_link(cluster)? {
+                None => return Err(ChainFault::FatOutOfRange { cluster }),
+                Some(Link::Bad) => return Err(ChainFault::BadCluster { cluster }),
+                Some(Link::Invalid(to)) => {
+                    return Err(ChainFault::LinkOutOfRange { from: cluster, to });
+                }
+                Some(link) => link,
+            };
+            match (link, index + 1 == needed) {
+                (Link::End, true) => {}
+                (Link::Next(next), false) => cluster = next,
+                (Link::End, false) => return Err(ChainFault::EndsEarly { cluster, needed }),
+                _ => return Err(ChainFault::LongerThanData { cluster, needed }),
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Checks the allocation bitmap against what the walk knows is in use
+    /// (ADR-0022 Decision E, as its Appendix A extends it): every cluster
+    /// read as the root or as a directory, every cluster of the bitmap and
+    /// of the up-case table, and every cluster of each live file's and
+    /// directory's allocation must be marked in use. A crafted bitmap that
+    /// marks structure free (the class of CVE-2025-40307) is not believed,
+    /// and neither is one that marks a live file's data free, over which a
+    /// deleted file would otherwise pass condition 1.
+    ///
+    /// A live allocation is followed as its set describes it: a run where
+    /// `NoFatChain` is set, otherwise the chain, until it has as many
+    /// clusters as `DataLength` needs or the FAT does not go on. Every
+    /// cluster reached counts. Live sets past [`Limits::live_allocations`],
+    /// or more clusters than [`LIVE_CLUSTERS_PER_CLUSTER`] times the
+    /// volume's, leave the bitmap unbelieved, because what was not checked
+    /// could be marked free.
+    ///
+    /// Call it once, after the walk of live directories and before any
+    /// deleted directory is read: a deleted directory is read only where its
+    /// clusters are free (ADR-0022 Decision K), so once one is read its
+    /// clusters are among those read, and this check would fail on them.
+    /// Call it only where the root was read whole: a root read part way may
+    /// not have reached the up-case entry, which would then be refused as
+    /// missing.
+    ///
+    /// It checks what the walk recorded, and nothing else. A live set in a
+    /// directory that was not read, or past the point where a read stopped,
+    /// is not recorded, so its clusters are not checked. A directory that was
+    /// not read has its own allocation checked, not its children's. The
+    /// caller must account for every directory not read whole.
+    ///
+    /// A directory cluster counts once it was taken as the next cluster of a
+    /// directory, even where reading it then failed: the FAT marking it bad,
+    /// or its FAT entry unreadable. Section 7.1.5.1 describes a cluster the
+    /// FAT marks bad as not available for allocation, which is what a set
+    /// bit says.
+    ///
+    /// The up-case table is located through its FAT chain (section 7.2.3),
+    /// held to the rules the bitmap's chain is, and to
+    /// [`MAX_UP_CASE_BYTES`]. Its contents are not read, so its
+    /// `TableChecksum`, which section 7.2.2 requires before the table is
+    /// used, is not checked: the table is not used.
+    pub fn check_bitmap(
+        &mut self,
+        bitmap: &mut ExFatBitmap,
+    ) -> Result<ExFatStructureChecked, ExFatStructureError> {
+        if bitmap.volume != self.bitmap_volume() {
+            return Err(ExFatBitmapError::OtherVolume.into());
+        }
+        let up_case = match (self.up_case, self.up_case_entries) {
+            (Some(entry), 1) => entry,
+            (None, _) => return Err(ExFatStructureError::NoUpCaseTable),
+            (Some(_), entries) => return Err(ExFatStructureError::UpCaseTables { entries }),
+        };
+        if self.live_unrecorded > 0 {
+            return Err(ExFatStructureError::LiveAllocationsUnrecorded {
+                bound: self.limits.live_allocations,
+                unrecorded: self.live_unrecorded,
+            });
+        }
+        let up_case_runs = self.up_case_runs(up_case)?;
+
+        // The lowest free cluster, whatever order the clusters are visited
+        // in, so the error does not depend on how the set is hashed.
+        let mut lowest: Option<(u32, ExFatStructure)> = None;
+        let mut check = |reader: &mut Self,
+                         bitmap: &mut ExFatBitmap,
+                         cluster: u32,
+                         structure: ExFatStructure|
+         -> Result<(), ExFatBitmapError> {
+            if !reader.cluster_allocated(bitmap, cluster)?
+                && lowest.is_none_or(|l| (cluster, structure) < l)
+            {
+                lowest = Some((cluster, structure));
+            }
+            Ok(())
+        };
+
+        for index in 0..bitmap.runs.len() {
+            let run = bitmap.runs[index];
+            for cluster in run.first..run.first + run.clusters {
+                check(self, bitmap, cluster, ExFatStructure::Bitmap)?;
+            }
+        }
+        for run in &up_case_runs {
+            for cluster in run.first..run.first + run.clusters {
+                check(self, bitmap, cluster, ExFatStructure::UpCaseTable)?;
+            }
+        }
+        // Copied, because each lookup borrows the reader: at most
+        // `directory_clusters` of them, 4 MiB under the default limits.
+        let directories: Vec<u32> = self.seen.iter().copied().collect();
+        for &cluster in &directories {
+            check(self, bitmap, cluster, ExFatStructure::Directory)?;
+        }
+
+        let limit = LIVE_CLUSTERS_PER_CLUSTER * self.boot.cluster_count as u64;
+        let mut live_clusters = 0u64;
+        for index in 0..self.live.len() {
+            let live = self.live[index];
+            let structure = if live.directory {
+                ExFatStructure::Directory
+            } else {
+                ExFatStructure::File
+            };
+            let mut cluster = live.first_cluster;
+            for taken in 1..=live.clusters {
+                live_clusters += 1;
+                if live_clusters > limit {
+                    return Err(ExFatStructureError::LiveClustersBeyondBound { limit });
+                }
+                check(self, bitmap, cluster, structure)?;
+                if taken == live.clusters {
+                    break;
+                }
+                cluster = if live.no_fat_chain {
+                    // In the heap: validate_file_set checked the run.
+                    cluster + 1
+                } else {
+                    match self.fat_link(cluster)? {
+                        Some(Link::Next(next)) => next,
+                        // The chain does not go on: what it reached counts.
+                        _ => break,
+                    }
+                };
+            }
+        }
+
+        if let Some((cluster, structure)) = lowest {
+            return Err(ExFatStructureError::MarkedFree { structure, cluster });
+        }
+        Ok(ExFatStructureChecked {
+            directory_clusters: directories.len() as u64,
+            bitmap_clusters: bitmap.clusters(),
+            up_case_clusters: up_case_runs.iter().map(|r| r.clusters as u64).sum(),
+            live_clusters,
+        })
+    }
+
+    /// Locates the up-case table's clusters through its FAT chain.
+    fn up_case_runs(&mut self, entry: UpCaseEntry) -> Result<Vec<BitmapRun>, ExFatStructureError> {
+        if entry.first_cluster < 2
+            || entry.first_cluster as u64 > self.boot.cluster_count as u64 + 1
+        {
+            return Err(ExFatStructureError::UpCaseFirstClusterOutOfRange {
+                cluster: entry.first_cluster,
+            });
+        }
+        if entry.data_length == 0 {
+            return Err(ExFatStructureError::UpCaseEmpty);
+        }
+        if entry.data_length > MAX_UP_CASE_BYTES {
+            return Err(ExFatStructureError::UpCaseTooLong {
+                data_length: entry.data_length,
+                limit: MAX_UP_CASE_BYTES,
+            });
+        }
+        let needed = entry.data_length.div_ceil(self.boot.cluster_bytes() as u64);
+        Ok(self.structure_runs(entry.first_cluster, needed)?)
     }
 
     /// The volume this reader reads, as a bitmap records it.
@@ -1380,6 +1854,7 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             match kind {
                 TYPE_FILE => match self.read_file_set(cursor, entry, window)? {
                     Ok(file) => {
+                        self.record_live(&file);
                         if file.is_directory() {
                             summary.directories += 1;
                         } else {
@@ -1411,9 +1886,18 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
                     }),
                     Err(refusal) => refuse(visit, summary, position, refusal),
                 },
-                // Recognised, and nothing of it is needed: the up-case table
-                // only matters to a lookup by name.
-                TYPE_UP_CASE => {}
+                // The table itself only matters to a lookup by name, which
+                // is not made. Where it lies is kept for the bitmap check;
+                // whether there is exactly one is that check's to decide.
+                TYPE_UP_CASE => {
+                    self.up_case_entries += 1;
+                    if self.up_case.is_none() {
+                        self.up_case = Some(UpCaseEntry {
+                            first_cluster: le_u32(&entry.bytes, 20),
+                            data_length: le_u64(&entry.bytes, 24),
+                        });
+                    }
+                }
                 _ if is_root => {
                     return Err(ExFatDirectoryError::UnrecognisedCriticalPrimary {
                         entry_type: kind,
@@ -1460,6 +1944,27 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         }
 
         Ok(Ok(()))
+    }
+
+    /// Keeps a live set's allocation for the bitmap check. A set with no
+    /// data has none.
+    fn record_live(&mut self, file: &ExFatFile) {
+        if file.first_cluster == 0 || file.data_length == 0 {
+            return;
+        }
+        if self.live.len() >= self.limits.live_allocations {
+            self.live_unrecorded += 1;
+            return;
+        }
+        // At most ClusterCount clusters: validate_file_set refused a longer
+        // DataLength, so the count fits.
+        let clusters = file.data_length.div_ceil(self.boot.cluster_bytes() as u64) as u32;
+        self.live.push(LiveAllocation {
+            first_cluster: file.first_cluster,
+            clusters,
+            no_fat_chain: file.no_fat_chain,
+            directory: file.is_directory(),
+        });
     }
 
     /// Reads and validates a File entry set.
@@ -2384,6 +2889,506 @@ pub(crate) mod tests {
             reader.cluster_allocated(&mut bitmap, 2),
             Err(ExFatBitmapError::OtherVolume)
         ));
+    }
+
+    // --- the bitmap check ----------------------------------------------------
+
+    /// An up-case table entry for a table of `data_length` bytes at `first`.
+    fn up_case_at(first: u32, data_length: u64) -> [u8; 32] {
+        let mut entry = [0u8; 32];
+        entry[0] = TYPE_UP_CASE;
+        entry[20..24].copy_from_slice(&first.to_le_bytes());
+        entry[24..32].copy_from_slice(&data_length.to_le_bytes());
+        entry
+    }
+
+    fn bitmap_entry_at(first: u32, data_length: u64) -> [u8; 32] {
+        let mut entry = [0u8; 32];
+        entry[0] = TYPE_BITMAP;
+        entry[20..24].copy_from_slice(&first.to_le_bytes());
+        entry[24..32].copy_from_slice(&data_length.to_le_bytes());
+        entry
+    }
+
+    /// Every cluster of structure on [`structured`]'s volume.
+    const STRUCTURE: [(u32, ExFatStructure); 6] = [
+        (2, ExFatStructure::Directory),
+        (5, ExFatStructure::Directory),
+        (12, ExFatStructure::Directory),
+        (3, ExFatStructure::Bitmap),
+        (6, ExFatStructure::UpCaseTable),
+        (9, ExFatStructure::UpCaseTable),
+    ];
+
+    /// A volume whose root is the chain 2, 5 and holds the bitmap (cluster
+    /// 3), the up-case table (the chain 6, 9) and a directory (cluster 12).
+    /// Cluster 7 is marked in use and is no structure's: read contiguously
+    /// from 6, the up-case table would take 7 for 9.
+    fn structured(root_entries: &[[u8; 32]]) -> Vol {
+        let mut vol = Vol::new();
+        vol.chain(&[2, 5]);
+        vol.chain(&[3]);
+        vol.chain(&[6, 9]);
+        vol.fat(7, FAT_END_OF_CHAIN);
+        vol.chain(&[12]);
+        // The root's first cluster holds 16 entries; the rest go in its
+        // second, 5, not in the cluster after 2, which is the bitmap.
+        let (first, rest) = root_entries.split_at(root_entries.len().min(PER_CLUSTER));
+        assert!(rest.len() <= PER_CLUSTER, "the root holds 32 entries");
+        vol.put(2, 0, first);
+        vol.put(5, 0, rest);
+        mark(&mut vol, &[3], &[7]);
+        vol
+    }
+
+    fn standard_root() -> Vec<[u8; 32]> {
+        let mut entries = vec![bitmap_entry_at(3, 25), up_case_at(6, 1024)];
+        entries.extend(directory("D", 12, 1));
+        entries
+    }
+
+    /// Walks the root and directory 12, opens the bitmap and checks it.
+    fn check(vol: &mut Vol) -> Result<ExFatStructureChecked, ExFatStructureError> {
+        check_with(vol, Limits::DEFAULT)
+    }
+
+    fn check_with(
+        vol: &mut Vol,
+        limits: Limits,
+    ) -> Result<ExFatStructureChecked, ExFatStructureError> {
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        let (result, seen) = walk_with(&mut reader, root(2));
+        result.expect("the root reads");
+        let _ = walk_with(
+            &mut reader,
+            DirectorySource::Subdirectory {
+                first_cluster: 12,
+                data_length: 512,
+                no_fat_chain: false,
+            },
+        );
+        let entry = seen
+            .iter()
+            .find_map(|s| match s {
+                Seen::Bitmap(entry) => Some(*entry),
+                _ => None,
+            })
+            .expect("a bitmap entry");
+        let mut bitmap = reader.open_bitmap(&entry).expect("opens");
+        reader.check_bitmap(&mut bitmap)
+    }
+
+    fn all_of(clusters: &[(u32, ExFatStructure)]) -> Vec<u32> {
+        clusters.iter().map(|&(c, _)| c).collect()
+    }
+
+    #[test]
+    fn a_bitmap_marking_every_structure_cluster_in_use_is_believed() {
+        let mut vol = structured(&standard_root());
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+
+        assert_eq!(
+            check(&mut vol).expect("believed"),
+            ExFatStructureChecked {
+                directory_clusters: 3,
+                bitmap_clusters: 1,
+                up_case_clusters: 2,
+                live_clusters: 1,
+            }
+        );
+    }
+
+    /// The root's second cluster, a directory's, the bitmap's own (the
+    /// class of CVE-2025-40307) and each of the up-case table's: any one
+    /// marked free and the bitmap is not believed. Cluster 9 free shows the
+    /// up-case table is followed through the FAT: 7, which a contiguous
+    /// reading would take instead, is marked in use.
+    #[test]
+    fn a_bitmap_marking_any_structure_cluster_free_is_not_believed() {
+        for (free, kind) in STRUCTURE {
+            let mut vol = structured(&standard_root());
+            let others: Vec<u32> = all_of(&STRUCTURE)
+                .into_iter()
+                .filter(|&c| c != free)
+                .collect();
+            mark(&mut vol, &[3], &others);
+
+            let result = check(&mut vol);
+            assert!(
+                matches!(
+                    result,
+                    Err(ExFatStructureError::MarkedFree { structure, cluster })
+                        if structure == kind && cluster == free
+                ),
+                "cluster {free}: {result:?}"
+            );
+        }
+    }
+
+    /// The bitmap's and the up-case table's clusters are visited before any
+    /// directory's, so the lowest free one, 5, is not the first found, 9.
+    #[test]
+    fn the_lowest_cluster_marked_free_is_named() {
+        let mut vol = structured(&standard_root());
+        mark(&mut vol, &[3], &[2, 3, 6]);
+
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::MarkedFree {
+                    structure: ExFatStructure::Directory,
+                    cluster: 5,
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Section 7.1.5.1: a cluster the FAT marks bad is not available for
+    /// allocation. A directory's cluster stopped there still counts.
+    #[test]
+    fn a_directory_cluster_the_fat_marks_bad_is_still_checked() {
+        let mut vol = structured(&standard_root());
+        vol.fat(12, FAT_BAD_CLUSTER);
+        mark(&mut vol, &[3], &[2, 5, 3, 6, 9]);
+
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::MarkedFree {
+                    structure: ExFatStructure::Directory,
+                    cluster: 12,
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// The root has no set, so no live record covers its clusters: a root
+    /// cluster the FAT marks bad is checked through the clusters the walk
+    /// took, alone. The walk stops there, and the check still names it.
+    #[test]
+    fn a_root_cluster_the_fat_marks_bad_is_still_checked() {
+        let mut vol = structured(&standard_root());
+        vol.fat(5, FAT_BAD_CLUSTER);
+        mark(&mut vol, &[3], &[2, 3, 6, 9, 12]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+
+        let (result, seen) = walk_with(&mut reader, root(2));
+        assert!(
+            matches!(result, Err(ExFatDirectoryError::BadCluster { cluster: 5 })),
+            "{result:?}"
+        );
+        let entry = seen
+            .iter()
+            .find_map(|s| match s {
+                Seen::Bitmap(entry) => Some(*entry),
+                _ => None,
+            })
+            .expect("a bitmap entry");
+        let mut bitmap = reader.open_bitmap(&entry).expect("opens");
+
+        let result = reader.check_bitmap(&mut bitmap);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::MarkedFree {
+                    structure: ExFatStructure::Directory,
+                    cluster: 5,
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_without_one_up_case_table_entry_leaves_the_bitmap_unbelieved() {
+        let mut none = vec![bitmap_entry_at(3, 25)];
+        none.extend(directory("D", 12, 1));
+        let mut vol = structured(&none);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        let result = check(&mut vol);
+        assert!(
+            matches!(result, Err(ExFatStructureError::NoUpCaseTable)),
+            "{result:?}"
+        );
+
+        let mut two = standard_root();
+        two.push(up_case_at(6, 1024));
+        let mut vol = structured(&two);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseTables { entries: 2 })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_up_case_table_whose_fields_cannot_be_followed_is_refused() {
+        let with = |first: u32, data_length: u64| {
+            let mut entries = vec![bitmap_entry_at(3, 25), up_case_at(first, data_length)];
+            entries.extend(directory("D", 12, 1));
+            let mut vol = structured(&entries);
+            mark(&mut vol, &[3], &all_of(&STRUCTURE));
+            check(&mut vol)
+        };
+
+        for first in [0, 1, 202] {
+            let result = with(first, 1024);
+            assert!(
+                matches!(
+                    result,
+                    Err(ExFatStructureError::UpCaseFirstClusterOutOfRange { cluster })
+                        if cluster == first
+                ),
+                "{first}: {result:?}"
+            );
+        }
+        let result = with(6, 0);
+        assert!(
+            matches!(result, Err(ExFatStructureError::UpCaseEmpty)),
+            "{result:?}"
+        );
+        let result = with(6, MAX_UP_CASE_BYTES + 1);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseTooLong {
+                    data_length,
+                    limit: MAX_UP_CASE_BYTES
+                }) if data_length == MAX_UP_CASE_BYTES + 1
+            ),
+            "{result:?}"
+        );
+        // At the bound the chain is followed, and here ends too soon.
+        let result = with(6, MAX_UP_CASE_BYTES);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseChainEndsEarly {
+                    cluster: 9,
+                    needed: 256
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn an_up_case_chain_that_is_short_long_or_bad_is_refused() {
+        let mut vol = structured(&standard_root());
+        vol.fat(6, FAT_END_OF_CHAIN);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseChainEndsEarly {
+                    cluster: 6,
+                    needed: 2
+                })
+            ),
+            "{result:?}"
+        );
+
+        let mut vol = structured(&standard_root());
+        vol.chain(&[6, 9, 10]);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseChainLongerThanData {
+                    cluster: 9,
+                    needed: 2
+                })
+            ),
+            "{result:?}"
+        );
+
+        let mut vol = structured(&standard_root());
+        vol.fat(6, FAT_BAD_CLUSTER);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::UpCaseBadCluster { cluster: 6 })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_of_another_volume_is_not_checked() {
+        let mut vol = structured(&standard_root());
+        let boot = vol.boot.clone();
+        let mut bitmap = {
+            let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+            reader.open_bitmap(&bitmap_at(3, 25)).expect("opens")
+        };
+        let mut other = boot.clone();
+        other.cluster_heap_offset = 65;
+        let mut reader = ExFatReader::new(&mut vol.image, &other, extent(), Limits::DEFAULT);
+        assert!(matches!(
+            reader.check_bitmap(&mut bitmap),
+            Err(ExFatStructureError::Bitmap(ExFatBitmapError::OtherVolume))
+        ));
+    }
+
+    /// The root of [`structured`], with live files: F is the chain 20, 30,
+    /// with 21 marked as the decoy a contiguous reading would take; G is a
+    /// run of 40 to 42; E is a directory at 50 that [`check`] does not read;
+    /// Z has no data.
+    fn root_with_live_files() -> (Vec<[u8; 32]>, Vec<(u32, ExFatStructure)>) {
+        let mut entries = standard_root();
+        entries.extend(file("F", 20, 1024));
+        entries.extend(file_set(&utf16("G"), 0, 40, 1500, 1500, true));
+        entries.extend(directory("E", 50, 1));
+        entries.extend(file("Z", 0, 0));
+        let mut clusters = STRUCTURE.to_vec();
+        clusters.extend([
+            (20, ExFatStructure::File),
+            (30, ExFatStructure::File),
+            (40, ExFatStructure::File),
+            (41, ExFatStructure::File),
+            (42, ExFatStructure::File),
+            (50, ExFatStructure::Directory),
+        ]);
+        (entries, clusters)
+    }
+
+    fn with_live_files() -> Vol {
+        let (entries, _) = root_with_live_files();
+        let mut vol = structured(&entries);
+        vol.chain(&[20, 30]);
+        vol.fat(21, FAT_END_OF_CHAIN);
+        vol.chain(&[50]);
+        mark(&mut vol, &[3], &[21]);
+        vol
+    }
+
+    #[test]
+    fn live_allocations_marked_in_use_are_believed_and_counted() {
+        let (_, clusters) = root_with_live_files();
+        let mut vol = with_live_files();
+        mark(&mut vol, &[3], &all_of(&clusters));
+
+        // D's one cluster, F's two, G's three and E's one.
+        assert_eq!(
+            check(&mut vol).expect("believed"),
+            ExFatStructureChecked {
+                directory_clusters: 3,
+                bitmap_clusters: 1,
+                up_case_clusters: 2,
+                live_clusters: 7,
+            }
+        );
+    }
+
+    /// A chain followed through the FAT (30, not the decoy 21), a run, and
+    /// a directory the walk did not read: any cluster of them marked free
+    /// and the bitmap is not believed.
+    #[test]
+    fn a_live_allocation_marked_free_is_not_believed() {
+        let (_, clusters) = root_with_live_files();
+        for &(free, kind) in clusters.iter().filter(|&&(c, _)| c >= 20) {
+            let mut vol = with_live_files();
+            let others: Vec<u32> = all_of(&clusters)
+                .into_iter()
+                .filter(|&c| c != free)
+                .collect();
+            mark(&mut vol, &[3], &others);
+
+            let result = check(&mut vol);
+            assert!(
+                matches!(
+                    result,
+                    Err(ExFatStructureError::MarkedFree { structure, cluster })
+                        if structure == kind && cluster == free
+                ),
+                "cluster {free}: {result:?}"
+            );
+        }
+    }
+
+    /// F needs three clusters and its chain ends after one: the cluster it
+    /// reached is checked, and nothing past the end is taken.
+    #[test]
+    fn a_live_chain_that_ends_early_is_checked_as_far_as_it_goes() {
+        let mut entries = standard_root();
+        entries.extend(file("F", 60, 1500));
+        let mut vol = structured(&entries);
+        vol.chain(&[60]);
+        let mut all = all_of(&STRUCTURE);
+        all.push(60);
+        mark(&mut vol, &[3], &all);
+
+        let checked = check(&mut vol).expect("believed");
+        assert_eq!(checked.live_clusters, 2);
+    }
+
+    #[test]
+    fn live_sets_past_the_bound_leave_the_bitmap_unbelieved() {
+        let (_, clusters) = root_with_live_files();
+        let mut vol = with_live_files();
+        mark(&mut vol, &[3], &all_of(&clusters));
+        let limits = Limits {
+            live_allocations: 2,
+            ..Limits::DEFAULT
+        };
+
+        let result = check_with(&mut vol, limits);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::LiveAllocationsUnrecorded {
+                    bound: 2,
+                    unrecorded: 2
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// Five runs of the whole heap name 1,000 clusters, more than four times
+    /// the volume's 200.
+    #[test]
+    fn live_allocations_naming_more_than_four_times_the_volume_are_refused() {
+        let mut entries = standard_root();
+        for name in ["A", "B", "C", "H", "I"] {
+            entries.extend(file_set(&utf16(name), 0, 2, 102_400, 102_400, true));
+        }
+        let mut vol = structured(&entries);
+        let all: Vec<u32> = (2..=201).collect();
+        mark(&mut vol, &[3], &all);
+
+        let result = check(&mut vol);
+        assert!(
+            matches!(
+                result,
+                Err(ExFatStructureError::LiveClustersBeyondBound { limit: 800 })
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// [`MAX_LIVE_ALLOCATIONS`]'s memory, 48 MiB, rests on this size.
+    #[test]
+    fn a_live_allocation_record_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<LiveAllocation>(), 12);
+        assert_eq!(
+            MAX_LIVE_ALLOCATIONS * std::mem::size_of::<LiveAllocation>(),
+            48 << 20
+        );
     }
 
     // --- checksum and names ---------------------------------------------------
