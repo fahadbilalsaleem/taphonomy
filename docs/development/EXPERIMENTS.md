@@ -2973,3 +2973,44 @@ or comes near a bound, so a contiguous reading and the chain cannot be
 told apart on any of them; these are left to unit tests. The made volumes
 carry a serial number and timestamps from the clock, so their digests
 differ from run to run; the figures above do not.
+
+### Appendix B: the deleted sets phase 1 reads, and the entry count (2026-10-22)
+
+**Question.** Before ADR-0022 Appendix B's reading of deleted sets is
+implemented: how many deleted sets do real volumes hold, are they all
+usable, do they straddle directory clusters, is any declared span cut
+short by an entry that is not an unused secondary, and what does reading
+deleted sets as sets do to each directory's entry count?
+
+**Input.** EXP-0011's 23 volumes.
+
+**Method.** `scripts/experiments/exp-0011-deleted-sets.py` on each: a
+walk written apart from Taphonomy's, over the root and every live
+directory, that reads each unused File entry as ADR-0022 Appendix B
+does and counts each directory's entries under two readings, each
+unused entry on its own and a deleted set once.
+`scripts/experiments/exp-0011-run.sh` runs it after the measurements
+above.
+
+**Result.**
+
+* 985 deleted sets lie outside deleted directories: 122 on A, 125 on B,
+  734 on NIST's twenty, 4 on `fs.exfat`. Every one is usable.
+* At most 262 lie on one volume, on NIST's dfr-09 and dfr-10.
+* 12 straddle two directory clusters: 2 on A, 2 on B, 4 on dfr-09 and 4
+  on dfr-10.
+* No declared span is cut short.
+* Read as sets, the root's entry count on A falls from 491 to 247, and
+  on B from 497 to 247.
+
+**Conclusion.** Every deleted set on these volumes is usable, so the
+hand-back rule never acts on them, and a set straddling directory
+clusters is common enough to be measured, not only tested. The most
+deleted sets on one volume, 262, is far below the bound of 2^20.
+
+**Limitations.** No volume holds a set cut short, an unusable deleted
+set or a File entry declaring fewer than two secondaries, so those are
+left to unit tests. The walk does not apply every check of ADR-0021
+section 4, only the checksum and the Stream Extension's place: a set
+passing those and failing another check would be counted usable here
+and not by Taphonomy.

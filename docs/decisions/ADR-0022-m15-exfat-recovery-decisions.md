@@ -572,3 +572,84 @@ left to unit tests, which the implementation is to carry.
 
 If the check fails, every deleted set on the volume is counted as not
 assessed, as section 7 says.
+
+---
+
+## Appendix B: phase 1's deleted sets, the entry count, and a bound (2026-10-22)
+
+Section 5's phase 1 records each usable deleted set. Before it is
+implemented, an audit settled four readings of Decision B, found that
+one count the command line prints changes, and found that the record
+needs a bound.
+
+**How a deleted set is read.**
+
+* An unused File entry that declares fewer than two secondaries is not a
+  File set, as a live one is not (`ADR-0021` section 4). It consumes
+  nothing, so what follows it is read as entries of its own, as after a
+  live File entry refused for the same reason.
+* Otherwise the set consumes, up to its declared count, the unused
+  secondaries that follow: any entry whose EntryType bits `C0h` equal
+  `40h`. That is a Stream Extension (`40h`), a File Name (`41h`) or an
+  unused benign secondary (`60h` to `7Fh`), as Decision B lists, and
+  also `42h` to `5Fh`, unused critical secondaries this version does
+  not recognise, which Decision B did not name. A live set is collected
+  the same way, taking any in-use secondary. A set holding one of
+  `42h` to `5Fh` is to fail its checks as a live set does, so it is
+  counted and not recorded. The set stops at the first entry that is
+  not an unused secondary, which is handed back (Decision B). The
+  project decided this widening on 2026-10-23.
+* A set that is complete but fails its SetChecksum or a check of
+  `ADR-0021` section 4 has still consumed its own entries. They are not
+  entries outside a set, so an unused Stream Extension among them is
+  not an orphan (`ADR-0014` Appendix F).
+* A set cut short, by a live entry, an end marker, another unused File
+  entry or the end of the directory's data, is not usable, even where
+  the entries read would pass every check.
+
+A usable set is recorded with the position of its File entry, the
+clusters its entries lie in, its attributes, FirstCluster, DataLength,
+ValidDataLength and NoFatChain, and the bytes of its creation and
+modification timestamps, 10 ms increments and UTC offsets, uninterpreted
+(`ADR-0019` Appendix C interprets them). A set that is not usable is
+counted and not recorded: its fields are not trusted, so it claims
+nothing.
+
+**The entry count changes.** Each directory's summary prints how many
+entries were read at its top level, and the code documents the count as
+counting an entry set once, however many secondaries it holds. M14 did
+not read deleted sets as sets, so it counted each unused entry of one
+on its own. Reading them as sets makes the count what its documentation
+says, and lowers it in every directory that holds a deleted set; no
+other line of output is to change. Of the 37 images section 14's
+identity proof runs over, the count is to change on three. On A and B
+the root's count falls from 491 and 497 to 247; the copy of A with its
+first exFAT sector zeroed differs from A only in that sector and is
+expected to change as A does, which section 14 item 4's identity proof
+is to show.
+Section 14 item 4 asks that every line of the live listing on these
+three images be unchanged: every line listing a live entry is to be,
+and the count line is to change as stated here. The project decided
+this on 2026-10-22.
+
+**A bound on the record.** `MAX_DELETED_SETS = 2^20` usable sets
+recorded on one volume, to be a field of `Limits` so a test can make it
+small. A choice of this project, not the specification's, and the same
+number as section 12's claims bound. A record is to hold a position (16
+bytes), a pointer into the list of clusters, the allocation fields and
+the two times, which as laid out in the trial implementation measures
+64 bytes with alignment: 64 MiB when full, and up to 96 MiB while it
+grows and the old and new buffers are both held. The clusters a set's
+entries lie in are held in one list beside it, one or two for almost
+every set and at most 17. A usable set past the bound is counted as not
+recorded, and is not assessed, as section 12 says of sets past its
+bounds.
+
+**Measured.** EXP-0011 Appendix B. On the 23 volumes of EXP-0011, 985
+deleted sets lie outside deleted directories, every one usable (judged
+by the checksum and the Stream Extension's place only; EXP-0011
+Appendix B, Limitations); at most 262 lie on one volume; 12 straddle
+two directory clusters; and no declared span is cut short. A set cut
+short, an unusable set, a set holding one of `42h` to `5Fh`, a count
+too small and each bound are left to unit tests, which the
+implementation is to carry.

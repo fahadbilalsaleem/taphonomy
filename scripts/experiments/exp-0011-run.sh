@@ -164,4 +164,9 @@ done
 echo "== Three more formatters (Appendix A)"
 "$T/exp-0011-made-images.sh" "$W/made" || echo "FAIL made images"
 
+echo "== Deleted sets read as sets, and each directory's entry count (Appendix B)"
+for f in "$W"/img/exp9-A.vhd "$W"/img/exp9-B.vhd "$W"/nist/img/*.dd "$W"/linux/fs.exfat; do
+    python3 -I "$T/exp-0011-deleted-sets.py" "$f" || echo "FAIL deleted sets $(basename "$f")"
+done
+
 check_inputs after
