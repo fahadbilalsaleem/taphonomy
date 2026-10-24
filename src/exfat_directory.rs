@@ -99,16 +99,21 @@ pub struct Limits {
 
     /// Most live sets whose allocation is kept for the bitmap check.
     pub live_allocations: usize,
+
+    /// Most usable deleted sets recorded for phase 2.
+    pub deleted_sets: usize,
 }
 
 impl Limits {
     /// [`MAX_DIRECTORY_CLUSTERS`], [`MAX_DIRECTORY_BYTES`],
-    /// [`MAX_QUEUED_DIRECTORIES`] and [`MAX_LIVE_ALLOCATIONS`].
+    /// [`MAX_QUEUED_DIRECTORIES`], [`MAX_LIVE_ALLOCATIONS`] and
+    /// [`MAX_DELETED_SETS`].
     pub const DEFAULT: Limits = Limits {
         directory_clusters: MAX_DIRECTORY_CLUSTERS,
         directory_bytes: MAX_DIRECTORY_BYTES,
         queued_directories: MAX_QUEUED_DIRECTORIES,
         live_allocations: MAX_LIVE_ALLOCATIONS,
+        deleted_sets: MAX_DELETED_SETS,
     };
 }
 
@@ -119,10 +124,22 @@ impl Limits {
 /// 12 bytes, so the full record is 48 MiB; while it grows from half that
 /// size the old and new buffers are briefly both held, up to 72 MiB. 2^22 is
 /// eight times the files of a 2 TB card filled with 4 MB photographs. A
-/// volume with more has
-/// the rest unrecorded, and its bitmap is then not believed, because a live
-/// file the check did not see could be marked free.
+/// volume with more has the rest unrecorded, and its bitmap is then not
+/// believed, because a live file the check did not see could be marked free.
 pub const MAX_LIVE_ALLOCATIONS: usize = 1 << 22;
+
+/// The most usable deleted sets one volume's walk records for phase 2
+/// (ADR-0022 section 5).
+///
+/// A safety bound chosen here, not a limit the specification gives, and the
+/// same number as Decision J's claims bound. Each record is 64 bytes, so the
+/// full record is 64 MiB, and while it grows the old and new buffers are
+/// briefly both held, up to 96 MiB; the clusters each set's entries lie in
+/// are held beside it, one or two for almost every set, at most 17. The
+/// most deleted sets on any volume measured is 262 (dfr-09, dfr-10). A set
+/// past the bound is counted as not recorded, and is not assessed
+/// (Decision J).
+pub const MAX_DELETED_SETS: usize = 1 << 20;
 
 /// How many clusters the bitmap check looks up for live allocations, as a
 /// multiple of the volume's ClusterCount.
@@ -320,6 +337,36 @@ impl ExFatBitmap {
 struct UpCaseEntry {
     first_cluster: u32,
     data_length: u64,
+}
+
+/// A timestamp field of a File entry, its 10 ms increment and its UTC
+/// offset byte, as stored (sections 7.4.5, 7.4.6 and 7.4.8 to 7.4.10).
+/// Nothing is interpreted here: ADR-0019 Appendix C decides how two are
+/// compared.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RawTime {
+    timestamp: u32,
+    ten_ms: u8,
+    utc_offset: u8,
+}
+
+/// A usable deleted set as phase 1 records it (ADR-0022 Decision B and
+/// section 5): where its File entry lies, the clusters its entries lie in
+/// (in the reader's shared list, from `clusters_start`, `clusters_len` of
+/// them), its allocation, and its creation and modification times. Its name
+/// is not held: phase 2 reads the set again from those clusters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DeletedSet {
+    position: ExFatPosition,
+    clusters_start: u32,
+    clusters_len: u8,
+    attributes: u16,
+    no_fat_chain: bool,
+    first_cluster: u32,
+    data_length: u64,
+    valid_data_length: u64,
+    created: RawTime,
+    modified: RawTime,
 }
 
 /// Where a live file or directory's data is, as its set describes it: the
@@ -1245,6 +1292,14 @@ pub struct ExFatReader<'a, R: EvidenceReader> {
     /// up to `limits.live_allocations`; and how many more were not kept.
     live: Vec<LiveAllocation>,
     live_unrecorded: u64,
+
+    /// Every usable deleted set found, up to `limits.deleted_sets`, the
+    /// clusters their entries lie in, and the counts of deleted sets that
+    /// were not usable and that were usable but not recorded.
+    deleted: Vec<DeletedSet>,
+    deleted_clusters: Vec<u32>,
+    deleted_unusable: u64,
+    deleted_unrecorded: u64,
 }
 
 impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
@@ -1268,6 +1323,10 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             up_case_entries: 0,
             live: Vec::new(),
             live_unrecorded: 0,
+            deleted: Vec::new(),
+            deleted_clusters: Vec::new(),
+            deleted_unusable: 0,
+            deleted_unrecorded: 0,
         }
     }
 
@@ -1815,11 +1874,13 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             }
 
             if kind & TYPE_IN_USE == 0 {
-                // Unused: skipped, its secondaries included. Only a File
-                // entry is counted, because that is a deleted set.
+                // An unused File entry begins a deleted set, read with the
+                // unused secondaries it declares and counted once. Any other
+                // unused entry outside a set is skipped, one at a time.
                 if kind == TYPE_UNUSED_FILE {
                     summary.unused_file_sets += 1;
                     visit(DirItem::UnusedFileSet { position });
+                    self.read_deleted_set(cursor, entry, window)?;
                 }
                 continue;
             }
@@ -1944,6 +2005,98 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         }
 
         Ok(Ok(()))
+    }
+
+    /// Reads a deleted set (ADR-0022 Decision B): the unused File entry and
+    /// the unused secondaries it declares, through the cursor, so the set
+    /// may straddle directory clusters. An entry that is not an unused
+    /// secondary ends the set and is handed back, not consumed: a live entry
+    /// in a deleted span is the newer writing and is read as live, and the
+    /// set is not usable. With every InUse bit set again, the set must pass
+    /// every check a live set does. A usable set is recorded for phase 2.
+    /// One that is not is counted, not recorded: its fields are not trusted,
+    /// so it claims nothing.
+    fn read_deleted_set(
+        &mut self,
+        cursor: &mut Cursor,
+        primary: RawEntry,
+        window: &mut Vec<u8>,
+    ) -> Result<(), ExFatDirectoryError> {
+        // As for a live set: a count too small for a File set consumes
+        // nothing, so what follows is read as entries of its own.
+        if (primary.bytes[1] as usize) < MIN_FILE_SECONDARIES {
+            self.deleted_unusable += 1;
+            return Ok(());
+        }
+
+        window.clear();
+        window.extend_from_slice(&primary.bytes);
+        let clusters_start = self.deleted_clusters.len();
+        self.deleted_clusters.push(primary.position.cluster);
+        let mut complete = true;
+        for _ in 0..primary.bytes[1] {
+            match self.next_entry(cursor)? {
+                Some(entry)
+                    if entry.bytes[0] & (TYPE_IN_USE | TYPE_SECONDARY) == TYPE_SECONDARY =>
+                {
+                    window.extend_from_slice(&entry.bytes);
+                    if self.deleted_clusters.last() != Some(&entry.position.cluster) {
+                        self.deleted_clusters.push(entry.position.cluster);
+                    }
+                }
+                Some(entry) => {
+                    cursor.pushed = Some(entry);
+                    complete = false;
+                    break;
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        for entry in window.as_chunks_mut::<ENTRY_BYTES>().0 {
+            entry[0] |= TYPE_IN_USE;
+        }
+        let file = match complete.then(|| self.validate_file_set(window)) {
+            Some(Ok(file)) => file,
+            _ => {
+                self.deleted_clusters.truncate(clusters_start);
+                self.deleted_unusable += 1;
+                return Ok(());
+            }
+        };
+        if self.deleted.len() >= self.limits.deleted_sets {
+            self.deleted_clusters.truncate(clusters_start);
+            self.deleted_unrecorded += 1;
+            return Ok(());
+        }
+
+        let p = &window[..ENTRY_BYTES];
+        self.deleted.push(DeletedSet {
+            position: primary.position,
+            // At most 17 clusters for a set of 256 entries at 512 bytes a
+            // cluster; the start is under 17 times the bound, which fits.
+            clusters_start: clusters_start as u32,
+            clusters_len: (self.deleted_clusters.len() - clusters_start) as u8,
+            attributes: file.attributes,
+            no_fat_chain: file.no_fat_chain,
+            first_cluster: file.first_cluster,
+            data_length: file.data_length,
+            valid_data_length: file.valid_data_length,
+            created: RawTime {
+                timestamp: le_u32(p, 8),
+                ten_ms: p[20],
+                utc_offset: p[22],
+            },
+            modified: RawTime {
+                timestamp: le_u32(p, 12),
+                ten_ms: p[21],
+                utc_offset: p[23],
+            },
+        });
+        Ok(())
     }
 
     /// Keeps a live set's allocation for the bitmap check. A set with no
@@ -3070,6 +3223,9 @@ pub(crate) mod tests {
     /// The root has no set, so no live record covers its clusters: a root
     /// cluster the FAT marks bad is checked through the clusters the walk
     /// took, alone. The walk stops there, and the check still names it.
+    /// This calls the check on a root not read whole, which its documentation
+    /// tells callers not to do: here the up-case entry lies in the cluster
+    /// read, so the mechanism can be tested. It is not the pattern to follow.
     #[test]
     fn a_root_cluster_the_fat_marks_bad_is_still_checked() {
         let mut vol = structured(&standard_root());
@@ -3388,6 +3544,340 @@ pub(crate) mod tests {
         assert_eq!(
             MAX_LIVE_ALLOCATIONS * std::mem::size_of::<LiveAllocation>(),
             48 << 20
+        );
+    }
+
+    // --- deleted sets ---------------------------------------------------------
+
+    /// `set` as deletion leaves it: the InUse bit of every entry cleared,
+    /// everything else, the checksum included, as the live set had it.
+    fn deleted(mut set: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+        for entry in set.iter_mut() {
+            entry[0] &= !TYPE_IN_USE;
+        }
+        set
+    }
+
+    /// What a walk of the root at cluster 2 recorded about deleted sets.
+    struct Found {
+        summary: DirectorySummary,
+        sets: Vec<DeletedSet>,
+        clusters: Vec<Vec<u32>>,
+        unusable: u64,
+        unrecorded: u64,
+    }
+
+    fn walk_deleted(vol: &mut Vol, limits: Limits) -> Found {
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        let (result, _) = walk_with(&mut reader, root(2));
+        let summary = result.expect("the root reads");
+        let clusters = reader
+            .deleted
+            .iter()
+            .map(|d| {
+                let start = d.clusters_start as usize;
+                reader.deleted_clusters[start..start + d.clusters_len as usize].to_vec()
+            })
+            .collect();
+        Found {
+            summary,
+            sets: reader.deleted.clone(),
+            clusters,
+            unusable: reader.deleted_unusable,
+            unrecorded: reader.deleted_unrecorded,
+        }
+    }
+
+    /// A file set with creation and modification times in its primary.
+    fn timed_file(name: &str, first: u32, size: u64) -> Vec<[u8; 32]> {
+        mutated(file(name, first, size), |s| {
+            s[0][8..12].copy_from_slice(&0x5A5A_1234u32.to_le_bytes());
+            s[0][12..16].copy_from_slice(&0x5A5B_5678u32.to_le_bytes());
+            s[0][20] = 7;
+            s[0][21] = 12;
+            s[0][22] = 0x90;
+            s[0][23] = 0x94;
+        })
+    }
+
+    #[test]
+    fn a_usable_deleted_set_is_recorded_with_its_allocation_and_times() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(timed_file("gone", 5, 1500)));
+        vol.put(2, 3, &file("kept", 0, 0));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 0);
+        assert_eq!(found.clusters, vec![vec![2]]);
+        assert_eq!(
+            found.sets,
+            vec![DeletedSet {
+                position: ExFatPosition {
+                    cluster: 2,
+                    slot: 0
+                },
+                clusters_start: 0,
+                clusters_len: 1,
+                // The archive attribute, which `file` sets.
+                attributes: 0x20,
+                no_fat_chain: false,
+                first_cluster: 5,
+                data_length: 1500,
+                valid_data_length: 1500,
+                created: RawTime {
+                    timestamp: 0x5A5A_1234,
+                    ten_ms: 7,
+                    utc_offset: 0x90
+                },
+                modified: RawTime {
+                    timestamp: 0x5A5B_5678,
+                    ten_ms: 12,
+                    utc_offset: 0x94
+                },
+            }]
+        );
+        // The deleted set counts once, as a live set does: the set, `kept`,
+        // and the end marker.
+        assert_eq!(found.summary.entries_read, 3);
+        assert_eq!(found.summary.unused_file_sets, 1);
+        assert_eq!(found.summary.files, 1);
+    }
+
+    #[test]
+    fn a_deleted_set_with_no_allocation_is_recorded() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(file("empty", 0, 0)));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.sets.len(), 1);
+        assert_eq!(found.sets[0].first_cluster, 0);
+        assert_eq!(found.sets[0].data_length, 0);
+    }
+
+    /// Slots 14 and 15 of cluster 2 hold the set's first two entries and
+    /// slot 0 of cluster 5, the root's next, its third.
+    #[test]
+    fn a_deleted_set_straddling_two_clusters_records_both() {
+        let mut vol = Vol::new();
+        vol.chain(&[2, 5]);
+        vol.fill_unused(2);
+        let set = deleted(file("across", 9, 100));
+        vol.put(2, 14, &set[..2]);
+        vol.put(5, 0, &set[2..]);
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 0);
+        assert_eq!(found.clusters, vec![vec![2, 5]]);
+        assert_eq!(
+            found.sets[0].position,
+            ExFatPosition {
+                cluster: 2,
+                slot: 14
+            }
+        );
+    }
+
+    /// An unused benign secondary (a vendor extension, E0h, unused: 60h)
+    /// after the names belongs to the set.
+    #[test]
+    fn an_unused_benign_secondary_belongs_to_the_deleted_set() {
+        let mut extension = [0u8; 32];
+        extension[0] = 0xE0;
+        let set = mutated(file("vendor", 5, 100), |s| {
+            s[0][1] += 1;
+            s.push(extension);
+        });
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(set));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 0);
+        assert_eq!(found.sets.len(), 1);
+        assert_eq!(found.summary.entries_read, 2);
+    }
+
+    /// An unused critical secondary this version does not recognise (C2h,
+    /// unused: 42h) after the names is consumed by the set, as a live set
+    /// consumes C2h, and then fails the set's checks: counted, not recorded.
+    /// The count of 2 (the set and the end marker) shows it was not handed
+    /// back.
+    #[test]
+    fn an_unused_unrecognised_critical_secondary_makes_the_deleted_set_unusable() {
+        let mut extension = [0u8; 32];
+        extension[0] = 0xC2;
+        let set = mutated(file("vendor", 5, 100), |s| {
+            s[0][1] += 1;
+            s.push(extension);
+        });
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(set));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        assert!(found.clusters.is_empty());
+        assert_eq!(found.summary.entries_read, 2);
+        assert_eq!(found.summary.unused_file_sets, 1);
+    }
+
+    /// The set declares two secondaries; the slot of the second holds a live
+    /// File entry, which is handed back and read as live.
+    #[test]
+    fn a_live_entry_in_a_deleted_span_ends_the_set_and_is_read_as_live() {
+        let gone = deleted(file("gone", 5, 100));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone[..2]);
+        vol.put(2, 2, &file("kept", 0, 0));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        assert_eq!(found.summary.files, 1);
+        assert_eq!(found.summary.refused, 0);
+    }
+
+    /// The marker at slot 2 ends the set and the directory: the file after
+    /// it is residue, not read.
+    #[test]
+    fn an_end_marker_in_a_deleted_span_ends_the_set_and_the_directory() {
+        let gone = deleted(file("gone", 5, 100));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone[..2]);
+        vol.put(2, 3, &file("after", 0, 0));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        assert!(found.summary.terminated);
+        assert_eq!(found.summary.files, 0);
+        assert_eq!(found.summary.entries_after_end_marker, 3);
+    }
+
+    /// The File entry declares three secondaries and its checksum covers
+    /// the three entries it has; the fourth slot holds a live set. What was
+    /// read would pass every check, but the set is cut short, so it is not
+    /// usable.
+    #[test]
+    fn a_deleted_set_cut_short_is_not_usable_even_where_what_was_read_passes() {
+        let gone = deleted(mutated(file("gone", 5, 100), |s| s[0][1] = 3));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone);
+        vol.put(2, 3, &file("kept", 0, 0));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        assert_eq!(found.summary.files, 1);
+    }
+
+    /// The first set's span reaches the second set's File entry, which
+    /// begins a set of its own.
+    #[test]
+    fn an_unused_file_entry_in_a_deleted_span_begins_a_set_of_its_own() {
+        let first = deleted(file("first", 5, 100));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &first[..2]);
+        vol.put(2, 2, &deleted(file("second", 7, 100)));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert_eq!(found.summary.unused_file_sets, 2);
+        assert_eq!(found.sets.len(), 1);
+        assert_eq!(
+            found.sets[0].position,
+            ExFatPosition {
+                cluster: 2,
+                slot: 2
+            }
+        );
+        assert_eq!(found.sets[0].first_cluster, 7);
+        // The unusable set's cluster was let go: the list holds the usable
+        // set's alone.
+        assert_eq!(found.sets[0].clusters_start, 0);
+        assert_eq!(found.clusters, vec![vec![2]]);
+    }
+
+    /// Its secondaries are its own, so they are consumed with it and are
+    /// not read as unused entries outside a set.
+    #[test]
+    fn a_deleted_set_failing_its_checksum_is_counted_and_consumes_its_entries() {
+        let mut gone = deleted(file("gone", 5, 100));
+        gone[0][2] ^= 1;
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone);
+        vol.put(2, 3, &file("kept", 0, 0));
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        assert_eq!(found.summary.entries_read, 3);
+        assert_eq!(found.summary.files, 1);
+    }
+
+    #[test]
+    fn a_deleted_set_failing_a_live_set_check_is_not_usable() {
+        let gone = deleted(mutated(file("gone", 5, 100), |s| s[1][3] = 0));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone);
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+    }
+
+    /// A File entry declaring one secondary is no File set, and consumes
+    /// nothing: the unused Stream Extension after it is read as an entry of
+    /// its own, as a live set's would be.
+    #[test]
+    fn a_deleted_file_entry_declaring_too_few_secondaries_consumes_nothing() {
+        let gone = deleted(mutated(file("gone", 5, 100), |s| s[0][1] = 1));
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &gone[..2]);
+
+        let found = walk_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(found.unusable, 1);
+        assert!(found.sets.is_empty());
+        // The File entry, the stream, and the end marker.
+        assert_eq!(found.summary.entries_read, 3);
+    }
+
+    #[test]
+    fn deleted_sets_past_the_bound_are_counted_not_recorded() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(file("one", 5, 100)));
+        vol.put(2, 3, &deleted(file("two", 7, 100)));
+        let limits = Limits {
+            deleted_sets: 1,
+            ..Limits::DEFAULT
+        };
+
+        let found = walk_deleted(&mut vol, limits);
+        assert_eq!(found.sets.len(), 1);
+        assert_eq!(found.unrecorded, 1);
+        assert_eq!(found.unusable, 0);
+        assert_eq!(found.clusters, vec![vec![2]]);
+    }
+
+    /// [`MAX_DELETED_SETS`]'s memory, 64 MiB, rests on this size.
+    #[test]
+    fn a_deleted_set_record_is_sixty_four_bytes() {
+        assert_eq!(std::mem::size_of::<DeletedSet>(), 64);
+        assert_eq!(
+            MAX_DELETED_SETS * std::mem::size_of::<DeletedSet>(),
+            64 << 20
         );
     }
 
