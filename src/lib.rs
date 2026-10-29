@@ -60,6 +60,7 @@ pub mod confidence;
 pub mod error;
 pub mod evidence;
 pub mod exfat_boot;
+pub mod exfat_claims;
 pub mod exfat_directory;
 pub mod extraction;
 pub mod fat;

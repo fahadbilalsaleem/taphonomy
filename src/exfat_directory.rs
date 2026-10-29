@@ -27,9 +27,12 @@
 //!
 //! An entry set is used only if it is well formed and its checksum is valid
 //! (ADR-0019 Decision C). One that is not is reported, with the reason, and
-//! not used. Deleted entry sets, those whose `InUse` bit is clear, are not
-//! examined in this milestone: an unused File entry is counted, and nothing
-//! in its secondaries is interpreted. The allocation bitmap's entry is
+//! not used. A deleted entry set, whose `InUse` bits are clear, is read as a
+//! set and, where usable, recorded (ADR-0022 Decision B and Appendix B); an
+//! unused Stream Extension outside any set is recorded as an orphan. Their
+//! claims are followed, and condition 2 decided over them, by
+//! [`ExFatReader::assess_claims`], which nothing calls yet. The allocation
+//! bitmap's entry is
 //! located and range checked by the walk. Its contents are read only
 //! through [`ExFatReader::open_bitmap`] and
 //! [`ExFatReader::cluster_allocated`], which the walk does not call yet.
@@ -58,6 +61,7 @@ use std::fmt;
 use crate::error::Error;
 use crate::evidence::EvidenceReader;
 use crate::exfat_boot::ExFatBootSector;
+use crate::exfat_claims::{self, ClaimRun, Claimant, ConditionTwo};
 use crate::filesystem::{VolumeExtent, le_u16, le_u32};
 use crate::partition::SECTOR_SIZE;
 
@@ -100,20 +104,25 @@ pub struct Limits {
     /// Most live sets whose allocation is kept for the bitmap check.
     pub live_allocations: usize,
 
-    /// Most usable deleted sets recorded for phase 2.
+    /// Most usable deleted sets and orphan Stream Extensions recorded for
+    /// phase 2, the two together.
     pub deleted_sets: usize,
+
+    /// Most runs of clusters held in the claims table.
+    pub claimed_runs: usize,
 }
 
 impl Limits {
     /// [`MAX_DIRECTORY_CLUSTERS`], [`MAX_DIRECTORY_BYTES`],
-    /// [`MAX_QUEUED_DIRECTORIES`], [`MAX_LIVE_ALLOCATIONS`] and
-    /// [`MAX_DELETED_SETS`].
+    /// [`MAX_QUEUED_DIRECTORIES`], [`MAX_LIVE_ALLOCATIONS`],
+    /// [`MAX_DELETED_SETS`] and [`MAX_CLAIMED_RUNS`].
     pub const DEFAULT: Limits = Limits {
         directory_clusters: MAX_DIRECTORY_CLUSTERS,
         directory_bytes: MAX_DIRECTORY_BYTES,
         queued_directories: MAX_QUEUED_DIRECTORIES,
         live_allocations: MAX_LIVE_ALLOCATIONS,
         deleted_sets: MAX_DELETED_SETS,
+        claimed_runs: MAX_CLAIMED_RUNS,
     };
 }
 
@@ -138,8 +147,40 @@ pub const MAX_LIVE_ALLOCATIONS: usize = 1 << 22;
 /// are held beside it, one or two for almost every set, at most 17. The
 /// most deleted sets on any volume measured is 262 (dfr-09, dfr-10). A set
 /// past the bound is counted as not recorded, and is not assessed
-/// (Decision J).
+/// (Decision J). Orphan Stream Extensions share the bound (ADR-0022
+/// Appendix C): an orphan is 32 bytes, so a record held to the bound by
+/// orphans alone is smaller.
 pub const MAX_DELETED_SETS: usize = 1 << 20;
+
+/// The most runs of clusters held in the claims table for one volume
+/// (ADR-0022 Decision J).
+///
+/// A safety bound chosen here, not a limit the specification gives. A run
+/// is 12 bytes, so the table is 12 MiB when full, up to 18 MiB while it
+/// grows. Deciding condition 2 holds, beside it and the claimants (56 bytes
+/// each, 56 MiB at [`MAX_DELETED_SETS`]), the runs sorted and merged, their
+/// boundaries, the ranges they become, a tree of counts (at most 2^22 nodes
+/// of 8 bytes) and the claimants grouped by offset byte. At both bounds the
+/// peak is about 150 MiB: 149 MiB computed from the types' sizes, and 152
+/// MiB resident, measured once in a trial run of 2^20 claimants and 2^20
+/// runs. The most runs claimed on any volume measured is
+/// 262 (dfr-09, dfr-10). A claimant whose claim would pass the bound, and
+/// every one after it, is not recorded: its claims are unseen and, if it is
+/// a set, it is not assessed.
+pub const MAX_CLAIMED_RUNS: usize = 1 << 20;
+
+/// How many FAT links the claims of every deleted chain on one volume may
+/// follow, as a multiple of its ClusterCount (ADR-0022 Decision J).
+///
+/// A safety bound chosen here, not the specification's. Each cluster belongs
+/// to one chain at a time, so a volume whose deleted chains follow more
+/// links than it has clusters is following the same links again; four
+/// leaves room for clusters reused by several deleted files, and stops a
+/// volume that points millions of sets at one long chain after reading the
+/// FAT four times over. The most clusters claimed on any volume measured is
+/// 0.9994 of its ClusterCount (dfr-06). Past the bound, the claimant being
+/// followed and every one after it are not recorded.
+pub const CLAIM_LINKS_PER_CLUSTER: u64 = 4;
 
 /// How many clusters the bitmap check looks up for live allocations, as a
 /// multiple of the volume's ClusterCount.
@@ -350,6 +391,13 @@ struct RawTime {
     utc_offset: u8,
 }
 
+impl RawTime {
+    /// The time as condition 2 compares it, where it can be compared.
+    fn key(self) -> Option<exfat_claims::Key> {
+        exfat_claims::key(self.timestamp, self.ten_ms, self.utc_offset)
+    }
+}
+
 /// A usable deleted set as phase 1 records it (ADR-0022 Decision B and
 /// section 5): where its File entry lies, the clusters its entries lie in
 /// (in the reader's shared list, from `clusters_start`, `clusters_len` of
@@ -367,6 +415,17 @@ struct DeletedSet {
     valid_data_length: u64,
     created: RawTime,
     modified: RawTime,
+}
+
+/// An unused Stream Extension outside any set, whose File entry was
+/// overwritten (ADR-0022 section 5): kept for the clusters its fields name.
+/// It has no time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct OrphanStream {
+    position: ExFatPosition,
+    no_fat_chain: bool,
+    first_cluster: u32,
+    data_length: u64,
 }
 
 /// Where a live file or directory's data is, as its set describes it: the
@@ -509,6 +568,39 @@ impl From<ChainFault> for ExFatBitmapError {
             }
         }
     }
+}
+
+/// What [`ExFatReader::assess_claims`] found: condition 2 for each recorded
+/// deleted set, and what the claims bounds left unseen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimsAssessed {
+    /// One per deleted set the walk recorded, in the order it found them;
+    /// `None` where a claims bound left it not assessed.
+    pub verdicts: Vec<Option<ConditionTwo>>,
+
+    /// Orphan Stream Extensions whose claims were followed.
+    pub orphan_streams: u64,
+
+    /// Claimants, deleted sets or orphans, whose claims a bound left unseen.
+    pub unrecorded: u64,
+
+    /// Runs of clusters held in the claims table.
+    pub runs: u64,
+
+    /// FAT links followed.
+    pub links: u64,
+
+    /// Deleted sets the walk found not usable: they claim nothing, so what
+    /// they held is unseen (ADR-0022 Decision B).
+    pub sets_unusable: u64,
+
+    /// Usable deleted sets the walk did not record, past
+    /// [`Limits::deleted_sets`]: not assessed, and their claims unseen.
+    pub sets_unrecorded: u64,
+
+    /// Orphan Stream Extensions the walk did not record, past the same
+    /// bound: their claims unseen.
+    pub orphans_unrecorded: u64,
 }
 
 /// Why a structure chain could not be followed. Each caller turns it into
@@ -1300,6 +1392,11 @@ pub struct ExFatReader<'a, R: EvidenceReader> {
     deleted_clusters: Vec<u32>,
     deleted_unusable: u64,
     deleted_unrecorded: u64,
+
+    /// Every orphan Stream Extension found, within the same bound as the
+    /// deleted sets, and how many more were not kept.
+    orphans: Vec<OrphanStream>,
+    orphans_unrecorded: u64,
 }
 
 impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
@@ -1327,6 +1424,8 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             deleted_clusters: Vec::new(),
             deleted_unusable: 0,
             deleted_unrecorded: 0,
+            orphans: Vec::new(),
+            orphans_unrecorded: 0,
         }
     }
 
@@ -1710,6 +1809,172 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         })
     }
 
+    /// Follows every claim the walk recorded and decides condition 2 for each
+    /// recorded deleted set (ADR-0022 section 5, Decisions C, D and J, and
+    /// Appendix C).
+    ///
+    /// A usable deleted set claims the clusters of its allocation: a run
+    /// where `NoFatChain` is set, otherwise the chain from its first
+    /// cluster, followed until it has as many clusters as `DataLength`
+    /// needs or the FAT does not go on, so a chain that condition 4 refuses
+    /// still claims what it reached. An orphan Stream Extension claims the
+    /// same way where its first cluster is in the heap and its `DataLength`
+    /// is above 0, a run cut at the heap's end; it has no time.
+    ///
+    /// Call it after the walk of every directory whose claims are to count.
+    /// Claims are followed in the order the walk found them, deleted sets
+    /// first. Past [`Limits::claimed_runs`] runs, or
+    /// [`CLAIM_LINKS_PER_CLUSTER`] times the volume's clusters in FAT links,
+    /// the claimant being followed and every one after it are not recorded:
+    /// their claims are unseen, and a deleted set among them is not assessed.
+    /// Condition 2 is still decided over the claims seen (Decision D). What
+    /// was not seen is counted in the result, those the walk itself left
+    /// unseen included; the caller must also count every directory not read
+    /// whole, whose claims are unseen too.
+    pub fn assess_claims(&mut self) -> Result<ClaimsAssessed, Error> {
+        let link_limit = CLAIM_LINKS_PER_CLUSTER * self.boot.cluster_count as u64;
+        let total = self.deleted.len() + self.orphans.len();
+        let mut claimants: Vec<Claimant> = Vec::with_capacity(total);
+        let mut runs: Vec<ClaimRun> = Vec::new();
+        let mut links = 0u64;
+
+        for index in 0..total {
+            let (first, data_length, no_fat_chain, claimant) = match self.deleted.get(index) {
+                Some(set) => (
+                    set.first_cluster,
+                    set.data_length,
+                    set.no_fat_chain,
+                    Claimant {
+                        timed: true,
+                        created: set.created.key(),
+                        modified: set.modified.key(),
+                    },
+                ),
+                None => {
+                    let orphan = self.orphans[index - self.deleted.len()];
+                    (
+                        orphan.first_cluster,
+                        orphan.data_length,
+                        orphan.no_fat_chain,
+                        Claimant {
+                            timed: false,
+                            created: None,
+                            modified: None,
+                        },
+                    )
+                }
+            };
+            let Ok(owner) = u32::try_from(index) else {
+                break;
+            };
+            let start = runs.len();
+            let complete = self.claim(
+                first,
+                data_length,
+                no_fat_chain,
+                owner,
+                &mut runs,
+                &mut links,
+                link_limit,
+            )?;
+            if !complete {
+                runs.truncate(start);
+                break;
+            }
+            claimants.push(claimant);
+        }
+
+        let decided = exfat_claims::decide(&claimants, &runs);
+        let mut verdicts = vec![None; self.deleted.len()];
+        for (verdict, decision) in verdicts.iter_mut().zip(decided) {
+            *verdict = decision;
+        }
+        Ok(ClaimsAssessed {
+            verdicts,
+            orphan_streams: claimants.len().saturating_sub(self.deleted.len()) as u64,
+            unrecorded: (total - claimants.len()) as u64,
+            runs: runs.len() as u64,
+            links,
+            sets_unusable: self.deleted_unusable,
+            sets_unrecorded: self.deleted_unrecorded,
+            orphans_unrecorded: self.orphans_unrecorded,
+        })
+    }
+
+    /// Adds the clusters one allocation claims to `runs`, as `owner`'s.
+    /// False where a bound was reached first.
+    #[allow(clippy::too_many_arguments)]
+    fn claim(
+        &mut self,
+        first: u32,
+        data_length: u64,
+        no_fat_chain: bool,
+        owner: u32,
+        runs: &mut Vec<ClaimRun>,
+        links: &mut u64,
+        link_limit: u64,
+    ) -> Result<bool, Error> {
+        let last = self.boot.cluster_count as u64 + 1;
+        let needed = data_length.div_ceil(self.boot.cluster_bytes() as u64);
+        if first < 2 || first as u64 > last || needed == 0 {
+            return Ok(true);
+        }
+        let limit = self.limits.claimed_runs;
+
+        if no_fat_chain {
+            // Cut at the heap's end. A usable set's run was held inside it by
+            // validate_file_set; an orphan's fields were not checked. At most
+            // ClusterCount clusters, so the count fits.
+            let clusters = needed.min(last + 1 - first as u64) as u32;
+            if runs.len() >= limit {
+                return Ok(false);
+            }
+            runs.push(ClaimRun {
+                first,
+                clusters,
+                owner,
+            });
+            return Ok(true);
+        }
+
+        // The chain is followed for DataLength's count of steps, not of
+        // distinct clusters: a chain that comes back to a cluster spends a
+        // run on it again, which reaches the bound sooner, never later. The
+        // repeat counts once in the claim (exfat_claims merges a claimant's
+        // runs).
+        let mut cluster = first;
+        for taken in 1..=needed {
+            let follows_on = runs.last().is_some_and(|run| {
+                run.owner == owner && run.first as u64 + run.clusters as u64 == cluster as u64
+            });
+            if let (true, Some(run)) = (follows_on, runs.last_mut()) {
+                // At most ClusterCount clusters follow on in one run.
+                run.clusters += 1;
+            } else if runs.len() >= limit {
+                return Ok(false);
+            } else {
+                runs.push(ClaimRun {
+                    first: cluster,
+                    clusters: 1,
+                    owner,
+                });
+            }
+            if taken == needed {
+                break;
+            }
+            *links += 1;
+            if *links > link_limit {
+                return Ok(false);
+            }
+            match self.fat_link(cluster)? {
+                Some(Link::Next(next)) => cluster = next,
+                // The chain does not go on: what it reached is the claim.
+                _ => break,
+            }
+        }
+        Ok(true)
+    }
+
     /// Locates the up-case table's clusters through its FAT chain.
     fn up_case_runs(&mut self, entry: UpCaseEntry) -> Result<Vec<BitmapRun>, ExFatStructureError> {
         if entry.first_cluster < 2
@@ -1875,12 +2140,16 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
 
             if kind & TYPE_IN_USE == 0 {
                 // An unused File entry begins a deleted set, read with the
-                // unused secondaries it declares and counted once. Any other
-                // unused entry outside a set is skipped, one at a time.
+                // unused secondaries it declares and counted once. An unused
+                // Stream Extension outside a set is an orphan, kept for its
+                // claim. Any other unused entry outside a set is skipped, one
+                // at a time.
                 if kind == TYPE_UNUSED_FILE {
                     summary.unused_file_sets += 1;
                     visit(DirItem::UnusedFileSet { position });
                     self.read_deleted_set(cursor, entry, window)?;
+                } else if kind == TYPE_STREAM & !TYPE_IN_USE {
+                    self.record_orphan(&entry);
                 }
                 continue;
             }
@@ -2035,7 +2304,16 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         self.deleted_clusters.push(primary.position.cluster);
         let mut complete = true;
         for _ in 0..primary.bytes[1] {
-            match self.next_entry(cursor)? {
+            // On an error the set's clusters are let go before it is passed
+            // up, so the shared list holds only recorded sets' clusters.
+            let next = match self.next_entry(cursor) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.deleted_clusters.truncate(clusters_start);
+                    return Err(e);
+                }
+            };
+            match next {
                 Some(entry)
                     if entry.bytes[0] & (TYPE_IN_USE | TYPE_SECONDARY) == TYPE_SECONDARY =>
                 {
@@ -2067,7 +2345,7 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
                 return Ok(());
             }
         };
-        if self.deleted.len() >= self.limits.deleted_sets {
+        if self.deleted.len() + self.orphans.len() >= self.limits.deleted_sets {
             self.deleted_clusters.truncate(clusters_start);
             self.deleted_unrecorded += 1;
             return Ok(());
@@ -2097,6 +2375,22 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             },
         });
         Ok(())
+    }
+
+    /// Keeps an orphan Stream Extension for its claim, within the deleted
+    /// sets' bound (ADR-0022 Appendix C).
+    fn record_orphan(&mut self, entry: &RawEntry) {
+        if self.deleted.len() + self.orphans.len() >= self.limits.deleted_sets {
+            self.orphans_unrecorded += 1;
+            return;
+        }
+        let bytes = &entry.bytes;
+        self.orphans.push(OrphanStream {
+            position: entry.position,
+            no_fat_chain: bytes[1] & FLAG_NO_FAT_CHAIN != 0,
+            first_cluster: le_u32(bytes, 20),
+            data_length: le_u64(bytes, 24),
+        });
     }
 
     /// Keeps a live set's allocation for the bitmap check. A set with no
@@ -5628,5 +5922,416 @@ pub(crate) mod tests {
             .contains("78")
         );
         assert!(!ExFatContentError::Directory.to_string().is_empty());
+    }
+
+    // --- claims and condition 2 (ADR-0022 section 5 and Appendix C) ---------
+
+    /// Walks the root at cluster 2 and follows its claims.
+    fn assess(vol: &mut Vol, limits: Limits) -> ClaimsAssessed {
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        let (result, _) = walk_with(&mut reader, root(2));
+        result.expect("the root reads");
+        reader.assess_claims().expect("the claims are followed")
+    }
+
+    /// 2026-03-01 10:00:00 plus `seconds`, as a timestamp.
+    fn stamp(seconds: u32) -> u32 {
+        let s = 10 * 3600 + seconds;
+        (46 << 25)
+            | (3 << 21)
+            | (1 << 16)
+            | ((s / 3600) << 11)
+            | (((s / 60) % 60) << 5)
+            | ((s % 60) / 2)
+    }
+
+    /// `set` created at `created` and last modified at `modified` seconds
+    /// after 10:00 on 1 March 2026, both under offset byte `offset`.
+    fn at_times(set: Vec<[u8; 32]>, created: u32, modified: u32, offset: u8) -> Vec<[u8; 32]> {
+        mutated(set, |s| {
+            s[0][8..12].copy_from_slice(&stamp(created).to_le_bytes());
+            s[0][12..16].copy_from_slice(&stamp(modified).to_le_bytes());
+            s[0][20] = 0;
+            s[0][21] = 0;
+            s[0][22] = offset;
+            s[0][23] = offset;
+        })
+    }
+
+    /// An unused Stream Extension naming `first` and `dl`.
+    fn orphan_stream(no_fat_chain: bool, first: u32, dl: u64) -> [u8; 32] {
+        let flags = FLAG_ALLOCATION_POSSIBLE | if no_fat_chain { FLAG_NO_FAT_CHAIN } else { 0 };
+        let mut entry = stream(flags, 0, dl, first, dl);
+        entry[0] &= !TYPE_IN_USE;
+        entry
+    }
+
+    use crate::exfat_claims::ConditionTwo::{Holds, Later, Unordered};
+
+    /// `old` claims clusters 10 and 11, `new`, created later, cluster 11.
+    #[test]
+    fn a_later_deleted_set_refuses_an_earlier_one_over_a_shared_cluster() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10, 11]);
+        vol.put(2, 0, &deleted(at_times(file("old", 10, 1024), 0, 4, 0x90)));
+        vol.put(2, 3, &deleted(at_times(file("new", 11, 512), 8, 8, 0x90)));
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.verdicts, vec![Some(Later), Some(Holds)]);
+        assert_eq!(assessed.runs, 2);
+        assert_eq!(assessed.unrecorded, 0);
+    }
+
+    /// The same two, sharing nothing: each holds.
+    #[test]
+    fn deleted_sets_sharing_no_cluster_both_hold() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10, 11]);
+        vol.chain(&[12]);
+        vol.put(2, 0, &deleted(at_times(file("old", 10, 1024), 0, 4, 0x90)));
+        vol.put(2, 3, &deleted(at_times(file("new", 12, 512), 8, 8, 0x90)));
+
+        assert_eq!(
+            assess(&mut vol, Limits::DEFAULT).verdicts,
+            vec![Some(Holds), Some(Holds)]
+        );
+    }
+
+    /// `later` needs three clusters, but its chain ends at 11: condition 4
+    /// will refuse it, and it still claims 10 and 11, so `earlier`, at 11,
+    /// is refused under condition 2.
+    #[test]
+    fn a_chain_that_ends_early_still_claims_what_it_reached() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10, 11]);
+        vol.put(
+            2,
+            0,
+            &deleted(at_times(file("later", 10, 1536), 8, 8, 0x90)),
+        );
+        vol.put(
+            2,
+            3,
+            &deleted(at_times(file("earlier", 11, 512), 0, 0, 0x90)),
+        );
+
+        assert_eq!(
+            assess(&mut vol, Limits::DEFAULT).verdicts,
+            vec![Some(Holds), Some(Later)]
+        );
+    }
+
+    /// A link the FAT marks bad, out of the heap, or 0 stops the claim at
+    /// the cluster it leaves: `earlier`, at 11, is not reached.
+    #[test]
+    fn a_chain_claims_no_further_than_its_last_link_in_the_heap() {
+        for link in [FAT_BAD_CLUSTER, 0, 1, CLUSTER_COUNT + 2] {
+            let mut vol = Vol::new();
+            vol.chain(&[2]);
+            vol.fat(10, link);
+            vol.chain(&[11]);
+            vol.put(
+                2,
+                0,
+                &deleted(at_times(file("later", 10, 1024), 8, 8, 0x90)),
+            );
+            vol.put(
+                2,
+                3,
+                &deleted(at_times(file("earlier", 11, 512), 0, 0, 0x90)),
+            );
+
+            let assessed = assess(&mut vol, Limits::DEFAULT);
+            assert_eq!(
+                assessed.verdicts,
+                vec![Some(Holds), Some(Holds)],
+                "{link:#x}"
+            );
+            assert_eq!(assessed.links, 1, "{link:#x}");
+        }
+    }
+
+    #[test]
+    fn a_run_without_a_fat_chain_is_claimed_whole() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        let run = file_set(&utf16("run"), 0x20, 10, 2048, 2048, true);
+        vol.put(2, 0, &deleted(at_times(run, 8, 8, 0x90)));
+        vol.put(
+            2,
+            3,
+            &deleted(at_times(file("earlier", 13, 512), 0, 0, 0x90)),
+        );
+        vol.chain(&[13]);
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.verdicts, vec![Some(Holds), Some(Later)]);
+        assert_eq!(assessed.links, 0);
+    }
+
+    /// ADR-0022 Appendix C: `new` is created under the byte `old` carries
+    /// and last modified under another. It is judged by `old`'s times
+    /// against its creation, and holds; `old` cannot be ordered against it.
+    #[test]
+    fn a_set_modified_under_another_offset_is_judged_by_its_creation() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10]);
+        vol.put(2, 0, &deleted(at_times(file("old", 10, 512), 0, 0, 0x90)));
+        let new = mutated(at_times(file("new", 10, 512), 8, 12, 0x90), |s| {
+            s[0][23] = 0x94
+        });
+        vol.put(2, 3, &deleted(new));
+
+        assert_eq!(
+            assess(&mut vol, Limits::DEFAULT).verdicts,
+            vec![Some(Unordered), Some(Holds)]
+        );
+    }
+
+    /// FatFs writes 00h: OffsetValid clear, so no two of its sets that share
+    /// a cluster can be ordered (the cost ADR-0022 Appendix C measures).
+    #[test]
+    fn sets_whose_offsets_are_not_valid_cannot_be_ordered() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10]);
+        vol.put(2, 0, &deleted(at_times(file("old", 10, 512), 0, 0, 0x00)));
+        vol.put(2, 3, &deleted(at_times(file("new", 10, 512), 8, 8, 0x00)));
+
+        assert_eq!(
+            assess(&mut vol, Limits::DEFAULT).verdicts,
+            vec![Some(Unordered), Some(Unordered)]
+        );
+    }
+
+    /// The orphan at slot 4 names cluster 20, which `gone` claims too.
+    #[test]
+    fn an_orphan_stream_extension_is_recorded_and_refuses_the_sets_it_meets() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[20]);
+        vol.chain(&[30]);
+        vol.put(2, 0, &deleted(at_times(file("gone", 20, 512), 8, 8, 0x90)));
+        vol.put(2, 3, &[orphan_stream(false, 20, 512)]);
+        vol.put(2, 4, &deleted(at_times(file("apart", 30, 512), 8, 8, 0x90)));
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.verdicts, vec![Some(Unordered), Some(Holds)]);
+        assert_eq!(assessed.orphan_streams, 1);
+    }
+
+    /// An orphan's fields are not checked: a first cluster outside the heap,
+    /// just past it or far past it, or a length of 0, claims nothing, and a
+    /// run is cut at the heap's end.
+    #[test]
+    fn an_orphan_claims_only_what_lies_in_the_heap() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[30]);
+        vol.chain(&[CLUSTER_COUNT + 1]);
+        vol.put(2, 0, &deleted(at_times(file("apart", 30, 512), 8, 8, 0x90)));
+        vol.put(
+            2,
+            3,
+            &deleted(at_times(file("last", CLUSTER_COUNT + 1, 512), 8, 8, 0x90)),
+        );
+        vol.put(
+            2,
+            6,
+            &[
+                orphan_stream(true, CLUSTER_COUNT + 2, 512),
+                orphan_stream(false, 30, 0),
+                orphan_stream(true, CLUSTER_COUNT, 512 * 1000),
+                orphan_stream(true, 0xFFFF_FFF0, 512),
+            ],
+        );
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.verdicts, vec![Some(Holds), Some(Unordered)]);
+        assert_eq!(assessed.orphan_streams, 4);
+    }
+
+    /// A run's length is cut at the heap's end before it becomes a count: an
+    /// orphan whose DataLength needs 2^32 + 51 clusters from 150 claims 150
+    /// to 201, not the 51 the count would wrap to.
+    #[test]
+    fn an_orphan_run_longer_than_the_heap_is_cut_not_wrapped() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[CLUSTER_COUNT + 1]);
+        vol.put(
+            2,
+            0,
+            &deleted(at_times(file("last", CLUSTER_COUNT + 1, 512), 8, 8, 0x90)),
+        );
+        vol.put(2, 3, &[orphan_stream(true, 150, ((1u64 << 32) + 51) * 512)]);
+
+        assert_eq!(
+            assess(&mut vol, Limits::DEFAULT).verdicts,
+            vec![Some(Unordered)]
+        );
+    }
+
+    /// Only an unused Stream Extension is an orphan: an unused File Name is
+    /// skipped, and one inside a set belongs to it.
+    #[test]
+    fn only_an_unused_stream_extension_outside_a_set_is_an_orphan() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[20]);
+        let mut name = name_entry(&utf16("x"));
+        name[0] &= !TYPE_IN_USE;
+        vol.put(2, 0, &[name]);
+        vol.put(2, 1, &deleted(at_times(file("gone", 20, 512), 8, 8, 0x90)));
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.orphan_streams, 0);
+        assert_eq!(assessed.verdicts, vec![Some(Holds)]);
+    }
+
+    /// A set failing its checksum claims nothing; the result counts it, so
+    /// the caller can count its claims as unseen.
+    #[test]
+    fn an_unusable_set_is_counted_in_the_result() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[20]);
+        let mut broken = deleted(file("gone", 20, 512));
+        broken[2][4] ^= 1;
+        vol.put(2, 0, &broken);
+        vol.put(2, 3, &deleted(at_times(file("kept", 20, 512), 0, 0, 0x90)));
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(assessed.sets_unusable, 1);
+        assert_eq!(assessed.verdicts, vec![Some(Holds)]);
+    }
+
+    /// One record between them: whichever comes first is kept.
+    #[test]
+    fn orphans_share_the_deleted_sets_bound() {
+        let limits = Limits {
+            deleted_sets: 1,
+            ..Limits::DEFAULT
+        };
+
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[20]);
+        vol.put(2, 0, &deleted(at_times(file("gone", 20, 512), 8, 8, 0x90)));
+        vol.put(2, 3, &[orphan_stream(false, 20, 512)]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        walk_with(&mut reader, root(2)).0.expect("the root reads");
+        assert_eq!((reader.deleted.len(), reader.orphans.len()), (1, 0));
+        assert_eq!(reader.orphans_unrecorded, 1);
+        let assessed = reader.assess_claims().expect("the claims are followed");
+        assert_eq!(assessed.verdicts, vec![Some(Holds)]);
+        assert_eq!(
+            (assessed.orphans_unrecorded, assessed.sets_unrecorded),
+            (1, 0)
+        );
+
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[20]);
+        vol.put(2, 0, &[orphan_stream(false, 20, 512)]);
+        vol.put(2, 1, &deleted(at_times(file("gone", 20, 512), 8, 8, 0x90)));
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        walk_with(&mut reader, root(2)).0.expect("the root reads");
+        assert_eq!((reader.deleted.len(), reader.orphans.len()), (0, 1));
+        assert_eq!(reader.deleted_unrecorded, 1);
+        let assessed = reader.assess_claims().expect("the claims are followed");
+        assert_eq!(
+            (assessed.orphans_unrecorded, assessed.sets_unrecorded),
+            (0, 1)
+        );
+        assert_eq!(assessed.verdicts, Vec::new());
+    }
+
+    /// One run fits: `first` is assessed; `second`'s claim would pass the
+    /// bound, so it is not recorded and not assessed.
+    #[test]
+    fn claimants_past_the_runs_bound_are_not_assessed() {
+        let limits = Limits {
+            claimed_runs: 1,
+            ..Limits::DEFAULT
+        };
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.chain(&[10]);
+        vol.chain(&[12]);
+        vol.put(2, 0, &deleted(at_times(file("first", 10, 512), 0, 0, 0x90)));
+        vol.put(
+            2,
+            3,
+            &deleted(at_times(file("second", 12, 512), 8, 8, 0x90)),
+        );
+
+        let assessed = assess(&mut vol, limits);
+        assert_eq!(assessed.verdicts, vec![Some(Holds), None]);
+        assert_eq!(assessed.unrecorded, 1);
+        assert_eq!(assessed.runs, 1);
+    }
+
+    /// Five sets name a chain that loops between 10 and 11 for as many
+    /// clusters as the volume holds: 199 links each. Four fit in 800, four
+    /// times the volume's 200 clusters; the fifth does not. The loop counts
+    /// once in each claim, so the four meet only each other.
+    #[test]
+    fn claimants_past_the_links_bound_are_not_assessed() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.fat(10, 11);
+        vol.fat(11, 10);
+        let whole = CLUSTER_COUNT as u64 * 512;
+        for (i, slot) in [0, 3, 6, 9, 12].into_iter().enumerate() {
+            let set = at_times(file(&format!("loop{i}"), 10, whole), i as u32 * 4, 0, 0x90);
+            vol.put(2, slot, &deleted(set));
+        }
+
+        let assessed = assess(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            assessed.verdicts,
+            vec![Some(Later), Some(Later), Some(Later), Some(Holds), None]
+        );
+        assert_eq!(assessed.unrecorded, 1);
+        assert_eq!(assessed.links, 4 * 199 + 5);
+        // Each claim alternates 10 and 11: 100 runs. The fifth's three runs,
+        // followed before the bound, were let go with it.
+        assert_eq!(assessed.runs, 4 * 100);
+    }
+
+    /// The set at slots 14 and 15 of cluster 2 needs a third entry, and the
+    /// root's next link is out of the heap: the error is passed up and the
+    /// set's cluster let go, so the shared list holds only recorded sets'
+    /// clusters.
+    #[test]
+    fn an_error_inside_a_deleted_set_lets_its_clusters_go() {
+        let mut vol = Vol::new();
+        vol.fat(2, 1);
+        vol.fill_unused(2);
+        vol.put(2, 14, &deleted(file("cut", 20, 512))[..2]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+
+        let (result, _) = walk_with(&mut reader, root(2));
+        assert!(matches!(
+            result,
+            Err(ExFatDirectoryError::LinkOutOfRange { from: 2, to: 1 })
+        ));
+        assert!(reader.deleted.is_empty());
+        assert!(reader.deleted_clusters.is_empty());
+    }
+
+    #[test]
+    fn claim_records_are_the_sizes_their_bounds_assume() {
+        assert_eq!(std::mem::size_of::<ClaimRun>(), 12);
+        assert_eq!(MAX_CLAIMED_RUNS * std::mem::size_of::<ClaimRun>(), 12 << 20);
+        assert_eq!(std::mem::size_of::<OrphanStream>(), 32);
     }
 }
