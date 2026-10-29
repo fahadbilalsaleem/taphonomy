@@ -614,3 +614,156 @@ machine, with the same results.
 * What Windows and macOS do with a second up-case entry. Windows needs
   a virtual disk attached with administrator rights; macOS was not
   available.
+
+---
+
+## 2026-10-29, exFAT: the UTC offsets writers record, and reuse after deletion
+
+### Objective
+
+Establish, before condition 2 is implemented (`ADR-0022` Appendix C),
+which UTC offset bytes established writers record, whether any can write
+two that differ on one volume, and how a writer reuses clusters and
+directory slots after a deletion, so that the volumes EXP-0011 Appendix
+C makes are understood rather than assumed.
+
+### Sources
+
+* FatFs R0.16 (`ff16.zip`, SHA-256
+  `99f7dc1f7e095356e4a9e3dbe29959090d8b948afe2bbc5441e52fdf4b85449e`),
+  ChaN's licence of one condition, retaining the notice (header of
+  `source/ff.c`): `f_open`, `create_xdir`, `f_sync`, `f_utime`,
+  `mount_volume`. Built and run, not copied.
+* relan's exfat, commit `1264da3` (archive SHA-256
+  `f5957b7602d457f503e6b3d5b2291bcd14489425e09fa20d3160c2adbcb96874`),
+  GPL-2.0-or-later (header of `libexfat/time.c`): `exfat_unix2exfat`,
+  `exfat_tzset`, and `exfat_mount` in `libexfat/mount.c`. Built and run
+  through its library, not copied.
+* Linux, commit `f47d223`, GPL-2.0-or-later (header of
+  `fs/exfat/misc.c`): `exfat_set_entry_time` and `exfat_get_entry_time`
+  in `fs/exfat/misc.c`, the `time_offset` option in `fs/exfat/super.c`,
+  and `__exfat_free_cluster` in `fs/exfat/fatent.c`. Read, not run.
+* exfatprogs, commit `8b42748`, GPL-2.0-or-later: `lib/exfat_dir.c`
+  (`unix_time_to_exfat_time`). Read, not copied.
+* The Sleuth Kit, commit `51d8672`, Common Public License 1.0:
+  `tsk/fs/tsk_exfatfs.h`. Read, not copied. Its wiki page *ExFAT
+  Implementation Notes*,
+  <https://wiki.sleuthkit.org/ExFAT-Implementation-Notes/>, last
+  modified 2014-06-03.
+* relan's exfat `ChangeLog`, in the archive above.
+* R. Nordvik and S. Axelsson, "It is about time - Do exFAT
+  implementations handle timestamps correctly?", *Forensic Science
+  International: Digital Investigation* 42-43 (2022) 301476,
+  doi:10.1016/j.fsidi.2022.301476, and its corrigendum, 45 (2023)
+  301542, doi:10.1016/j.fsidi.2023.301542. Their existence and
+  bibliographic details are confirmed through Crossref; their text could
+  not be opened here (the publisher refused the request), so what they
+  say is reported below as read by another research session, not
+  verified.
+* Microsoft, *exFAT file system specification*, the Markdown source with
+  SHA-256
+  `09454c9663cbd7b33c6dfe3ad37baa1351779ad5ab73034c53fcf864ccdee825`,
+  sections 7.4.10 to 7.4.10.2.
+
+### Findings
+
+1. **FatFs records no offset.** `f_open` and `create_xdir` clear a new
+   File entry, its offset bytes included, before writing its times, and
+   `f_sync` and `f_utime` write `00h` beside every time they set.
+   OffsetValid is therefore clear on every set FatFs writes. Measured on
+   EXP-0011 Appendix C's four FatFs volumes: `00h` on every set.
+2. **relan's exfat records the local offset, valid.**
+   `exfat_unix2exfat` writes the offset from UTC in 15-minute units with
+   bit 7 set, from a value `exfat_tzset` computes from TZ and the clock
+   when the volume is mounted. A host that changes TZ and calls
+   `exfat_tzset` again writes another byte on the same volume. Measured:
+   `90h` and `94h` on one volume (EXP-0011 Appendix C).
+3. **Linux records UTC, valid.** `exfat_set_entry_time` writes the time
+   in UTC and the offset byte `80h` (OffsetValid set, offset 0) whatever
+   the mount options. `time_offset` and `sys_tz` are used only by
+   `exfat_get_entry_time`, for an entry whose OffsetValid is clear. At
+   this commit, then, `exfat_set_entry_time` writes no other byte. Read,
+   not measured here; EXP-0011 measured `80h` on every set of
+   forensics-samples' Linux image.
+4. **Linux frees a cluster in the bitmap only.** `__exfat_free_cluster`
+   clears bitmap bits and writes no FAT entry, so a deleted file's chain
+   survives until another allocation rewrites it.
+5. **FatFs allocates from the heap's start after a mount, and reuses a
+   deleted set's slots.** `mount_volume` sets the allocation hint
+   (`last_clst`) invalid, so the next allocation searches from the first
+   cluster and takes freed clusters first. A new set takes the first run
+   of free slots large enough; where it ends on a deleted set's File
+   entry, that set's Stream Extension and names stay behind, unused and
+   outside any set. Measured on EXP-0011 Appendix C's volumes; read in
+   source for the hint.
+6. **Linux stamps every time it writes back as valid UTC.** On every
+   write of a file's entry, `__exfat_write_inode` (`fs/exfat/inode.c`)
+   passes its creation, modification and access times through
+   `exfat_set_entry_time`, which writes `80h` beside each. A time read
+   from an entry whose OffsetValid was clear was first converted with
+   `time_offset` or `sys_tz` (finding 3), 0 unless the mount says
+   otherwise, so an entry another writer stored as local time with `00h`
+   can come back as the same digits stamped valid UTC. Read in source;
+   that this happens to a given file is inferred, not measured.
+7. **exfatprogs' fsck writes `80h`.** `unix_time_to_exfat_time` sets
+   `*tz = 0x80` for the entry sets it builds.
+8. **The Sleuth Kit ignores the offset bytes.** At `51d8672` the three
+   fields are declared in `tsk_exfatfs.h` and used nowhere else; its wiki
+   says "At present, TSK does not store this time zone information."
+9. **relan's exfat recorded offsets from 1.4.0.** Its `ChangeLog` lists
+   "Added support for timezone offsets" under 1.4.0 (2023-03-02) and not
+   under 1.3.0 (2018-09-15).
+10. **The Sleuth Kit's wiki reports macOS switching the sign, and two
+    writers that record no offset.** "Files created on a system set for
+    UTC-5:00 end up with a timezone for UTC+5:00"; "the timezone fields
+    are empty in some older versions of Windows, such as Vista SP1"; and
+    "the Panasonic Lumix camera is leaving the TZ fields as zero on the
+    SDXC cards". One source for each, from 2014; the versions are not
+    stated.
+11. **Reported, not verified here: the 2022 paper and its corrigendum.**
+    Another research session read them and reports that Windows 10
+    writes the offset in force at each write, daylight saving included,
+    and rewrites the modification and access offsets but not the
+    creation's when a file changes; that Linux's driver turned `00h`
+    offsets into `80h` without changing the times; that macOS rewrote
+    every file's access offset on mounting; and that the corrigendum
+    corrects four other points and leaves macOS's switched sign as
+    reported.
+
+### Implications
+
+* Condition 2 can order no two sets FatFs wrote (finding 1): on a FatFs
+  volume, deleted sets sharing a cluster are all refused. `ADR-0022`
+  Appendix C keeps the OffsetValid requirement and records the cost.
+* Differing valid bytes on one volume need a writer that records local
+  time (finding 2), as the writers of EXP-0009's and NIST's images did
+  (EXP-0011), and not Linux at `f47d223` (finding 3).
+* An orphan Stream Extension arises from ordinary slot reuse (finding
+  5), so its claim matters on volumes no one crafted.
+* An equal, valid offset byte does not prove that two times were written
+  under one offset. Linux can stamp `80h` on local-time digits (finding
+  6), and on a card used by Windows and by macOS one byte means opposite
+  offsets (findings 10 and 11). Condition 2 may then order two sets
+  wrongly, and recover the earlier. `ADR-0022` Appendix C records it as
+  a limit, to be measured on the paper's published images.
+
+### Confidence
+
+High for findings 1 and 2, each read from source and measured; and for
+finding 5, measured, and read in source for the allocation hint. Finding
+3 is read from source and agrees with EXP-0011's measured byte; findings
+4, 6 and 7 are read only. Finding 8 rests on source and the wiki,
+finding 9 on the ChangeLog alone, finding 10 on one wiki page. Finding
+11 is not verified.
+
+### Follow-up
+
+* Measure a volume written by Windows or macOS across a daylight-saving
+  change, which the cost of the OffsetValid and same-byte rules depends
+  on (`ADR-0022` section 16).
+* Find which devices write exFAT with FatFs or another writer that
+  records no offset; one camera is named (finding 10), not measured.
+* Score condition 2 on the paper's published images (Mendeley Data,
+  doi:10.17632/krjsmdc65h.2), written by Windows 10, macOS and Linux,
+  before stage 6 decides whether close times need a margin.
+* Read the paper and its corrigendum directly.

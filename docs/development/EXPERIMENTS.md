@@ -3014,3 +3014,77 @@ left to unit tests. The walk does not apply every check of ADR-0021
 section 4, only the checksum and the Stream Extension's place: a set
 passing those and failing another check would be counted usable here
 and not by Taphonomy.
+
+### Appendix C: condition 2 on EXP-0011's volumes and on made ones (2026-10-26)
+
+**Question.** Before phase 2's claims are implemented: on real volumes,
+how many deleted sets share a cluster, and do any of them carry offset
+bytes that cannot be compared? Where they do, which reading of ADR-0019
+Appendix C's "condition 2 does not hold for either" recovers the right
+files? Does an orphan Stream Extension's claim prevent a wrong recovery,
+and what does the OffsetValid requirement cost on a writer that records
+no offset?
+
+**Input.** EXP-0011's 23 volumes, deleted directories not read. Six
+volumes made with two writers, each block of each file tagged with its
+path and block number: FatFs R0.16, built with its clock, writing two
+scenes at 4,096- and 512-byte clusters, and relan's exfat (`1264da3`)
+writing one at each size.
+
+* `fatfs-reuse`: six files written in `o/`, three deleted; the volume
+  remounted, so FatFs allocates from the heap's start; two new files
+  written into the holes and deleted.
+* `fatfs-orphan`: `sub/rival.bin` written and deleted; in the root, a
+  file whose data reuses rival's clusters, deleted with an empty file
+  before it; a new four-entry set then takes the first free slots,
+  overwriting the deleted file's File entry and leaving its Stream
+  Extension.
+* `relan-tz`: two files in `o/`, deleted; two new files reusing their
+  clusters, created under offset `90h`, one last modified under `90h`
+  and the other under `94h`, both deleted.
+
+**Method.** `scripts/experiments/exp-0011-condition-two.py` decides
+condition 2 for every usable deleted set, comparing every pair of
+claimants directly, and counts the pairs sharing a cluster, those whose
+four keys do not all carry one valid byte, and the sets the literal
+reading would decide otherwise.
+`scripts/experiments/exp-0011-claims-images.sh` builds both writers
+from their archives, checked by digest, makes the six volumes, and
+scores each set against its tags
+(`scripts/experiments/exp-0011-score-tags.py`) under the decided rule,
+the literal reading, the rule without orphan claims, and the rule with
+every offset taken as valid. `scripts/experiments/exp-0011-run.sh` runs
+both.
+
+**Result.**
+
+* On the 23 volumes: 985 deleted sets, no orphan Stream Extension, 31
+  pairs sharing a cluster, none mixing offset bytes. Condition 2 holds
+  for 952 and refuses 33 as later; none is unordered, and the literal
+  reading decides none otherwise.
+* On the made volumes, the same at both cluster sizes, recovered right,
+  recovered wrong, and refused holding its own data:
+
+| Volume | Decided | Literal | No orphan claims | Offsets valid |
+| --- | --- | --- | --- | --- |
+| `fatfs-reuse` | 0, 0, 2 | 0, 0, 2 | 0, 0, 2 | 2, 0, 0 |
+| `fatfs-orphan` | 0, 0, 0 | 0, 0, 0 | 0, 1, 0 | 0, 0, 0 |
+| `relan-tz` | 2, 0, 0 | 1, 0, 1 | 2, 0, 0 | 2, 0, 0 |
+
+* FatFs wrote offset bytes `00h` on every set, live and deleted. relan
+  wrote `90h`, and `94h` for the modification and access of the set
+  last modified under the other offset. The four FatFs volumes are the
+  same on every run (digests printed); relan's carry the clock's times.
+
+**Conclusion.** The literal reading refuses a file holding its own data
+that the decided reading recovers, and gains nothing on any volume. An
+orphan Stream Extension's claim prevents the one wrong recovery on these
+volumes. On a writer that records no offset, condition 2 refuses every
+deleted set sharing a cluster, those holding their own data included.
+
+**Limitations.** One writer of each kind, and one scene each. No public
+image holds a pair mixing offset bytes or an orphan Stream Extension.
+relan took its offsets from TZ, set by the host, not from a time zone a
+device was in. The scripts check each deleted set's checksum, not every
+check of ADR-0021 section 4; no deleted set on these volumes fails its
+checksum.

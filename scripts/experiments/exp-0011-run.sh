@@ -10,7 +10,8 @@
 #   linux/fs.exfat            forensics-samples' image, expanded
 #   linux/original-files/     forensics-samples' originals
 #   made/src/                 the three archives exp-0011-made-images.sh
-#                             names (Appendix A)
+#                             names (Appendix A); exp-0011-claims-images.sh
+#                             uses two of them (Appendix C)
 # Results go to WORKDIR/final. Every input is checked by digest before and
 # after the runs. A failure prints a line starting FAIL and the run goes on,
 # so a failure is never silent.
@@ -168,5 +169,27 @@ echo "== Deleted sets read as sets, and each directory's entry count (Appendix B
 for f in "$W"/img/exp9-A.vhd "$W"/img/exp9-B.vhd "$W"/nist/img/*.dd "$W"/linux/fs.exfat; do
     python3 -I "$T/exp-0011-deleted-sets.py" "$f" || echo "FAIL deleted sets $(basename "$f")"
 done
+
+echo "== Condition 2, pair by pair, deleted directories not read (Appendix C)"
+run "$F/linux.unread.tsv" python3 -I "$T/exp-0011-scan.py" "$W/linux/fs.exfat"
+two() { # image table
+    python3 -I "$T/exp-0011-condition-two.py" "$1" "$2" || echo "FAIL condition two $(basename "$1")"
+}
+{
+    two "$W/img/exp9-A.vhd" "$F/exp9-A.tsv"
+    two "$W/img/exp9-B.vhd" "$F/exp9-B.tsv"
+    for f in "$W"/nist/img/*.dd; do
+        two "$f" "$F/$(basename "$f" .dd).unread.tsv"
+    done
+    two "$W/linux/fs.exfat" "$F/linux.unread.tsv"
+} >"$F/condition-two.txt"
+grep -e '^TALLY' -e '^FAIL' "$F/condition-two.txt"
+awk -F'\t' '$1=="TALLY" {v++; for(i=3;i<=NF;i++){split($i,kv,"="); n[kv[1]]+=kv[2]}}
+    END {printf "condition two, %d volumes: sets %d orphans %d pairs %d mixed %d holds %d later %d unordered %d literal-differs %d\n",
+         v, n["sets"], n["orphans"], n["pairs"], n["mixed"], n["holds"], n["later"], n["unordered"], n["literal-differs"]}' \
+    "$F/condition-two.txt"
+
+echo "== Volumes made for condition 2 (Appendix C)"
+"$T/exp-0011-claims-images.sh" "$W/made" || echo "FAIL claims images"
 
 check_inputs after

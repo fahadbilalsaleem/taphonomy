@@ -653,3 +653,119 @@ two directory clusters; and no declared span is cut short. A set cut
 short, an unusable set, a set holding one of `42h` to `5Fh`, a count
 too small and each bound are left to unit tests, which the
 implementation is to carry.
+
+---
+
+## Appendix C: condition 2, orphan claims and the claims bounds (2026-10-26)
+
+Before phase 2's claims and condition 2 are implemented, an audit read
+`ADR-0019` Appendix C and section 5 of this record against EXP-0011's
+scripts, and benchmarked the readings on volumes made with two writers
+(EXP-0011 Appendix C). It found one reading that fails its benchmark,
+one description that the decided rule cannot use, and three things
+section 5 leaves open. The project decided the reading of condition 2,
+OffsetValid, the orphan's claim and bound, and the read error on
+2026-10-26, and the claims bounds' order and the algorithm on 2026-10-29.
+
+**A set is judged by its rivals' times against its own creation.**
+`ADR-0019` Appendix C says that where two keys cannot be compared,
+"condition 2 does not hold for either". Read literally, a set whose own
+modification falls under another offset byte, as a daylight-saving
+change makes it, is refused wherever a rival created under its
+creation's byte shares a cluster. EXP-0011's scorer reads it otherwise.
+On volumes relan's exfat wrote with a file created under one offset and
+modified under another, the literal reading refuses that file, which
+holds its own data, and the scorer's reading recovers it; neither
+recovers a file wrongly. On EXP-0011's 23 volumes no pair sharing a
+cluster mixes offset bytes, so the readings never differ there. Condition
+2 is therefore to read: a set is refused where another claimant sharing
+one of its clusters has a creation or modification key that cannot be
+compared with this set's creation key, or one at or after it. The set's
+own modification key does not decide its own case. What shows that a
+set wrote last is its creation against each rival's two times, and that
+comparison is the same under both readings, so this refuses no fewer
+sets holding another file's data. A pair that cannot be ordered still
+refuses the rival whose creation the set's times cannot be compared
+with. This amends `ADR-0019` Appendix C's sentence; nothing else in it
+changes.
+
+**OffsetValid is still required.** FatFs writes `00h` into every offset
+byte. On volumes it wrote where later files reused deleted files'
+clusters, condition 2 refuses every set sharing a cluster, two of them
+holding their own data, and recovers none wrongly; taking the offsets as
+valid and equal would recover those two. A byte with OffsetValid clear
+says nothing of the time zone, and comparing two such times would trust
+that their writers shared one, which is what the requirement exists to
+refuse. The cost is a recorded limit.
+
+**An orphan Stream Extension claims as a deleted set's allocation
+would.** Section 5 says an orphan "claims the clusters its fields name
+where they are in range". It is to claim a run where NoFatChain is set,
+cut at the heap's end, and otherwise the chain from its first cluster,
+followed until it has as many clusters as DataLength needs or the FAT
+does not go on; nothing where its first cluster is outside the heap or
+its DataLength is 0. It has no time, so every set sharing a cluster with
+it is refused under condition 2. On a volume FatFs wrote, where a new set
+overwrote a deleted file's File entry and left its Stream Extension, the
+deleted file whose clusters that file had reused is refused with orphan
+claims and recovered wrongly without them. An orphan is an unused
+Stream Extension (`40h`) outside any set, as phase 1 reads sets
+(Appendix B), in a directory the walk reads.
+
+**Orphans share the deleted sets' bound.** Phase 1 keeps orphans within
+`MAX_DELETED_SETS`, sets and orphans together. An orphan past it is
+counted, and its claim is unseen.
+
+**The claims bounds.** Claims are followed in the order the walk found
+them, deleted sets first, then orphans. Where a claimant's claim would
+pass `MAX_CLAIMED_RUNS` or `CLAIM_LINKS_PER_CLUSTER` times ClusterCount
+FAT links, its runs followed so far are let go: it and every claimant
+after it are not recorded, as section 12 says. Links are counted once
+per FAT entry read for a claim. A chain that reaches a cluster twice
+counts it once in its claim.
+
+**The algorithm.** Section 5 describes a sweep keeping, per stretch of
+clusters, "the latest key, the second latest, and whether two keys there
+cannot be ordered". Under the rule above, whether a rival can be ordered
+against a set depends on the set's creation byte, so one flag per stretch
+cannot say it. The implementation is instead to decide in two passes over
+a tree that adds a count to a range of stretches and answers the largest
+count in a range. The first, with every claimant counted, takes away for
+each offset byte the claimants whose two keys both carry it; a set whose
+creation carries it is then refused as unordered where any claimant but
+itself is left on one of its stretches. The second adds, for each byte,
+those claimants in order of their later key, and refuses a set where any
+claimant but itself whose later key is at or after its creation lies on
+one of its stretches. Both are O(R log R) for R runs. Tests are to
+compare it with a direct check of every pair. The worst-case memory at
+both bounds is to be recorded with the implementation, as section 12
+says.
+
+**A read error inside a deleted set.** Phase 1 is to let a set's
+clusters go before passing up an error met inside it, so the list of
+clusters holds only recorded sets'. Sets recorded before the error stay
+recorded and claim: they were seen. The directory not read whole is a
+gap already, and its unseen claims with it.
+
+**EXP-0011's scorer treats every deleted set as a rival**, unusable or
+not; Decision B says an unusable set claims nothing. No set on EXP-0011's
+images is unusable, so no figure depends on the difference.
+
+**An equal, valid offset byte is not proof of one clock.** Appendix C
+of `ADR-0019` calls comparing local times under the same byte immune to
+macOS's switched sign. That holds where one writer wrote both times. A
+card used by Windows and by macOS can carry one byte meaning opposite
+offsets, and Linux can stamp `80h`, valid UTC, on digits another writer
+stored as local time (RESEARCH_LOG, 2026-10-29, findings 6, 10 and 11).
+Two sets may then be ordered wrongly, and the earlier recovered. This
+widens the limit `ADR-0019` Appendix C records. It is to be measured on
+the published images of Nordvik and Axelsson's study before stage 6
+decides whether condition 2 needs a margin around close times; the
+project decided this on 2026-10-29.
+
+**What no public image exercises:** a pair mixing offset bytes, an orphan
+Stream Extension, a claimant past either bound, a chain reaching a
+cluster twice, and an error inside a deleted set. Volumes made here hold
+the first two (EXP-0011 Appendix C); unit tests, which the
+implementation is to carry, are to hold every one, each failing when its
+rule is removed.
