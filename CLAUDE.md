@@ -46,13 +46,26 @@ Where a passage is ambiguous, treat it as attribution and omit it.
 
 ## 0.2 Version Control
 
-All commits and pushes are performed manually by the author, in the terminal.
+Every push and every tag is performed manually by the author, in the
+terminal. Coding agents may make local commits (decided by the author on
+2026-11-12), under these conditions only:
+
+* the change has been reviewed by its diff, and formatting, lint, the
+  documentation check and the tests have passed on the tree being
+  committed;
+* files are staged by name (`git add <path>`), never `git add -A` or
+  `git add .`;
+* the commit message describes the change and contains nothing else: no
+  trailer, no co-author line, no tool name (section 0.1);
+* the commit carries the author's own configured git identity; an agent
+  never sets or overrides `user.name`, `user.email`, `--author` or any
+  other identity.
 
 Coding agents must never run:
 
-* `git commit`
 * `git push`
 * `git tag`
+* `git commit --amend`
 * `git merge`, `git rebase`, `git reset`, `git revert`, `git cherry-pick`
 * `git filter-branch`, `git gc --prune`, or any history-rewriting command
 * any command that contacts a remote
@@ -61,7 +74,8 @@ Coding agents may run read-only git commands such as `status`, `diff`, `log`,
 `show`, `ls-files`, and `check-ignore`. They may run `git mv` only when
 explicitly instructed, and must report the result.
 
-An agent that believes a commit is required must stop and say so.
+An agent that believes a push, a tag or a history change is required must
+stop and say so.
 
 # Taphonomy Agent Instructions
 
@@ -688,8 +702,8 @@ work
 
 # 31. No Premature Commit
 
-Agents never commit, consistent with §0.2. All commits are made manually by
-the author.
+Agents commit only as §0.2 allows, never automatically after every edit, and
+never push. Every push is made by the author.
 
 First:
 

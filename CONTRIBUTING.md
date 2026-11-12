@@ -62,8 +62,10 @@ procedures.
 
 ## Commits
 
-Commits are made manually by the author. Automated tools propose changes and
-do not commit.
+Commits are made by the author, or locally by a coding agent under the
+conditions in `CLAUDE.md` section 0.2, with the author's own identity and a
+message that describes only the change. Every push and every tag is made by
+the author.
 
 A commit should represent one coherent change. Commit messages describe the
 change that was made, not the intent behind it.
