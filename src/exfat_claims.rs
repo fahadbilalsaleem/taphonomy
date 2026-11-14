@@ -6,7 +6,10 @@
 //! evidence, so the rule can be tested apart from any volume.
 //!
 //! A claimant is a usable deleted entry set, with its creation and
-//! modification keys, or an orphan Stream Extension, which has no time. A
+//! modification keys, or an orphan Stream Extension, which has no time, or
+//! a set read inside a deleted directory (ADR-0022 Decision K), which has
+//! its two keys and is a rival exactly as a deleted set is, but is not
+//! decided: it gets no verdict. A
 //! set is refused where another claimant shares a cluster with it and that
 //! claimant has no time, or holds a creation or modification key that cannot
 //! be compared with this set's creation key, or one at or after it. The set's
@@ -96,12 +99,18 @@ fn days_in_month(year: u32, month: u32) -> u32 {
     }
 }
 
-/// One claimant: a deleted set's two keys, or an orphan Stream Extension,
-/// which has none.
+/// One claimant: a set's two keys, or an orphan Stream Extension, which
+/// has none.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Claimant {
-    /// A deleted set, which is decided; an orphan is only a rival.
+    /// It has keys and is ordered against as a rival: a set. An orphan is
+    /// not, so no set it meets can be ordered against it.
     pub(crate) timed: bool,
+
+    /// It receives a verdict: a deleted set the walk recorded. A set inside
+    /// a deleted directory is timed and not decided. `decided` implies
+    /// `timed`: a claimant with no keys cannot be decided.
+    pub(crate) decided: bool,
     pub(crate) created: Option<Key>,
     pub(crate) modified: Option<Key>,
 }
@@ -148,13 +157,18 @@ pub enum ConditionTwo {
     Unordered,
 }
 
-/// Decides condition 2 for every timed claimant: `None` for an orphan.
+/// Decides condition 2 for every decided claimant: `None` for one that is
+/// not, which is still a rival to every set it meets.
 ///
 /// `runs` may be in any order, and one claimant's may overlap or repeat.
 pub(crate) fn decide(claimants: &[Claimant], runs: &[ClaimRun]) -> Vec<Option<ConditionTwo>> {
+    debug_assert!(
+        claimants.iter().all(|c| c.timed || !c.decided),
+        "a decided claimant is timed"
+    );
     let mut verdicts: Vec<Option<ConditionTwo>> = claimants
         .iter()
-        .map(|c| c.timed.then_some(ConditionTwo::Holds))
+        .map(|c| (c.timed && c.decided).then_some(ConditionTwo::Holds))
         .collect();
 
     let spans = Spans::new(claimants.len(), runs);
@@ -168,7 +182,7 @@ pub(crate) fn decide(claimants: &[Claimant], runs: &[ClaimRun]) -> Vec<Option<Co
     // among them, can be ordered against no one: it is refused wherever any
     // other claimant shares a stretch with it.
     for (owner, claimant) in claimants.iter().enumerate() {
-        if claimant.timed && claimant.created.is_none() && spans.most(&tree, owner) > 1 {
+        if verdicts[owner].is_some() && claimant.created.is_none() && spans.most(&tree, owner) > 1 {
             verdicts[owner] = Some(ConditionTwo::Unordered);
         }
     }
@@ -188,7 +202,7 @@ pub(crate) fn decide(claimants: &[Claimant], runs: &[ClaimRun]) -> Vec<Option<Co
             } else {
                 1
             };
-            if spans.most(&tree, s) > own {
+            if verdicts[s].is_some() && spans.most(&tree, s) > own {
                 verdicts[s] = Some(ConditionTwo::Unordered);
             }
         }
@@ -410,14 +424,24 @@ mod tests {
     fn timed(created: Option<Key>, modified: Option<Key>) -> Claimant {
         Claimant {
             timed: true,
+            decided: true,
             created,
             modified,
+        }
+    }
+
+    /// A set inside a deleted directory: a rival with keys, not decided.
+    fn inside(created: Option<Key>, modified: Option<Key>) -> Claimant {
+        Claimant {
+            decided: false,
+            ..timed(created, modified)
         }
     }
 
     fn orphan() -> Claimant {
         Claimant {
             timed: false,
+            decided: false,
             created: None,
             modified: None,
         }
@@ -578,6 +602,44 @@ mod tests {
         assert_eq!(v, vec![Some(Unordered), None, Some(Holds)]);
     }
 
+    /// ADR-0022 Decision K: a set inside a deleted directory is a rival
+    /// with its two times, as a deleted set is.
+    #[test]
+    fn an_undecided_rival_refuses_a_set_created_before_it_and_not_one_after() {
+        let rival = inside(k(4, 0x90), k(4, 0x90));
+        let runs = [run(0, 5, 2), run(1, 6, 1)];
+        let before = [timed(k(0, 0x90), k(0, 0x90)), rival];
+        assert_eq!(decide(&before, &runs), vec![Some(Later), None]);
+        let after = [timed(k(8, 0x90), k(8, 0x90)), rival];
+        assert_eq!(decide(&after, &runs), vec![Some(Holds), None]);
+    }
+
+    #[test]
+    fn an_undecided_rival_without_a_creation_key_leaves_the_set_unordered() {
+        let c = [timed(k(8, 0x90), k(8, 0x90)), inside(None, k(0, 0x90))];
+        let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1)]);
+        assert_eq!(v, vec![Some(Unordered), None]);
+    }
+
+    /// Alone, meeting a later set, meeting an orphan, and with a creation
+    /// key that cannot be compared: each is a place a verdict is written.
+    #[test]
+    fn an_undecided_claimant_gets_no_verdict() {
+        let alone = [inside(k(0, 0x90), k(0, 0x90))];
+        assert_eq!(decide(&alone, &[run(0, 5, 1)]), vec![None]);
+
+        let shared = [run(0, 5, 1), run(1, 5, 1)];
+        for me in [
+            inside(k(0, 0x90), k(0, 0x90)),
+            inside(k(0, 0x90), k(0, 0x94)),
+            inside(None, k(0, 0x90)),
+        ] {
+            for rival in [timed(k(8, 0x90), k(8, 0x90)), orphan(), me] {
+                assert_eq!(decide(&[me, rival], &shared)[0], None, "{me:?} {rival:?}");
+            }
+        }
+    }
+
     /// A chain that reaches cluster 5 twice, and runs given out of order,
     /// count once: the set does not meet itself.
     #[test]
@@ -618,7 +680,7 @@ mod tests {
         (0..claimants.len())
             .map(|s| {
                 let me = claimants[s];
-                if !me.timed {
+                if !me.decided {
                     return None;
                 }
                 let mut verdict = Holds;
@@ -686,7 +748,12 @@ mod tests {
                     } else {
                         let created = draw_key(&mut rng);
                         let modified = draw_key(&mut rng);
-                        timed(created, modified)
+                        // One set in five is inside a deleted directory.
+                        if rng.below(5) == 0 {
+                            inside(created, modified)
+                        } else {
+                            timed(created, modified)
+                        }
                     }
                 })
                 .collect();

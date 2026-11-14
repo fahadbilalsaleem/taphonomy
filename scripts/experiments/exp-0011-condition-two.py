@@ -22,7 +22,9 @@ do not all carry one valid byte, and the sets that Appendix C's "condition 2
 does not hold for either", read literally, would decide otherwise.
 
 Usage: exp-0011-condition-two.py IMAGE TABLE
-  TABLE from exp-0011-scan.py without --deleted-dirs. Prints a SET line per
+  TABLE from exp-0011-scan.py, with or without --deleted-dirs; with it,
+  each usable set inside a deleted directory read is a rival with its two
+  keys and is not decided (ADR-0022 Decision K). Prints a SET line per
   set (image, cluster/slot of its File entry, verdict) and one TALLY line.
 """
 import re, struct, sys
@@ -71,9 +73,14 @@ def key(t):
 
 claimants = []
 for r in R:
-    if r['deleted'] == '1' and r['checksum_ok'] == '1':
+    # A usable set inside a deleted directory that was read (a TABLE made
+    # with --deleted-dirs) is a rival with its two keys, whatever its InUse
+    # bit, and is never decided (ADR-0022 Decision K).
+    inside = r.get('in_deleted_dir') == '1'
+    if r['checksum_ok'] == '1' and (r['deleted'] == '1' or inside):
         c, s = re.fullmatch(r'c(\d+) s(\d+)', r['pos']).groups()
-        claimants.append(dict(pos=f'{c}/{s}', timed=True, c=key(r['ctime']), m=key(r['mtime']),
+        claimants.append(dict(pos=f'{c}/{s}', timed=True, decided=not inside,
+                              c=key(r['ctime']), m=key(r['mtime']),
                               cs=claim(int(r['first']), int(r['dl']), r['nofat'] == '1')))
 orphans = 0
 for m in meta:
@@ -83,7 +90,7 @@ for m in meta:
         e = img[coff(c) + s * 32:coff(c) + s * 32 + 32]
         if e[0] != 0x40:
             sys.exit(f'orphan at c{c} s{s} is {e[0]:#04x}, not 0x40')
-        claimants.append(dict(pos=f'{c}/{s}', timed=False, c=None, m=None,
+        claimants.append(dict(pos=f'{c}/{s}', timed=False, decided=False, c=None, m=None,
                               cs=claim(struct.unpack_from('<I', e, 20)[0],
                                        struct.unpack_from('<Q', e, 24)[0], bool(e[1] & 2))))
         orphans += 1
@@ -95,7 +102,7 @@ name = sys.argv[1].rsplit('/', 1)[-1]
 tally = dict(Holds=0, Later=0, Unordered=0)
 pairs = mixed = differ = 0
 for i, s in enumerate(claimants):
-    if s['timed']:
+    if s['decided']:
         verdict, literal_unordered = 'Holds', False
     for j, o in enumerate(claimants):
         if i == j or s['cs'].isdisjoint(o['cs']):
@@ -105,7 +112,7 @@ for i, s in enumerate(claimants):
             keys = [s['c'], s['m'], o['c'], o['m']]
             if None in keys or len({k[0] for k in keys}) > 1:
                 mixed += 1
-        if not s['timed']:
+        if not s['decided']:
             continue
         for t in ((o['c'], o['m']) if o['timed'] else (None,)):
             if not comparable(s['c'], t):
@@ -116,12 +123,12 @@ for i, s in enumerate(claimants):
         # in O's own decision (S's keys against O's creation) cannot be.
         if o['timed'] and not (comparable(o['c'], s['c']) and comparable(o['c'], s['m'])):
             literal_unordered = True
-    if s['timed']:
+    if s['decided']:
         tally[verdict] += 1
         literal = 'Unordered' if literal_unordered else verdict
         if literal != verdict:
             differ += 1
         print(f"SET\t{name}\t{s['pos']}\t{verdict}")
-print(f"TALLY\t{name}\tsets={sum(c['timed'] for c in claimants)}\torphans={orphans}\tpairs={pairs}"
+print(f"TALLY\t{name}\tsets={sum(c['decided'] for c in claimants)}\torphans={orphans}\tpairs={pairs}"
       f"\tmixed={mixed}\tholds={tally['Holds']}\tlater={tally['Later']}"
       f"\tunordered={tally['Unordered']}\tliteral-differs={differ}")

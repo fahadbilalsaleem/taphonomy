@@ -189,7 +189,35 @@ awk -F'\t' '$1=="TALLY" {v++; for(i=3;i<=NF;i++){split($i,kv,"="); n[kv[1]]+=kv[
          v, n["sets"], n["orphans"], n["pairs"], n["mixed"], n["holds"], n["later"], n["unordered"], n["literal-differs"]}' \
     "$F/condition-two.txt"
 
+echo "== Condition 2, pair by pair, deleted directories read (ADR-0022 Appendix D)"
+for x in A B; do
+    run "$F/exp9-$x.read.tsv" python3 -I "$T/exp-0011-scan.py" "$W/img/exp9-$x.vhd" --deleted-dirs
+done
+{
+    two "$W/img/exp9-A.vhd" "$F/exp9-A.read.tsv"
+    two "$W/img/exp9-B.vhd" "$F/exp9-B.read.tsv"
+    for f in "$W"/nist/img/*.dd; do
+        two "$f" "$F/$(basename "$f" .dd).read.tsv"
+    done
+    two "$W/linux/fs.exfat" "$F/linux.tsv"
+} >"$F/condition-two-read.txt"
+grep -e '^TALLY' -e '^FAIL' "$F/condition-two-read.txt"
+awk -F'\t' '$1=="TALLY" {v++; for(i=3;i<=NF;i++){split($i,kv,"="); n[kv[1]]+=kv[2]}}
+    END {printf "condition two, deleted directories read, %d volumes: sets %d orphans %d pairs %d mixed %d holds %d later %d unordered %d literal-differs %d\n",
+         v, n["sets"], n["orphans"], n["pairs"], n["mixed"], n["holds"], n["later"], n["unordered"], n["literal-differs"]}' \
+    "$F/condition-two-read.txt"
+# Each set whose verdict differs between the two runs: what reading deleted
+# directories for their claims changes.
+join -t "$(printf '\t')" \
+    <(awk -F'\t' '$1=="SET" {print $2":"$3"\t"$4}' "$F/condition-two.txt" | sort) \
+    <(awk -F'\t' '$1=="SET" {print $2":"$3"\t"$4}' "$F/condition-two-read.txt" | sort) |
+    awk -F'\t' '$2!=$3 {print "changed by reading deleted directories:", $1, $2, "->", $3}'
+grep -h '^# deleted_dir_unread' "$F"/*.read.tsv "$F/linux.tsv" | sort | uniq -c
+
 echo "== Volumes made for condition 2 (Appendix C)"
 "$T/exp-0011-claims-images.sh" "$W/made" || echo "FAIL claims images"
+
+echo "== Volumes made for deleted directories read for their claims (ADR-0022 Appendix D)"
+"$T/exp-0011-deleted-dirs-images.sh" "$W/made" || echo "FAIL deleted-dirs images"
 
 check_inputs after

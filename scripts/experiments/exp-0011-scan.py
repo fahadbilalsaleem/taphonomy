@@ -128,11 +128,14 @@ def walk_dir(first, data_len, nofat, path, is_root, in_deleted=False):
                              ctime=ts(ct, c10, cu), mtime=ts(mt, m10, mu), atime=ts(at, 0, au),
                              nofat=bool(flags & 2), fc=fc, dl=dl, vdl=vdl,
                              offs=f'{cu:02x}/{mu:02x}/{au:02x}', in_deleted=in_deleted))
-            if attrs & 0x10 and not deleted and ok:
+            if attrs & 0x10 and not deleted and not in_deleted and ok:
                 subdirs.append((fc, dl, bool(flags & 2), path + '/' + name, in_deleted))
-            elif attrs & 0x10 and deleted and ok and DESCEND:
+            elif attrs & 0x10 and (deleted or in_deleted) and ok and DESCEND:
                 # A deleted directory is read only where every cluster is
                 # free and never read before: then its entries are its own.
+                # A directory inside a deleted one is deleted too, whatever
+                # its InUse bit (ADR-0022 Decision K), and meets the same
+                # tests.
                 dcl, end = dir_clusters(fc, dl, bool(flags & 2)) if fc and dl else ([], 'none')
                 if end in ('contig', 'EOC') and dcl and all(2 <= c <= ccount + 1 for c in dcl) \
                         and not any(alloc(c) for c in dcl) and seen.isdisjoint(dcl):

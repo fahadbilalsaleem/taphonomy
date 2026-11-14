@@ -769,3 +769,81 @@ cluster twice, and an error inside a deleted set. Volumes made here hold
 the first two (EXP-0011 Appendix C); unit tests, which the
 implementation is to carry, are to hold every one, each failing when its
 rule is removed.
+
+---
+
+## Appendix D: deleted directories read for their claims (2026-11-14)
+
+Stage 5 implements Decision K. An audit read section 5, section 13 and
+Appendix A against the reader and against EXP-0011's scripts before any
+code was written. The points below were decided on 2026-11-13 and
+2026-11-14 by the planning session, under the decision-making the author
+delegated on 2026-11-13; none changes Decision K.
+
+**A set inside a deleted directory is a rival that is not decided.** The
+claims table knew two kinds of claimant: a deleted set, timed and decided,
+and an orphan Stream Extension, neither. A set read inside a deleted
+directory has both its keys and is ordered against exactly as a deleted
+set is, but gets no verdict (Decision K: nothing in it is decided). A
+claimant therefore carries whether it is timed and, separately, whether
+it is decided; only a decided claimant receives a verdict, and a decided
+claimant is always timed. EXP-0011's scorer already treated these sets so.
+
+**Reading one.** Deleted directories are read after the live walk and the
+bitmap check (Appendix A), never before: the reader refuses to read one
+until the check has passed. The candidates are the deleted sets the walk
+recorded that mark a directory, in the order recorded, then each
+directory found inside one read, first in first out. A candidate is read
+only where, in this order: its first cluster is in the heap and it has
+data; its allocation is a run inside the heap, or a chain of exactly the
+clusters its DataLength needs that then ends (the same rule as the
+bitmap's and up-case table's chains); every cluster is free in the
+bitmap; and none was read as a directory before. Each failure is counted
+by the first test it fails, and the directory's claims are unseen.
+Inside one, every File set is a deleted set whatever its InUse bits; with
+those bits set again it must pass every check a live set does. A usable
+one is recorded for its claim and its two times, never as live and never
+as a deleted set of the walk's; one that marks a directory becomes a
+candidate and meets all four tests, whatever its own InUse bit says. An
+unused Stream Extension outside a set is an orphan, as anywhere.
+
+**EXP-0011's scanner is corrected to match.** `exp-0011-scan.py`
+followed a subdirectory still marked in use inside a deleted directory
+without the four tests. No public image holds a directory of either kind
+inside a deleted one, and the scanner's tables for all 23 images are the
+same byte for byte before and after the correction.
+
+**Bounds.** The sets recorded inside share `Limits::deleted_sets` with
+the walk's deleted sets and orphans. Each directory is read within the
+same limits as any directory, and one they stop is counted as read in
+part. At most `Limits::queued_directories` wait at once. One bound is
+new, this project's choice: the clusters examined to decide which
+directories are read, over all candidates, are held to
+`CLAIM_LINKS_PER_CLUSTER` times the volume's clusters. Without it, a
+volume of a million deleted directory sets all naming one long
+allocation would have each walked through the FAT and the bitmap before
+the last test refused it. Each cluster belongs to one directory at a
+time, so a volume that needs more is naming the same clusters again. A
+candidate past the bound is counted, and its claims are unseen.
+
+**Measured** (`exp-0011-run.sh`, sections "deleted directories read"
+and "Volumes made for deleted directories"). On EXP-0011's 23 volumes,
+condition 2 over the sets the walk records holds for 952 and finds a
+later claimant for 33 with deleted directories not read, and holds for
+946 and finds one for 39 with them read. The six that change are the
+five `/.Trashes/._501` files of section 13, recovered holding an
+fseventsd log's data until the sets inside `/.fseventsd` are seen, and
+one deleted directory's own set, `/.Trashes/501` on DFR-13, which is
+never a file to recover. Eleven deleted directories are not read, each
+because a cluster is in use again. On the volumes made with FatFs, where
+a directory deleted as macOS deletes one left its files' entries in use
+and those files reused two earlier deleted files' clusters, the two
+earlier files are recovered holding the later files' data with deleted
+directories not read, and refused with them read, at both cluster sizes;
+a volume whose deleted directory's cluster is in use again reports it
+unread.
+
+**What no public image exercises:** a directory inside a deleted one, two
+deleted directories sharing a cluster, an allocation that is not well
+formed, and each bound. The volumes made here hold the first; unit tests
+hold every one, each failing when its rule is removed.

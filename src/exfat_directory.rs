@@ -31,7 +31,11 @@
 //! set and, where usable, recorded (ADR-0022 Decision B and Appendix B); an
 //! unused Stream Extension outside any set is recorded as an orphan. Their
 //! claims are followed, and condition 2 decided over them, by
-//! [`ExFatReader::assess_claims`], which nothing calls yet. The allocation
+//! [`ExFatReader::assess_claims`], which nothing calls yet. A deleted
+//! directory is read for the claims of the sets inside it, which are
+//! rivals and are not decided (ADR-0022 Decision K), by
+//! [`ExFatReader::read_deleted_directories`], which nothing calls yet
+//! either. The allocation
 //! bitmap's entry is
 //! located and range checked by the walk. Its contents are read only
 //! through [`ExFatReader::open_bitmap`] and
@@ -55,7 +59,7 @@
 //! is the one way it becomes text: no code unit outside printable ASCII
 //! reaches a terminal or a path as itself.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 use crate::error::Error;
@@ -104,8 +108,8 @@ pub struct Limits {
     /// Most live sets whose allocation is kept for the bitmap check.
     pub live_allocations: usize,
 
-    /// Most usable deleted sets and orphan Stream Extensions recorded for
-    /// phase 2, the two together.
+    /// Most usable deleted sets, orphan Stream Extensions and sets inside
+    /// deleted directories recorded for phase 2, the three together.
     pub deleted_sets: usize,
 
     /// Most runs of clusters held in the claims table.
@@ -149,7 +153,8 @@ pub const MAX_LIVE_ALLOCATIONS: usize = 1 << 22;
 /// past the bound is counted as not recorded, and is not assessed
 /// (Decision J). Orphan Stream Extensions share the bound (ADR-0022
 /// Appendix C): an orphan is 32 bytes, so a record held to the bound by
-/// orphans alone is smaller.
+/// orphans alone is smaller. Sets inside deleted directories (Decision K)
+/// share it too, at 32 bytes each.
 pub const MAX_DELETED_SETS: usize = 1 << 20;
 
 /// The most runs of clusters held in the claims table for one volume
@@ -417,6 +422,35 @@ struct DeletedSet {
     modified: RawTime,
 }
 
+/// A usable set read inside a deleted directory (ADR-0022 Decision K),
+/// whatever its own InUse bit: kept for its claim and its two times. It is
+/// a rival to the deleted sets and is not decided, so nothing phase 2
+/// would read it again by is held.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct InnerSet {
+    no_fat_chain: bool,
+    first_cluster: u32,
+    data_length: u64,
+    created: RawTime,
+    modified: RawTime,
+}
+
+/// The creation and modification times a File entry holds.
+fn raw_times(primary: &[u8]) -> (RawTime, RawTime) {
+    (
+        RawTime {
+            timestamp: le_u32(primary, 8),
+            ten_ms: primary[20],
+            utc_offset: primary[22],
+        },
+        RawTime {
+            timestamp: le_u32(primary, 12),
+            ten_ms: primary[21],
+            utc_offset: primary[23],
+        },
+    )
+}
+
 /// An unused Stream Extension outside any set, whose File entry was
 /// overwritten (ADR-0022 section 5): kept for the clusters its fields name.
 /// It has no time.
@@ -581,7 +615,12 @@ pub struct ClaimsAssessed {
     /// Orphan Stream Extensions whose claims were followed.
     pub orphan_streams: u64,
 
-    /// Claimants, deleted sets or orphans, whose claims a bound left unseen.
+    /// Sets inside deleted directories whose claims were followed: rivals
+    /// to the deleted sets, and not decided (ADR-0022 Decision K).
+    pub inner_sets: u64,
+
+    /// Claimants, deleted sets, orphans or sets inside deleted directories,
+    /// whose claims a bound left unseen.
     pub unrecorded: u64,
 
     /// Runs of clusters held in the claims table.
@@ -601,6 +640,66 @@ pub struct ClaimsAssessed {
     /// Orphan Stream Extensions the walk did not record, past the same
     /// bound: their claims unseen.
     pub orphans_unrecorded: u64,
+}
+
+/// What [`ExFatReader::read_deleted_directories`] found, counted (ADR-0022
+/// Decision K). A deleted directory is the set of one, recorded by the walk
+/// or found inside a deleted directory read here. Each one not read whole
+/// is a gap: the claims it holds are unseen.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DeletedDirectoriesRead {
+    /// Deleted directories read to their end.
+    pub directories_read: u64,
+
+    /// Not read: the first cluster is outside the heap, or there is no data.
+    pub not_read_out_of_range: u64,
+
+    /// Not read: the allocation is not well formed (condition 4).
+    pub not_read_malformed: u64,
+
+    /// Not read: a cluster of it is marked in use, so may hold another's
+    /// entries.
+    pub not_read_in_use: u64,
+
+    /// Not read: a cluster of it was read as a directory before.
+    pub not_read_before: u64,
+
+    /// Not read: past [`Limits::queued_directories`] waiting at once, or
+    /// past [`CLAIM_LINKS_PER_CLUSTER`] times the volume's clusters examined
+    /// to decide which are read.
+    pub not_read_bound: u64,
+
+    /// Read in part: an error stopped it, and what it held before the error
+    /// was recorded.
+    pub partly_read: u64,
+
+    /// Clusters read, over the directories read whole and in part.
+    pub clusters_read: u64,
+
+    /// Usable sets inside, recorded for their claims. None is decided.
+    pub sets_inside_recorded: u64,
+
+    /// Sets inside that are not usable: they claim nothing, so what they
+    /// held is unseen.
+    pub sets_inside_unusable: u64,
+
+    /// Usable sets inside past [`Limits::deleted_sets`]: their claims
+    /// unseen, and a directory among them not read.
+    pub sets_inside_unrecorded: u64,
+}
+
+/// What reading deleted directories carries from one to the next.
+struct DeletedWalk {
+    read: DeletedDirectoriesRead,
+
+    /// One set at a time, as for a live directory.
+    window: Vec<u8>,
+
+    /// Directory sets found inside the directories read, first in first out.
+    queue: VecDeque<DirectorySource>,
+
+    /// Clusters examined to decide which directories are read.
+    examined: u64,
 }
 
 /// Why a structure chain could not be followed. Each caller turns it into
@@ -1071,6 +1170,14 @@ pub enum ExFatDirectoryError {
     /// A critical primary entry other than a File entry, outside the root
     /// directory, which makes that directory invalid. Section 8.2.
     CriticalPrimaryOutsideRoot { entry_type: u8 },
+
+    /// Deleted directories were asked for before the bitmap check passed
+    /// (ADR-0022 Appendix A). Nothing was read.
+    BitmapNotChecked,
+
+    /// The bitmap could not be asked whether a deleted directory's cluster
+    /// is free.
+    Bitmap(ExFatBitmapError),
 }
 
 impl fmt::Display for ExFatDirectoryError {
@@ -1119,6 +1226,10 @@ impl fmt::Display for ExFatDirectoryError {
                 f,
                 "critical primary entry {entry_type:#04x} outside the root directory"
             ),
+            Self::BitmapNotChecked => f.write_str(
+                "deleted directories are read only after the allocation bitmap is checked",
+            ),
+            Self::Bitmap(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1127,8 +1238,15 @@ impl std::error::Error for ExFatDirectoryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Evidence(e) => Some(e),
+            Self::Bitmap(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<ExFatBitmapError> for ExFatDirectoryError {
+    fn from(e: ExFatBitmapError) -> Self {
+        Self::Bitmap(e)
     }
 }
 
@@ -1397,6 +1515,13 @@ pub struct ExFatReader<'a, R: EvidenceReader> {
     /// deleted sets, and how many more were not kept.
     orphans: Vec<OrphanStream>,
     orphans_unrecorded: u64,
+
+    /// Every usable set found inside a deleted directory, within the same
+    /// bound again.
+    inner: Vec<InnerSet>,
+
+    /// The bitmap check passed: deleted directories may be read.
+    bitmap_checked: bool,
 }
 
 impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
@@ -1426,7 +1551,14 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             deleted_unrecorded: 0,
             orphans: Vec::new(),
             orphans_unrecorded: 0,
+            inner: Vec::new(),
+            bitmap_checked: false,
         }
+    }
+
+    /// Claimants recorded so far, which [`Limits::deleted_sets`] bounds.
+    fn claimants_recorded(&self) -> usize {
+        self.deleted.len() + self.orphans.len() + self.inner.len()
     }
 
     /// Clusters read as directories so far, over every directory.
@@ -1635,8 +1767,10 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
     /// `needed` clusters, each link but the last a next cluster in the heap,
     /// the last the end of the chain. Returns the clusters as runs, in chain
     /// order. `first` is in the heap, and `needed` is at least 1 and at most
-    /// ClusterCount for the bitmap or 256 for the up-case table
-    /// ([`MAX_UP_CASE_BYTES`] over the smallest cluster).
+    /// ClusterCount for the bitmap or a deleted directory, or 256 for the
+    /// up-case table ([`MAX_UP_CASE_BYTES`] over the smallest cluster). A
+    /// chain that reaches a cluster twice never ends, so one accepted here
+    /// has no repeat.
     fn structure_runs(&mut self, first: u32, needed: u64) -> Result<Vec<BitmapRun>, ChainFault> {
         let mut runs: Vec<BitmapRun> = Vec::new();
         let mut cluster = first;
@@ -1801,12 +1935,256 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         if let Some((cluster, structure)) = lowest {
             return Err(ExFatStructureError::MarkedFree { structure, cluster });
         }
+        self.bitmap_checked = true;
         Ok(ExFatStructureChecked {
             directory_clusters: directories.len() as u64,
             bitmap_clusters: bitmap.clusters(),
             up_case_clusters: up_case_runs.iter().map(|r| r.clusters as u64).sum(),
             live_clusters,
         })
+    }
+
+    /// Reads every deleted directory that may be read, for the claims of
+    /// the sets inside it (ADR-0022 Decision K).
+    ///
+    /// Refused with [`ExFatDirectoryError::BitmapNotChecked`], and nothing
+    /// read, unless [`Self::check_bitmap`] has passed (Appendix A). Call it
+    /// once, with the bitmap that was checked, after the walk of live
+    /// directories and before [`Self::assess_claims`].
+    ///
+    /// The candidates are every usable deleted set the walk recorded that
+    /// marks a directory, in the order recorded, then each directory set
+    /// found inside a directory read here, first in first out. One is read
+    /// only where, in this order: its first cluster is in the heap and it
+    /// has data; its allocation is well formed, a run inside the heap or a
+    /// chain of exactly the clusters `DataLength` needs that then ends;
+    /// every cluster of it is free in the bitmap; and none was read as a
+    /// directory before. Then its entries are its own. Otherwise it is
+    /// counted by the first of those it failed, and its claims are unseen.
+    ///
+    /// Inside one, every File set is a deleted set whatever its InUse bits
+    /// say, because macOS leaves them set. A usable one is recorded for its
+    /// claim and its two times, and is never decided, recorded as live or
+    /// recorded as a deleted set of the walk's. An unused Stream Extension
+    /// outside a set is an orphan, as anywhere. Every other entry is
+    /// skipped.
+    ///
+    /// Bounds, each this project's choice. The sets recorded share
+    /// [`Limits::deleted_sets`] with the walk's deleted sets and orphans. A
+    /// directory is read within [`Limits::directory_bytes`] and
+    /// [`Limits::directory_clusters`], as any is, and one either stops is
+    /// counted as read in part. At most [`Limits::queued_directories`]
+    /// found inside wait at once. The clusters examined to decide which
+    /// directories are read are held to [`CLAIM_LINKS_PER_CLUSTER`] times
+    /// the volume's: each cluster belongs to one directory at a time, so a
+    /// volume that needs more is naming the same clusters again.
+    ///
+    /// An evidence or bitmap error is returned, and what was recorded
+    /// before it stands.
+    pub fn read_deleted_directories(
+        &mut self,
+        bitmap: &mut ExFatBitmap,
+    ) -> Result<DeletedDirectoriesRead, ExFatDirectoryError> {
+        if !self.bitmap_checked {
+            return Err(ExFatDirectoryError::BitmapNotChecked);
+        }
+        let mut walk = DeletedWalk {
+            read: DeletedDirectoriesRead::default(),
+            window: Vec::with_capacity(MAX_SET_ENTRIES * ENTRY_BYTES),
+            queue: VecDeque::new(),
+            examined: 0,
+        };
+
+        // Nothing read here records a deleted set, so the count stands.
+        for index in 0..self.deleted.len() {
+            let set = self.deleted[index];
+            if set.attributes & ATTRIBUTE_DIRECTORY != 0 {
+                let source = DirectorySource::Subdirectory {
+                    first_cluster: set.first_cluster,
+                    data_length: set.data_length,
+                    no_fat_chain: set.no_fat_chain,
+                };
+                self.read_deleted_directory(bitmap, source, &mut walk)?;
+            }
+        }
+        while let Some(source) = walk.queue.pop_front() {
+            self.read_deleted_directory(bitmap, source, &mut walk)?;
+        }
+        Ok(walk.read)
+    }
+
+    /// Reads one candidate where Decision K's four tests hold, and counts
+    /// it by the first that does not.
+    fn read_deleted_directory(
+        &mut self,
+        bitmap: &mut ExFatBitmap,
+        source: DirectorySource,
+        walk: &mut DeletedWalk,
+    ) -> Result<(), ExFatDirectoryError> {
+        let DirectorySource::Subdirectory {
+            first_cluster: first,
+            data_length,
+            no_fat_chain,
+        } = source
+        else {
+            return Ok(());
+        };
+        let last = self.boot.cluster_count as u64 + 1;
+        if first < 2 || first as u64 > last || data_length == 0 {
+            walk.read.not_read_out_of_range += 1;
+            return Ok(());
+        }
+
+        // At most ClusterCount: validate_file_set refused a longer
+        // DataLength. Charged before any cluster is looked at, so sets that
+        // name one long allocation again and again stop here.
+        let needed = data_length.div_ceil(self.boot.cluster_bytes() as u64);
+        walk.examined = walk.examined.saturating_add(needed);
+        if walk.examined > CLAIM_LINKS_PER_CLUSTER * self.boot.cluster_count as u64 {
+            walk.read.not_read_bound += 1;
+            return Ok(());
+        }
+
+        let runs = if no_fat_chain {
+            if first as u64 + needed - 1 > last {
+                walk.read.not_read_malformed += 1;
+                return Ok(());
+            }
+            vec![BitmapRun {
+                start: 0,
+                first,
+                clusters: needed as u32,
+            }]
+        } else {
+            match self.structure_runs(first, needed) {
+                Ok(runs) => runs,
+                Err(ChainFault::Evidence(e)) => return Err(e.into()),
+                Err(_) => {
+                    walk.read.not_read_malformed += 1;
+                    return Ok(());
+                }
+            }
+        };
+        // Every run lies in the heap, so its end fits.
+        let clusters = || runs.iter().flat_map(|r| r.first..r.first + r.clusters);
+        for cluster in clusters() {
+            if self.cluster_allocated(bitmap, cluster)? {
+                walk.read.not_read_in_use += 1;
+                return Ok(());
+            }
+        }
+        if clusters().any(|cluster| self.seen.contains(&cluster)) {
+            walk.read.not_read_before += 1;
+            return Ok(());
+        }
+
+        // The cursor enters each cluster as a subdirectory's, which is what
+        // marks it read.
+        let mut cursor = self.cursor_for(source);
+        let result = self.read_deleted_entries(&mut cursor, walk);
+        walk.read.clusters_read += cursor.clusters_taken;
+        match result {
+            Ok(()) => walk.read.directories_read += 1,
+            Err(ExFatDirectoryError::Evidence(e)) => return Err(e.into()),
+            Err(_) => walk.read.partly_read += 1,
+        }
+        Ok(())
+    }
+
+    /// The entries of one deleted directory.
+    fn read_deleted_entries(
+        &mut self,
+        cursor: &mut Cursor,
+        walk: &mut DeletedWalk,
+    ) -> Result<(), ExFatDirectoryError> {
+        while let Some(entry) = self.next_entry(cursor)? {
+            match entry.bytes[0] {
+                TYPE_END_OF_DIRECTORY => {
+                    // The rest is entered, not interpreted, so every cluster
+                    // of the directory counts as read.
+                    while self.next_entry(cursor)?.is_some() {}
+                }
+                TYPE_FILE | TYPE_UNUSED_FILE => self.read_inner_set(cursor, entry, walk)?,
+                kind if kind == TYPE_STREAM & !TYPE_IN_USE => self.record_orphan(&entry),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads a File set inside a deleted directory: the File entry and the
+    /// secondaries it declares, each whatever its InUse bit. An entry that
+    /// is not a secondary ends the set and is handed back. With every InUse
+    /// bit set again, the set must pass every check a live set does. A
+    /// usable one is recorded for its claim; if it marks a directory, it
+    /// waits to be read in its turn.
+    fn read_inner_set(
+        &mut self,
+        cursor: &mut Cursor,
+        primary: RawEntry,
+        walk: &mut DeletedWalk,
+    ) -> Result<(), ExFatDirectoryError> {
+        // As for a live set: a count too small consumes nothing.
+        if (primary.bytes[1] as usize) < MIN_FILE_SECONDARIES {
+            walk.read.sets_inside_unusable += 1;
+            return Ok(());
+        }
+
+        let window = &mut walk.window;
+        window.clear();
+        window.extend_from_slice(&primary.bytes);
+        let mut complete = true;
+        for _ in 0..primary.bytes[1] {
+            match self.next_entry(cursor)? {
+                Some(entry) if entry.bytes[0] & TYPE_SECONDARY != 0 => {
+                    window.extend_from_slice(&entry.bytes);
+                }
+                Some(entry) => {
+                    cursor.pushed = Some(entry);
+                    complete = false;
+                    break;
+                }
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        for entry in window.as_chunks_mut::<ENTRY_BYTES>().0 {
+            entry[0] |= TYPE_IN_USE;
+        }
+        let Some(Ok(file)) = complete.then(|| self.validate_file_set(window)) else {
+            walk.read.sets_inside_unusable += 1;
+            return Ok(());
+        };
+        if self.claimants_recorded() >= self.limits.deleted_sets {
+            walk.read.sets_inside_unrecorded += 1;
+            return Ok(());
+        }
+
+        let (created, modified) = raw_times(&window[..ENTRY_BYTES]);
+        self.inner.push(InnerSet {
+            no_fat_chain: file.no_fat_chain,
+            first_cluster: file.first_cluster,
+            data_length: file.data_length,
+            created,
+            modified,
+        });
+        walk.read.sets_inside_recorded += 1;
+
+        if file.is_directory() {
+            if walk.queue.len() >= self.limits.queued_directories {
+                walk.read.not_read_bound += 1;
+            } else {
+                walk.queue.push_back(DirectorySource::Subdirectory {
+                    first_cluster: file.first_cluster,
+                    data_length: file.data_length,
+                    no_fat_chain: file.no_fat_chain,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Follows every claim the walk recorded and decides condition 2 for each
@@ -1819,11 +2197,14 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
     /// needs or the FAT does not go on, so a chain that condition 4 refuses
     /// still claims what it reached. An orphan Stream Extension claims the
     /// same way where its first cluster is in the heap and its `DataLength`
-    /// is above 0, a run cut at the heap's end; it has no time.
+    /// is above 0, a run cut at the heap's end; it has no time. A set inside
+    /// a deleted directory claims as a deleted set does, with its two
+    /// times, and is not decided (Decision K).
     ///
-    /// Call it after the walk of every directory whose claims are to count.
+    /// Call it after the walk of every directory whose claims are to count,
+    /// and after [`Self::read_deleted_directories`].
     /// Claims are followed in the order the walk found them, deleted sets
-    /// first. Past [`Limits::claimed_runs`] runs, or
+    /// first, then orphans, then the sets inside deleted directories. Past [`Limits::claimed_runs`] runs, or
     /// [`CLAIM_LINKS_PER_CLUSTER`] times the volume's clusters in FAT links,
     /// the claimant being followed and every one after it are not recorded:
     /// their claims are unseen, and a deleted set among them is not assessed.
@@ -1833,37 +2214,52 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
     /// whole, whose claims are unseen too.
     pub fn assess_claims(&mut self) -> Result<ClaimsAssessed, Error> {
         let link_limit = CLAIM_LINKS_PER_CLUSTER * self.boot.cluster_count as u64;
-        let total = self.deleted.len() + self.orphans.len();
+        let (sets, orphans) = (self.deleted.len(), self.orphans.len());
+        let total = self.claimants_recorded();
         let mut claimants: Vec<Claimant> = Vec::with_capacity(total);
         let mut runs: Vec<ClaimRun> = Vec::new();
         let mut links = 0u64;
 
         for index in 0..total {
-            let (first, data_length, no_fat_chain, claimant) = match self.deleted.get(index) {
-                Some(set) => (
-                    set.first_cluster,
-                    set.data_length,
-                    set.no_fat_chain,
-                    Claimant {
-                        timed: true,
-                        created: set.created.key(),
-                        modified: set.modified.key(),
-                    },
-                ),
-                None => {
-                    let orphan = self.orphans[index - self.deleted.len()];
+            let (first, data_length, no_fat_chain, claimant) =
+                if let Some(set) = self.deleted.get(index) {
+                    (
+                        set.first_cluster,
+                        set.data_length,
+                        set.no_fat_chain,
+                        Claimant {
+                            timed: true,
+                            decided: true,
+                            created: set.created.key(),
+                            modified: set.modified.key(),
+                        },
+                    )
+                } else if let Some(orphan) = self.orphans.get(index - sets) {
                     (
                         orphan.first_cluster,
                         orphan.data_length,
                         orphan.no_fat_chain,
                         Claimant {
                             timed: false,
+                            decided: false,
                             created: None,
                             modified: None,
                         },
                     )
-                }
-            };
+                } else {
+                    let inner = self.inner[index - sets - orphans];
+                    (
+                        inner.first_cluster,
+                        inner.data_length,
+                        inner.no_fat_chain,
+                        Claimant {
+                            timed: true,
+                            decided: false,
+                            created: inner.created.key(),
+                            modified: inner.modified.key(),
+                        },
+                    )
+                };
             let Ok(owner) = u32::try_from(index) else {
                 break;
             };
@@ -1885,13 +2281,14 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         }
 
         let decided = exfat_claims::decide(&claimants, &runs);
-        let mut verdicts = vec![None; self.deleted.len()];
+        let mut verdicts = vec![None; sets];
         for (verdict, decision) in verdicts.iter_mut().zip(decided) {
             *verdict = decision;
         }
         Ok(ClaimsAssessed {
             verdicts,
-            orphan_streams: claimants.len().saturating_sub(self.deleted.len()) as u64,
+            orphan_streams: claimants.len().saturating_sub(sets).min(orphans) as u64,
+            inner_sets: claimants.len().saturating_sub(sets + orphans) as u64,
             unrecorded: (total - claimants.len()) as u64,
             runs: runs.len() as u64,
             links,
@@ -2345,13 +2742,13 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
                 return Ok(());
             }
         };
-        if self.deleted.len() + self.orphans.len() >= self.limits.deleted_sets {
+        if self.claimants_recorded() >= self.limits.deleted_sets {
             self.deleted_clusters.truncate(clusters_start);
             self.deleted_unrecorded += 1;
             return Ok(());
         }
 
-        let p = &window[..ENTRY_BYTES];
+        let (created, modified) = raw_times(&window[..ENTRY_BYTES]);
         self.deleted.push(DeletedSet {
             position: primary.position,
             // At most 17 clusters for a set of 256 entries at 512 bytes a
@@ -2363,16 +2760,8 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             first_cluster: file.first_cluster,
             data_length: file.data_length,
             valid_data_length: file.valid_data_length,
-            created: RawTime {
-                timestamp: le_u32(p, 8),
-                ten_ms: p[20],
-                utc_offset: p[22],
-            },
-            modified: RawTime {
-                timestamp: le_u32(p, 12),
-                ten_ms: p[21],
-                utc_offset: p[23],
-            },
+            created,
+            modified,
         });
         Ok(())
     }
@@ -2380,7 +2769,7 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
     /// Keeps an orphan Stream Extension for its claim, within the deleted
     /// sets' bound (ADR-0022 Appendix C).
     fn record_orphan(&mut self, entry: &RawEntry) {
-        if self.deleted.len() + self.orphans.len() >= self.limits.deleted_sets {
+        if self.claimants_recorded() >= self.limits.deleted_sets {
             self.orphans_unrecorded += 1;
             return;
         }
@@ -6333,5 +6722,505 @@ pub(crate) mod tests {
         assert_eq!(std::mem::size_of::<ClaimRun>(), 12);
         assert_eq!(MAX_CLAIMED_RUNS * std::mem::size_of::<ClaimRun>(), 12 << 20);
         assert_eq!(std::mem::size_of::<OrphanStream>(), 32);
+        assert_eq!(std::mem::size_of::<InnerSet>(), 32);
+    }
+
+    // --- deleted directories (ADR-0022 Decision K) ---------------------------
+
+    /// [`structured`]'s volume with `extra` in the root after the standard
+    /// entries, and every cluster of structure marked in use.
+    fn with_root(extra: &[[u8; 32]]) -> Vol {
+        let mut entries = standard_root();
+        entries.extend_from_slice(extra);
+        let mut vol = structured(&entries);
+        mark(&mut vol, &[3], &all_of(&STRUCTURE));
+        vol
+    }
+
+    /// [`with_root`]'s volume with one deleted directory, `gone`, of one
+    /// cluster at 20, whose entries the caller writes.
+    fn with_gone() -> Vol {
+        let mut vol = with_root(&deleted(directory("gone", 20, 1)));
+        vol.chain(&[20]);
+        vol
+    }
+
+    /// Walks the root and directory 12, and opens the bitmap.
+    fn walk_live(reader: &mut ExFatReader<'_, MemoryImage>) -> ExFatBitmap {
+        walk_with(reader, root(2)).0.expect("the root reads");
+        let d = DirectorySource::Subdirectory {
+            first_cluster: 12,
+            data_length: 512,
+            no_fat_chain: false,
+        };
+        walk_with(reader, d).0.expect("the directory reads");
+        reader.open_bitmap(&bitmap_at(3, 25)).expect("opens")
+    }
+
+    /// Walks the live directories and checks the bitmap, then hands the
+    /// reader over.
+    fn checked<T>(
+        vol: &mut Vol,
+        limits: Limits,
+        then: impl FnOnce(&mut ExFatReader<'_, MemoryImage>, &mut ExFatBitmap) -> T,
+    ) -> T {
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), limits);
+        let mut bitmap = walk_live(&mut reader);
+        reader
+            .check_bitmap(&mut bitmap)
+            .expect("the bitmap is believed");
+        then(&mut reader, &mut bitmap)
+    }
+
+    /// What reading the deleted directories counted, and the sets recorded
+    /// inside them.
+    fn read_deleted(vol: &mut Vol, limits: Limits) -> (DeletedDirectoriesRead, Vec<InnerSet>) {
+        checked(vol, limits, |reader, bitmap| {
+            let read = reader.read_deleted_directories(bitmap).expect("reads");
+            (read, reader.inner.clone())
+        })
+    }
+
+    /// The directory's entries stay in use, as macOS leaves them, and one
+    /// is unused: both are sets inside, and neither is live or a deleted
+    /// set of the walk's.
+    #[test]
+    fn a_deleted_directory_is_read_and_its_sets_recorded_as_inside() {
+        let mut vol = with_gone();
+        vol.put(20, 0, &at_times(file("kept", 30, 1024), 0, 4, 0x90));
+        vol.put(
+            20,
+            3,
+            &deleted(at_times(file("unlinked", 40, 512), 8, 8, 0x94)),
+        );
+
+        checked(&mut vol, Limits::DEFAULT, |reader, bitmap| {
+            let before = (reader.live.len(), reader.deleted.len());
+            assert_eq!(before.1, 1, "the directory's own set");
+            let read = reader.read_deleted_directories(bitmap).expect("reads");
+            assert_eq!(
+                read,
+                DeletedDirectoriesRead {
+                    directories_read: 1,
+                    clusters_read: 1,
+                    sets_inside_recorded: 2,
+                    ..Default::default()
+                }
+            );
+            assert_eq!((reader.live.len(), reader.deleted.len()), before);
+            assert!(reader.seen.contains(&20));
+            let time = |seconds, utc_offset| RawTime {
+                timestamp: stamp(seconds),
+                ten_ms: 0,
+                utc_offset,
+            };
+            assert_eq!(
+                reader.inner,
+                vec![
+                    InnerSet {
+                        no_fat_chain: false,
+                        first_cluster: 30,
+                        data_length: 1024,
+                        created: time(0, 0x90),
+                        modified: time(4, 0x90),
+                    },
+                    InnerSet {
+                        no_fat_chain: false,
+                        first_cluster: 40,
+                        data_length: 512,
+                        created: time(8, 0x94),
+                        modified: time(8, 0x94),
+                    },
+                ]
+            );
+        });
+    }
+
+    /// ADR-0022 Appendix A: after the check, and only where it passed.
+    #[test]
+    fn deleted_directories_are_read_only_after_the_bitmap_check_passes() {
+        let mut vol = with_gone();
+        vol.put(20, 0, &file("kept", 30, 512));
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = walk_live(&mut reader);
+        assert!(matches!(
+            reader.read_deleted_directories(&mut bitmap),
+            Err(ExFatDirectoryError::BitmapNotChecked)
+        ));
+        assert!(reader.inner.is_empty() && !reader.seen.contains(&20));
+        reader.check_bitmap(&mut bitmap).expect("believed");
+        let read = reader.read_deleted_directories(&mut bitmap).expect("reads");
+        assert_eq!(read.directories_read, 1);
+
+        // A check that fails opens nothing: cluster 12, a live directory,
+        // is marked free.
+        let mut entries = standard_root();
+        entries.extend(deleted(directory("gone", 20, 1)));
+        let mut vol = structured(&entries);
+        vol.chain(&[20]);
+        mark(&mut vol, &[3], &[2, 5, 3, 6, 9]);
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = walk_live(&mut reader);
+        assert!(reader.check_bitmap(&mut bitmap).is_err());
+        assert!(matches!(
+            reader.read_deleted_directories(&mut bitmap),
+            Err(ExFatDirectoryError::BitmapNotChecked)
+        ));
+    }
+
+    #[test]
+    fn a_deleted_directory_with_no_cluster_or_no_data_is_not_read() {
+        let mut extra = deleted(directory("empty", 0, 0));
+        extra.extend(deleted(directory("nodata", 20, 0)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[20]);
+        vol.put(20, 0, &file("inside", 30, 512));
+
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                not_read_out_of_range: 2,
+                ..Default::default()
+            }
+        );
+        assert!(inner.is_empty());
+    }
+
+    /// `short`'s chain ends a cluster early, `long`'s goes on past its
+    /// length, and `loop`'s comes back to its first cluster.
+    #[test]
+    fn a_deleted_directory_whose_chain_is_not_its_length_is_not_read() {
+        let mut extra = deleted(directory("short", 20, 2));
+        extra.extend(deleted(directory("long", 22, 1)));
+        extra.extend(deleted(directory("loop", 25, 3)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[20]);
+        vol.chain(&[22, 23]);
+        vol.fat(25, 26);
+        vol.fat(26, 25);
+        for cluster in [20, 22, 25] {
+            vol.put(cluster, 0, &file("inside", 30, 512));
+        }
+
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                not_read_malformed: 3,
+                ..Default::default()
+            }
+        );
+        assert!(inner.is_empty());
+    }
+
+    /// Its second cluster is in use again, so may hold another's entries:
+    /// the case of NIST's `/.Trashes/501`.
+    #[test]
+    fn a_deleted_directory_with_a_cluster_in_use_again_is_not_read() {
+        let mut vol = with_root(&deleted(directory("gone", 20, 2)));
+        vol.chain(&[20, 21]);
+        vol.put(20, 0, &file("inside", 30, 512));
+        mark(&mut vol, &[3], &[21]);
+
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                not_read_in_use: 1,
+                ..Default::default()
+            }
+        );
+        assert!(inner.is_empty());
+    }
+
+    /// `first` is the chain 20, 21 and ends in 20. `same` names the same
+    /// clusters, and `tail` only 21, which `first` did not reach an entry
+    /// in but is its cluster all the same.
+    #[test]
+    fn a_deleted_directory_sharing_a_cluster_with_one_read_is_not_read() {
+        let mut extra = deleted(directory("first", 20, 2));
+        extra.extend(deleted(directory("same", 20, 2)));
+        extra.extend(deleted(directory("tail", 21, 1)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[20, 21]);
+        vol.put(20, 0, &file("inside", 30, 512));
+        vol.put(21, 0, &file("past the end", 31, 512));
+
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 1,
+                clusters_read: 2,
+                sets_inside_recorded: 1,
+                not_read_before: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner.len(), 1);
+    }
+
+    /// `gone`, holding `sub`, a directory at cluster 24 that holds a file.
+    fn nested(sub: Vec<[u8; 32]>) -> Vol {
+        let mut vol = with_gone();
+        vol.chain(&[24]);
+        vol.put(20, 0, &sub);
+        vol.put(24, 0, &file("deep", 30, 512));
+        vol
+    }
+
+    /// Decision K's tests apply to a directory inside a deleted directory
+    /// though its own entry is still in use.
+    #[test]
+    fn an_in_use_directory_inside_a_deleted_one_is_read_only_where_its_clusters_are_free() {
+        let mut vol = nested(directory("sub", 24, 1));
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 2,
+                clusters_read: 2,
+                sets_inside_recorded: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner[1].first_cluster, 30);
+
+        let mut vol = nested(directory("sub", 24, 1));
+        mark(&mut vol, &[3], &[24]);
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 1,
+                clusters_read: 1,
+                sets_inside_recorded: 1,
+                not_read_in_use: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner.len(), 1);
+    }
+
+    #[test]
+    fn a_deleted_directory_inside_a_deleted_one_is_read() {
+        let mut vol = nested(deleted(directory("sub", 24, 1)));
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 2,
+                clusters_read: 2,
+                sets_inside_recorded: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner[1].first_cluster, 30);
+    }
+
+    #[test]
+    fn an_orphan_stream_extension_inside_a_deleted_directory_is_recorded_as_an_orphan() {
+        let mut vol = with_gone();
+        vol.put(20, 0, &[orphan_stream(false, 30, 512)]);
+        vol.put(20, 1, &file("after", 31, 512));
+
+        checked(&mut vol, Limits::DEFAULT, |reader, bitmap| {
+            let read = reader.read_deleted_directories(bitmap).expect("reads");
+            assert_eq!(read.sets_inside_recorded, 1);
+            assert_eq!(
+                reader.orphans,
+                vec![OrphanStream {
+                    position: ExFatPosition {
+                        cluster: 20,
+                        slot: 0
+                    },
+                    no_fat_chain: false,
+                    first_cluster: 30,
+                    data_length: 512,
+                }]
+            );
+        });
+    }
+
+    /// Two records: the directory's own set and `a`. `b` and the orphan
+    /// are past the bound.
+    #[test]
+    fn sets_inside_share_the_deleted_sets_bound() {
+        let limits = Limits {
+            deleted_sets: 2,
+            ..Limits::DEFAULT
+        };
+        let mut vol = with_gone();
+        vol.put(20, 0, &file("a", 30, 512));
+        vol.put(20, 3, &file("b", 31, 512));
+        vol.put(20, 6, &[orphan_stream(false, 32, 512)]);
+
+        checked(&mut vol, limits, |reader, bitmap| {
+            let read = reader.read_deleted_directories(bitmap).expect("reads");
+            assert_eq!(
+                read,
+                DeletedDirectoriesRead {
+                    directories_read: 1,
+                    clusters_read: 1,
+                    sets_inside_recorded: 1,
+                    sets_inside_unrecorded: 1,
+                    ..Default::default()
+                }
+            );
+            assert_eq!((reader.inner.len(), reader.orphans.len()), (1, 0));
+            assert_eq!(reader.orphans_unrecorded, 1);
+        });
+    }
+
+    /// `broken`'s checksum does not match. `cut` declares two secondaries
+    /// and is followed, after one, by a File entry, which is handed back
+    /// and read as the set it begins.
+    #[test]
+    fn an_unusable_set_inside_a_deleted_directory_is_counted_and_claims_nothing() {
+        let mut vol = with_gone();
+        let mut broken = file("broken", 30, 512);
+        broken[1][24] ^= 1;
+        vol.put(20, 0, &broken);
+        vol.put(20, 3, &file("cut", 31, 512)[..2]);
+        vol.put(20, 5, &file("whole", 32, 512));
+
+        let (read, inner) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 1,
+                clusters_read: 1,
+                sets_inside_recorded: 1,
+                sets_inside_unusable: 2,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].first_cluster, 32);
+    }
+
+    /// The live walk read three clusters, so a cap of three stops the
+    /// deleted directory at its first.
+    #[test]
+    fn a_deleted_directory_the_cluster_cap_stops_is_read_in_part() {
+        let limits = Limits {
+            directory_clusters: 3,
+            ..Limits::DEFAULT
+        };
+        let mut vol = with_gone();
+        vol.put(20, 0, &file("inside", 30, 512));
+
+        let (read, inner) = read_deleted(&mut vol, limits);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                partly_read: 1,
+                ..Default::default()
+            }
+        );
+        assert!(inner.is_empty());
+    }
+
+    /// One directory may wait: `one` does and is read, `two` is not.
+    #[test]
+    fn a_directory_inside_past_the_queue_bound_is_not_read() {
+        let limits = Limits {
+            queued_directories: 1,
+            ..Limits::DEFAULT
+        };
+        let mut vol = with_gone();
+        vol.chain(&[24]);
+        vol.chain(&[25]);
+        vol.put(20, 0, &directory("one", 24, 1));
+        vol.put(20, 3, &directory("two", 25, 1));
+        vol.put(25, 0, &file("unseen", 30, 512));
+
+        let (read, inner) = read_deleted(&mut vol, limits);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                directories_read: 2,
+                clusters_read: 2,
+                sets_inside_recorded: 2,
+                not_read_bound: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(inner.len(), 2);
+    }
+
+    /// Five sets name a looping chain for as many clusters as the volume
+    /// holds. Four fit in four times the volume's clusters and are found
+    /// malformed; the fifth is not examined.
+    #[test]
+    fn deleted_directories_past_the_examined_bound_are_not_read() {
+        let mut extra = Vec::new();
+        for i in 0..5 {
+            let name = format!("loop{i}");
+            extra.extend(deleted(directory(&name, 10, CLUSTER_COUNT as u64)));
+        }
+        let mut vol = with_root(&extra);
+        vol.fat(10, 11);
+        vol.fat(11, 10);
+
+        let (read, _) = read_deleted(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            read,
+            DeletedDirectoriesRead {
+                not_read_malformed: 4,
+                not_read_bound: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// `victim`, a deleted file at cluster 30 created at 4 s, and a file
+    /// inside the deleted directory that names cluster 30 too. The
+    /// directory's own set claims cluster 20 alone.
+    #[test]
+    fn a_set_inside_a_deleted_directory_is_a_rival_and_is_not_decided() {
+        for (created, verdict) in [(8, Later), (0, Holds)] {
+            let mut extra = deleted(at_times(file("victim", 30, 512), 4, 4, 0x90));
+            extra.extend(deleted(directory("gone", 20, 1)));
+            let mut vol = with_root(&extra);
+            vol.chain(&[20]);
+            vol.chain(&[30]);
+            let inside = at_times(file("inside", 30, 512), created, created, 0x90);
+            vol.put(20, 0, &inside);
+
+            checked(&mut vol, Limits::DEFAULT, |reader, bitmap| {
+                reader.read_deleted_directories(bitmap).expect("reads");
+                let assessed = reader.assess_claims().expect("the claims are followed");
+                assert_eq!(assessed.verdicts, vec![Some(verdict), Some(Holds)]);
+                assert_eq!((assessed.inner_sets, assessed.unrecorded), (1, 0));
+                assert_eq!(assessed.runs, 3);
+            });
+        }
+    }
+
+    /// Two runs fit: the two deleted sets'. The set inside is cut, and is
+    /// counted with the claimants not recorded.
+    #[test]
+    fn a_set_inside_past_the_runs_bound_is_counted_unrecorded() {
+        let limits = Limits {
+            claimed_runs: 2,
+            ..Limits::DEFAULT
+        };
+        let mut extra = deleted(at_times(file("victim", 30, 512), 4, 4, 0x90));
+        extra.extend(deleted(directory("gone", 20, 1)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[20]);
+        vol.chain(&[30]);
+        vol.put(20, 0, &at_times(file("inside", 30, 512), 8, 8, 0x90));
+
+        checked(&mut vol, limits, |reader, bitmap| {
+            reader.read_deleted_directories(bitmap).expect("reads");
+            let assessed = reader.assess_claims().expect("the claims are followed");
+            assert_eq!(assessed.verdicts, vec![Some(Holds), Some(Holds)]);
+            assert_eq!((assessed.inner_sets, assessed.unrecorded), (0, 1));
+        });
     }
 }

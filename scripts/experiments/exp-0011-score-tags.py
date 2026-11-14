@@ -17,7 +17,8 @@ ADR-0022 section 6's order (conditions 4, 1, 2, 3) under four rules:
   valid-offsets     decided, with every offset byte taken as valid and the
                     same: what the files would get had their writer
                     recorded an offset
-Usage: exp-0011-score-tags.py IMAGE TABLE   (TABLE from exp-0011-scan.py)
+Usage: exp-0011-score-tags.py IMAGE TABLE   (TABLE from exp-0011-scan.py; with
+--deleted-dirs, sets inside deleted directories read are rivals, not scored)
 """
 import re, struct, sys
 
@@ -89,7 +90,14 @@ for m in meta:
         orphans.append(claim(struct.unpack_from('<I', e, 20)[0],
                              struct.unpack_from('<Q', e, 24)[0], bool(e[1] & 2)))
 
-dels = [r for r in R if r['deleted'] == '1' and r['checksum_ok'] == '1']
+dels = [r for r in R if r['deleted'] == '1' and r['checksum_ok'] == '1'
+        and r.get('in_deleted_dir') != '1']
+# A usable set inside a deleted directory that was read (a TABLE made with
+# --deleted-dirs) is a rival with its two keys, whatever its InUse bit, and
+# is not scored (ADR-0022 Decision K).
+inner = [r for r in R if r.get('in_deleted_dir') == '1' and r['checksum_ok'] == '1']
+for r in inner:
+    r['cs'] = claim(int(r['first']), int(r['dl']), r['nofat'] == '1')
 # Sets failing their checksum are not usable and are not scored: counted,
 # so that none is dropped unseen.
 failing = sum(1 for r in R if r['deleted'] == '1' and r['checksum_ok'] != '1')
@@ -101,13 +109,17 @@ for r in dels:
 def decide(r, rule):
     if not r['cl']:
         return 'nodata'
+    # A deleted directory's own set is not a file to recover; it is set
+    # aside, as exp-0011-score-nist.py sets it aside.
+    if int(r['attrs'], 16) & 0x10:
+        return 'directory'
     if r['chain_end'] not in ('contig', 'EOC'):
         return 'refuse:c4'
     if r['allocated_clusters']:
         return 'refuse:c1'
     fv = rule == 'valid-offsets'
     sc, sm = key(r['ctime'], fv), key(r['mtime'], fv)
-    for o in dels:
+    for o in dels + inner:
         if o is r or r['cs'].isdisjoint(o['cs']):
             continue
         oc, om = key(o['ctime'], fv), key(o['mtime'], fv)
