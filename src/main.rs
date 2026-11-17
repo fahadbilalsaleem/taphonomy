@@ -18,13 +18,14 @@ use std::process::ExitCode;
 
 use taphonomy::EvidenceFile;
 use taphonomy::Sha256Digest;
-use taphonomy::analysis::exfat::{ExFatNotRead, ExFatReached};
+use taphonomy::analysis::exfat::{ExFatNotRead, ExFatPhaseTwoStopped, ExFatReached};
 use taphonomy::analysis::{
     Coverage, DirectoryPart, Event, MAX_DEPTH, NotReadReason, Options, Reached, RunCounts, Sink,
 };
 use taphonomy::confidence::Confidence;
 use taphonomy::exfat_boot::{BootRegion, ExFatBootSector};
-use taphonomy::exfat_directory::{ExFatPosition, escaped_name};
+use taphonomy::exfat_claims::ConditionTwo;
+use taphonomy::exfat_directory::{DeletedSetOutcome, ExFatPosition, escaped_name};
 use taphonomy::fat_directory::{
     DeletedKind, Directory, Entry, EntryKind, FirstByte, associate, recovered_name,
 };
@@ -272,6 +273,10 @@ struct StdoutSink {
 
     /// Whether this directory's residue heading has printed.
     residue_heading_printed: bool,
+
+    /// Whether this exFAT volume's deleted entry sets heading has printed.
+    /// A new boot region starts a new volume and resets it.
+    exfat_deleted_heading_printed: bool,
 }
 
 impl StdoutSink {
@@ -295,6 +300,15 @@ impl StdoutSink {
             Listing::Orphaned => "orphaned content",
         };
         println!("      {title}");
+    }
+
+    /// Prints the heading of an exFAT volume's deleted sets once, before
+    /// its first line, after the volume's last directory.
+    fn head_exfat_deleted(&mut self) {
+        if !self.exfat_deleted_heading_printed {
+            self.exfat_deleted_heading_printed = true;
+            println!("    deleted entry sets");
+        }
     }
 }
 
@@ -466,7 +480,10 @@ impl Sink for StdoutSink {
             } => {
                 println!("        {:<9} NOT EXTRACTED: {error}", "");
             }
-            Event::ExFatBootRegion(boot) => print_exfat_boot_region(boot),
+            Event::ExFatBootRegion(boot) => {
+                self.exfat_deleted_heading_printed = false;
+                print_exfat_boot_region(boot);
+            }
             Event::ExFatBootRejected(failure) => {
                 println!("    BOOT REGION REJECTED: {failure}");
             }
@@ -526,10 +543,7 @@ impl Sink for StdoutSink {
                     summary.entries_read, summary.files, summary.directories
                 );
                 if summary.unused_file_sets > 0 {
-                    println!(
-                        "      deleted entry sets {}, not examined",
-                        summary.unused_file_sets
-                    );
+                    println!("      deleted entry sets {}", summary.unused_file_sets);
                 }
                 if summary.entries_after_end_marker > 0 {
                     println!(
@@ -561,7 +575,114 @@ impl Sink for StdoutSink {
                 "    {directories_unread} {} not read: more than {bound} were waiting to be read",
                 directories(directories_unread)
             ),
+            // Their gaps are counted, and printed in the summary.
+            Event::ExFatDeletedDirectoriesRead(_) | Event::ExFatClaimsAssessed(_) => {}
+            Event::ExFatDeletedSetDecided { position, outcome } => {
+                self.head_exfat_deleted();
+                println!("{}", exfat_decision_line(position, outcome));
+            }
+            Event::ExFatDeletedSetsNotAssessed { reason, sets } => {
+                self.head_exfat_deleted();
+                println!(
+                    "      NOT ASSESSED: {sets} deleted sets: {}",
+                    phase_two_stopped(reason)
+                );
+            }
         }
+    }
+}
+
+/// One decided deleted exFAT set: its position, its name, and the outcome
+/// (ADR-0022 section 6 and Appendix E). The name is in the column a live
+/// entry's kind takes; a set unusable on re-read has none to show.
+fn exfat_decision_line(position: ExFatPosition, outcome: &DeletedSetOutcome) -> String {
+    use DeletedSetOutcome as O;
+    let (name, text) = match outcome {
+        O::UnusableOnReread { refusal } => (String::new(), format!("NOT ASSESSED: {refusal}")),
+        O::DeletedDirectory { file } => (
+            escaped_name(&file.name),
+            "deleted directory, not decided".to_string(),
+        ),
+        O::NoData { file } => (
+            escaped_name(&file.name),
+            "no content: no cluster and no data".to_string(),
+        ),
+        O::LeftByBound { file } => (
+            escaped_name(&file.name),
+            "NOT ASSESSED: phase 2's work bound reached".to_string(),
+        ),
+        O::ConditionFour { file, reason } => (
+            escaped_name(&file.name),
+            format!("REFUSED, condition 4: {reason}"),
+        ),
+        O::ClusterWithoutData { file } => (
+            escaped_name(&file.name),
+            format!(
+                "REFUSED, condition 4: cluster {} with no data",
+                file.first_cluster
+            ),
+        ),
+        O::ConditionOne { file, cluster } => (
+            escaped_name(&file.name),
+            format!("REFUSED, condition 1: cluster {cluster} is in use"),
+        ),
+        O::ConditionTwo { file, verdict } => (
+            escaped_name(&file.name),
+            format!(
+                "REFUSED, condition 2: {}",
+                match verdict {
+                    ConditionTwo::Later => "a later claim",
+                    ConditionTwo::Unordered => "claims not ordered",
+                    // Never built: a set that holds is not refused. Should
+                    // it reach here, the line must not read as a finding.
+                    ConditionTwo::Holds => "internal error, the verdict holds",
+                }
+            ),
+        ),
+        O::NotAssessed { file } => (
+            escaped_name(&file.name),
+            "NOT ASSESSED: claims bound reached".to_string(),
+        ),
+        O::NoValidData { file } => (
+            escaped_name(&file.name),
+            "REFUSED, condition 3: no valid data".to_string(),
+        ),
+        O::ConditionThreeNotChecked { file } => (
+            escaped_name(&file.name),
+            format!(
+                "cluster {}, {} bytes, conditions 4, 1 and 2 passed, condition 3 not checked",
+                file.first_cluster, file.data_length
+            ),
+        ),
+        // Content is never read yet, so neither occurs; reading it will
+        // write them.
+        O::ZerosOnly { file } => (
+            escaped_name(&file.name),
+            "REFUSED, condition 3: zeros only".to_string(),
+        ),
+        O::Recoverable { file } => (escaped_name(&file.name), "recoverable".to_string()),
+    };
+    format!("      {} {name:<13} {text}", exfat_position(position))
+}
+
+/// Why an exFAT volume's deleted sets were left not assessed.
+fn phase_two_stopped(reason: ExFatPhaseTwoStopped<'_>) -> String {
+    match reason {
+        ExFatPhaseTwoStopped::NoBitmap => "the root holds no allocation bitmap".to_string(),
+        ExFatPhaseTwoStopped::DirectoriesNotReadWhole => {
+            "a directory of the volume was not read whole".to_string()
+        }
+        ExFatPhaseTwoStopped::BitmapNotOpened(error) => {
+            format!("allocation bitmap not followed: {error}")
+        }
+        ExFatPhaseTwoStopped::BitmapNotBelieved(error) => {
+            format!("allocation bitmap not believed: {error}")
+        }
+        ExFatPhaseTwoStopped::DeletedDirectories(error) => {
+            format!("deleted directories not read: {error}")
+        }
+        ExFatPhaseTwoStopped::Claims(error) => format!("claims not followed: {error}"),
+        ExFatPhaseTwoStopped::Decide(error) => format!("deciding stopped: {error}"),
     }
 }
 
@@ -858,7 +979,10 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     print_gap("filesystems not analysed", counts.unsupported());
     print_gap("boot sectors rejected", counts.boot_rejected());
     print_gap("root directories not read", counts.root_unread());
-    print_gap("entries not assessed", counts.not_assessed());
+    print_gap(
+        "entries not assessed",
+        counts.not_assessed() + counts.exfat_not_assessed(),
+    );
     print_gap("entries not extracted", counts.not_extracted());
     print_gap("artifacts not written", counts.not_delivered());
     print_gap("directories not read", counts.directories_unread());
@@ -866,12 +990,17 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     print_gap("orphan searches stopped", counts.orphan_search_stopped());
     print_gap("entry sets not used", counts.exfat_sets_refused());
     print_gap(
-        "deleted sets not examined",
-        counts.exfat_deleted_sets_not_examined(),
-    );
-    print_gap(
         "entries after end marker",
         counts.exfat_end_marker_residue(),
+    );
+    print_gap("deleted sets not usable", counts.exfat_sets_unusable());
+    print_gap(
+        "claimants not followed",
+        counts.exfat_claimants_not_followed(),
+    );
+    print_gap(
+        "deleted directories unread",
+        counts.exfat_deleted_directories_unread(),
     );
 
     // Only `--recover` produces an artifact, so without it the line would
@@ -897,12 +1026,31 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     // Deleted entries that produced no artifact, by what stopped them.
     // `ADR-0013` Appendix C.4: an operator asking whether a file is present
     // needs to know the question went unanswered for part of the volume.
+    // `ADR-0022` section 11: each part sums FAT32's and exFAT's. An exFAT
+    // set that passed is not read whatever `--recover` says, as content is
+    // not yet read for exFAT.
     let mut unrecovered = Vec::new();
-    push_part(&mut unrecovered, counts.refused(), "refused");
-    push_part(&mut unrecovered, counts.not_read(options), "not read");
-    push_part(&mut unrecovered, counts.not_assessed(), "not assessed");
+    push_part(
+        &mut unrecovered,
+        counts.refused() + counts.exfat_refused(),
+        "refused",
+    );
+    push_part(
+        &mut unrecovered,
+        counts.not_read(options) + counts.exfat_passed(),
+        "not read",
+    );
+    push_part(
+        &mut unrecovered,
+        counts.not_assessed() + counts.exfat_not_assessed(),
+        "not assessed",
+    );
     push_part(&mut unrecovered, counts.not_extracted(), "not extracted");
-    push_part(&mut unrecovered, counts.empty(), "size zero");
+    push_part(
+        &mut unrecovered,
+        counts.empty() + counts.exfat_no_data(),
+        "size zero",
+    );
     push_part(
         &mut unrecovered,
         counts.reserved_cluster(),
@@ -1152,5 +1300,121 @@ mod tests {
         assert_eq!(directories(1), "directory");
         assert_eq!(directories(0), "directories");
         assert_eq!(directories(2), "directories");
+    }
+
+    /// Every decided set's line: the position and name columns, then the
+    /// outcome in the words the operator reads (ADR-0022 Appendix E).
+    #[test]
+    fn each_decided_exfat_set_prints_its_outcome_in_its_own_words() {
+        use DeletedSetOutcome as O;
+        use taphonomy::exfat_directory::{ExFatContentError, ExFatFile, SetRefusal};
+
+        let file = || ExFatFile {
+            name: "f.bin".encode_utf16().collect(),
+            attributes: 0x20,
+            first_cluster: 30,
+            data_length: 1024,
+            valid_data_length: 1024,
+            no_fat_chain: false,
+        };
+        let reason = ExFatContentError::ChainEndsEarly {
+            cluster: 30,
+            needed: 2,
+        };
+        let refusal = SetRefusal::ChangedSinceWalk;
+        let cases = [
+            (
+                O::UnusableOnReread {
+                    refusal: refusal.clone(),
+                },
+                format!("{:<13} NOT ASSESSED: {refusal}", ""),
+            ),
+            (
+                O::DeletedDirectory { file: file() },
+                "f.bin         deleted directory, not decided".to_string(),
+            ),
+            (
+                O::NoData { file: file() },
+                "f.bin         no content: no cluster and no data".to_string(),
+            ),
+            (
+                O::LeftByBound { file: file() },
+                "f.bin         NOT ASSESSED: phase 2's work bound reached".to_string(),
+            ),
+            (
+                O::ConditionFour {
+                    file: file(),
+                    reason: ExFatContentError::ChainEndsEarly {
+                        cluster: 30,
+                        needed: 2,
+                    },
+                },
+                format!("f.bin         REFUSED, condition 4: {reason}"),
+            ),
+            (
+                O::ClusterWithoutData { file: file() },
+                "f.bin         REFUSED, condition 4: cluster 30 with no data".to_string(),
+            ),
+            (
+                O::ConditionOne {
+                    file: file(),
+                    cluster: 31,
+                },
+                "f.bin         REFUSED, condition 1: cluster 31 is in use".to_string(),
+            ),
+            (
+                O::ConditionTwo {
+                    file: file(),
+                    verdict: ConditionTwo::Later,
+                },
+                "f.bin         REFUSED, condition 2: a later claim".to_string(),
+            ),
+            (
+                O::ConditionTwo {
+                    file: file(),
+                    verdict: ConditionTwo::Unordered,
+                },
+                "f.bin         REFUSED, condition 2: claims not ordered".to_string(),
+            ),
+            (
+                O::ConditionTwo {
+                    file: file(),
+                    verdict: ConditionTwo::Holds,
+                },
+                "f.bin         REFUSED, condition 2: internal error, the verdict holds".to_string(),
+            ),
+            (
+                O::NotAssessed { file: file() },
+                "f.bin         NOT ASSESSED: claims bound reached".to_string(),
+            ),
+            (
+                O::NoValidData { file: file() },
+                "f.bin         REFUSED, condition 3: no valid data".to_string(),
+            ),
+            (
+                O::ConditionThreeNotChecked { file: file() },
+                "f.bin         cluster 30, 1024 bytes, conditions 4, 1 and 2 passed, \
+                 condition 3 not checked"
+                    .to_string(),
+            ),
+        ];
+        for (outcome, text) in cases {
+            assert_eq!(
+                exfat_decision_line(FITS, &outcome),
+                format!("      c5 s0{} {text}", " ".repeat(15))
+            );
+        }
+    }
+
+    #[test]
+    fn phase_2_left_without_a_bitmap_or_a_directory_read_whole_says_so() {
+        assert_eq!(
+            phase_two_stopped(ExFatPhaseTwoStopped::NoBitmap),
+            "the root holds no allocation bitmap"
+        );
+        assert_eq!(
+            phase_two_stopped(ExFatPhaseTwoStopped::DirectoriesNotReadWhole),
+            "a directory of the volume was not read whole"
+        );
     }
 }

@@ -12,10 +12,13 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use crate::Error;
 use crate::evidence::EvidenceReader;
 use crate::exfat_boot::{ExFatBootFailure, ExFatBootSector, parse_boot_region};
 use crate::exfat_directory::{
-    DirItem, DirectorySource, DirectorySummary, ExFatDirectoryError, ExFatReader, Limits,
+    DeletedDirectoriesRead, DeletedSetError, DeletedSetOutcome, DirItem, DirectorySource,
+    DirectorySummary, ExFatBitmapEntry, ExFatBitmapError, ExFatDirectoryError, ExFatReader,
+    ExFatStructureError, Limits,
 };
 use crate::filesystem::{UnknownReason, VolumeExtent};
 use crate::partition::MbrPartition;
@@ -44,6 +47,47 @@ pub enum ExFatNotRead<'a> {
 
     /// Reading it failed, wholly or part way.
     Error(&'a ExFatDirectoryError),
+}
+
+/// Why phase 2 did not run on a volume, or stopped part way (ADR-0022
+/// section 5, S6-1 to S6-3). The deleted sets it had not decided are not
+/// assessed.
+#[derive(Clone, Copy, Debug)]
+pub enum ExFatPhaseTwoStopped<'a> {
+    /// The root held no allocation bitmap entry, so condition 1 cannot be
+    /// shown for any set.
+    NoBitmap,
+
+    /// A live directory of the volume was not read whole, so the bitmap
+    /// check would cover only part of what is in use (S6-1).
+    DirectoriesNotReadWhole,
+
+    /// The bitmap's chain could not be followed (ADR-0022 Decision E).
+    BitmapNotOpened(&'a ExFatBitmapError),
+
+    /// The bitmap check failed: the bitmap does not describe the volume
+    /// (ADR-0022 Appendix A, S6-2).
+    BitmapNotBelieved(&'a ExFatStructureError),
+
+    /// Reading the deleted directories failed (S6-3).
+    DeletedDirectories(&'a ExFatDirectoryError),
+
+    /// Following the claims failed (S6-3).
+    Claims(&'a Error),
+
+    /// Deciding a set failed: it and every later one are left (S6-3).
+    Decide(&'a DeletedSetError),
+}
+
+/// What the live walk of one volume gathered for phase 2.
+#[derive(Default)]
+struct VolumeWalk {
+    /// The root's allocation bitmap entry.
+    bitmap: Option<ExFatBitmapEntry>,
+
+    /// Unused File entries the walk met: every deleted set of the volume
+    /// it saw, usable or not.
+    deleted_sets: usize,
 }
 
 /// A directory's name in the path of the directory being read.
@@ -161,12 +205,13 @@ fn report_boot_failure(
     }
 }
 
-/// Reads every directory reachable from the root of a volume.
+/// Reads every directory reachable from the root of a volume, then decides
+/// its deleted sets.
 ///
 /// Breadth first, each directory once. `limits` bounds the work: a directory
 /// beyond [`MAX_DEPTH`] is not read, and the volume's cluster cap, where it is
 /// reached, leaves the directories not yet read counted and not read, never a
-/// hang.
+/// hang. Phase 2 follows the walk ([`report_deleted_sets`]).
 fn report_volume<R: EvidenceReader>(
     evidence: &mut R,
     boot: &ExFatBootSector,
@@ -183,6 +228,11 @@ fn report_volume<R: EvidenceReader>(
     // Directories named and never queued, because queueing them would hold
     // more directories than `limits.queued_directories` allows.
     let mut unqueued = 0usize;
+
+    // What phase 2 needs from the walk, and whether every live directory of
+    // this volume was read whole (S6-1): none was counted as unread.
+    let mut walk = VolumeWalk::default();
+    let unread_before = counts.directories_unread;
 
     let root = Rc::new(PathNode {
         parent: None,
@@ -201,6 +251,7 @@ fn report_volume<R: EvidenceReader>(
         0,
         &mut pending,
         &mut unqueued,
+        &mut walk,
         counts,
         sink,
     ) {
@@ -213,9 +264,16 @@ fn report_volume<R: EvidenceReader>(
         }
         Err(error) => {
             // The listing already printed stands, and the volume is not
-            // counted as analysed.
+            // counted as analysed. The deleted sets the root showed before
+            // it failed are not assessed: it was not read whole (S6-1).
             sink.record(Event::ExFatRootDirectoryUnread(&error));
             counts.root_unread += 1;
+            leave_not_assessed(
+                ExFatPhaseTwoStopped::DirectoriesNotReadWhole,
+                walk.deleted_sets,
+                counts,
+                sink,
+            );
             return;
         }
     }
@@ -246,6 +304,7 @@ fn report_volume<R: EvidenceReader>(
             next.depth,
             &mut pending,
             &mut unqueued,
+            &mut walk,
             counts,
             sink,
         ) {
@@ -283,6 +342,131 @@ fn report_volume<R: EvidenceReader>(
             directories_unread: unqueued,
         });
     }
+
+    let every_directory_read = counts.directories_unread == unread_before;
+    report_deleted_sets(&mut reader, &walk, every_directory_read, counts, sink);
+}
+
+/// Phase 2 (ADR-0022 sections 5 and 6, Appendix E, S6-1 to S6-3): checks
+/// the bitmap, reads the deleted directories, follows the claims, and
+/// decides every recorded deleted set in the order the walk recorded them.
+/// Content is never read here. Where phase 2 does not run or stops, every
+/// set not yet decided is counted not assessed, with one event saying why.
+fn report_deleted_sets<R: EvidenceReader>(
+    reader: &mut ExFatReader<'_, R>,
+    walk: &VolumeWalk,
+    every_directory_read: bool,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    use ExFatPhaseTwoStopped as Stopped;
+
+    // Until the claims are followed, every set the walk met is left: the
+    // records do not yet say which were unusable or not recorded.
+    let all = walk.deleted_sets;
+    let Some(entry) = walk.bitmap else {
+        return leave_not_assessed(Stopped::NoBitmap, all, counts, sink);
+    };
+    if !every_directory_read {
+        return leave_not_assessed(Stopped::DirectoriesNotReadWhole, all, counts, sink);
+    }
+    let mut bitmap = match reader.open_bitmap(&entry) {
+        Ok(bitmap) => bitmap,
+        Err(error) => {
+            return leave_not_assessed(Stopped::BitmapNotOpened(&error), all, counts, sink);
+        }
+    };
+    if let Err(error) = reader.check_bitmap(&mut bitmap) {
+        return leave_not_assessed(Stopped::BitmapNotBelieved(&error), all, counts, sink);
+    }
+
+    match reader.read_deleted_directories(&mut bitmap) {
+        Ok(read) => {
+            let (unread, unseen) = deleted_directory_gaps(&read);
+            counts.exfat_deleted_directories_unread += unread;
+            counts.exfat_claimants_not_followed += unseen;
+            sink.record(Event::ExFatDeletedDirectoriesRead(&read));
+        }
+        Err(error) => {
+            return leave_not_assessed(Stopped::DeletedDirectories(&error), all, counts, sink);
+        }
+    }
+
+    let claims = match reader.assess_claims() {
+        Ok(claims) => claims,
+        Err(error) => return leave_not_assessed(Stopped::Claims(&error), all, counts, sink),
+    };
+    counts.exfat_sets_unusable += claims.sets_unusable as usize;
+    counts.exfat_not_assessed += claims.sets_unrecorded as usize;
+    counts.exfat_claimants_not_followed += (claims.unrecorded + claims.orphans_unrecorded) as usize;
+    sink.record(Event::ExFatClaimsAssessed(&claims));
+
+    let recorded = reader.deleted_sets_recorded();
+    for index in 0..recorded {
+        match reader.decide_deleted_set(index, &mut bitmap, &claims, false) {
+            Ok(decision) => {
+                count_outcome(&decision.outcome, counts);
+                sink.record(Event::ExFatDeletedSetDecided {
+                    position: decision.position,
+                    outcome: &decision.outcome,
+                });
+            }
+            Err(error) => {
+                let left = recorded - index;
+                return leave_not_assessed(Stopped::Decide(&error), left, counts, sink);
+            }
+        }
+    }
+}
+
+/// The gaps a reading of the deleted directories leaves (ADR-0022 Decision
+/// K, Appendix D): the deleted directories not read whole, each kind of
+/// reason summed, and the sets inside whose claims were not recorded.
+fn deleted_directory_gaps(read: &DeletedDirectoriesRead) -> (usize, usize) {
+    let unread = read.not_read_out_of_range
+        + read.not_read_malformed
+        + read.not_read_in_use
+        + read.not_read_before
+        + read.not_read_bound
+        + read.partly_read;
+    let unseen = read.sets_inside_unusable + read.sets_inside_unrecorded;
+    (unread as usize, unseen as usize)
+}
+
+/// Counts `sets` deleted sets not assessed for `reason`, and reports it
+/// where there are any.
+fn leave_not_assessed(
+    reason: ExFatPhaseTwoStopped<'_>,
+    sets: usize,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    if sets > 0 {
+        counts.exfat_not_assessed += sets;
+        sink.record(Event::ExFatDeletedSetsNotAssessed { reason, sets });
+    }
+}
+
+/// Counts one decided set as a finding or a gap (ADR-0022 section 11).
+fn count_outcome(outcome: &DeletedSetOutcome, counts: &mut RunCounts) {
+    use DeletedSetOutcome as O;
+    let count = match outcome {
+        O::UnusableOnReread { .. } | O::LeftByBound { .. } | O::NotAssessed { .. } => {
+            &mut counts.exfat_not_assessed
+        }
+        O::DeletedDirectory { .. } => &mut counts.exfat_deleted_directories,
+        O::NoData { .. } => &mut counts.exfat_no_data,
+        O::ConditionFour { .. } | O::ClusterWithoutData { .. } => {
+            &mut counts.exfat_refused_condition_4
+        }
+        O::ConditionOne { .. } => &mut counts.exfat_refused_condition_1,
+        O::ConditionTwo { .. } => &mut counts.exfat_refused_condition_2,
+        O::NoValidData { .. } | O::ZerosOnly { .. } => &mut counts.exfat_refused_condition_3,
+        // Content is never read here, so `Recoverable` cannot occur; it is
+        // counted with the sets that passed until reading content splits it.
+        O::ConditionThreeNotChecked { .. } | O::Recoverable { .. } => &mut counts.exfat_passed,
+    };
+    *count += 1;
 }
 
 /// Reads one directory, reporting what it holds and queueing the directories
@@ -295,6 +479,7 @@ fn read_listing<R: EvidenceReader>(
     depth: usize,
     pending: &mut VecDeque<Pending>,
     dropped: &mut usize,
+    walk: &mut VolumeWalk,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) -> Result<DirectorySummary, ExFatDirectoryError> {
@@ -330,13 +515,17 @@ fn read_listing<R: EvidenceReader>(
             sink.record(Event::ExFatVolumeLabel { position, label });
         }
         DirItem::Bitmap { position, bitmap } => {
+            // The root's is the volume's; the reader refuses a second.
+            if depth == 0 {
+                walk.bitmap = Some(*bitmap);
+            }
             sink.record(Event::ExFatBitmap { position, bitmap });
         }
         DirItem::Refused { position, refusal } => {
             counts.exfat_sets_refused += 1;
             sink.record(Event::ExFatSetRefused { position, refusal });
         }
-        DirItem::UnusedFileSet { .. } => counts.exfat_deleted_sets_not_examined += 1,
+        DirItem::UnusedFileSet { .. } => walk.deleted_sets += 1,
         DirItem::AfterEndMarker { .. } => counts.exfat_end_marker_residue += 1,
     })
 }
@@ -349,7 +538,10 @@ mod tests {
     use crate::exfat_boot::tests as boot_tests;
     use crate::exfat_boot::{BootRegion, ExFatError};
     use crate::exfat_directory::escaped_name;
-    use crate::exfat_directory::tests::{Vol, directory, extent, file, seal};
+    use crate::exfat_directory::tests::{
+        Vol, at_times, deleted, directory, extent, file, file_set, mark, orphan_stream, seal,
+        standard_root, structured, utf16, with_root,
+    };
 
     /// Each event as one line of text, in order, so a test reads as a
     /// transcript. Only the exFAT events say anything.
@@ -383,9 +575,55 @@ mod tests {
                 Event::ExFatIdentifiedFromBackup { .. } => "exfat from backup".to_string(),
                 Event::ExFatTexFat(_) => "texfat".to_string(),
                 Event::ExFatBootRejected(_) => "boot rejected".to_string(),
+                Event::ExFatDeletedSetDecided { position, outcome } => format!(
+                    "decided c{} s{} {}",
+                    position.cluster,
+                    position.slot,
+                    outcome_kind(outcome)
+                ),
+                Event::ExFatDeletedSetsNotAssessed { reason, sets } => {
+                    format!("not assessed {sets}: {}", stopped_kind(reason))
+                }
+                Event::ExFatDeletedDirectoriesRead(read) => {
+                    format!("deleted directories read {}", read.directories_read)
+                }
+                Event::ExFatClaimsAssessed(claims) => {
+                    format!("claims for {} sets", claims.verdicts.len())
+                }
                 _ => "other".to_string(),
             };
             self.0.push(line);
+        }
+    }
+
+    fn outcome_kind(outcome: &DeletedSetOutcome) -> &'static str {
+        use DeletedSetOutcome as O;
+        match outcome {
+            O::UnusableOnReread { .. } => "unusable on re-read",
+            O::DeletedDirectory { .. } => "deleted directory",
+            O::NoData { .. } => "no data",
+            O::LeftByBound { .. } => "left by bound",
+            O::ConditionFour { .. } => "condition 4",
+            O::ClusterWithoutData { .. } => "condition 4 cluster without data",
+            O::ConditionOne { .. } => "condition 1",
+            O::ConditionTwo { .. } => "condition 2",
+            O::NotAssessed { .. } => "not assessed",
+            O::NoValidData { .. } => "condition 3 no valid data",
+            O::ConditionThreeNotChecked { .. } => "passed",
+            O::ZerosOnly { .. } => "condition 3 zeros",
+            O::Recoverable { .. } => "recoverable",
+        }
+    }
+
+    fn stopped_kind(reason: ExFatPhaseTwoStopped<'_>) -> &'static str {
+        match reason {
+            ExFatPhaseTwoStopped::NoBitmap => "no bitmap",
+            ExFatPhaseTwoStopped::DirectoriesNotReadWhole => "not read whole",
+            ExFatPhaseTwoStopped::BitmapNotOpened(_) => "bitmap not opened",
+            ExFatPhaseTwoStopped::BitmapNotBelieved(_) => "bitmap not believed",
+            ExFatPhaseTwoStopped::DeletedDirectories(_) => "deleted directories",
+            ExFatPhaseTwoStopped::Claims(_) => "claims",
+            ExFatPhaseTwoStopped::Decide(_) => "decide",
         }
     }
 
@@ -441,7 +679,7 @@ mod tests {
         vol.put(2, 6, &file("a", 0, 0));
 
         let (counts, _) = analyse(&mut vol, Limits::DEFAULT);
-        assert_eq!(counts.exfat_deleted_sets_not_examined(), 2);
+        assert_eq!(counts.exfat_not_assessed(), 2);
         assert_eq!(counts.volumes_analysed(), 1);
         assert_eq!(counts.coverage(), Coverage::Incomplete);
     }
@@ -800,5 +1038,418 @@ mod tests {
 
         let (counts, _) = analyse(&mut vol, Limits::DEFAULT);
         assert_eq!(counts.exfat_sets_refused(), 0);
+    }
+
+    // --- phase 2: every deleted set decided (ADR-0022 Appendix E) ------------
+
+    /// The decided lines of a transcript, without their prefix.
+    fn decided(transcript: &[String]) -> Vec<&str> {
+        transcript
+            .iter()
+            .filter_map(|l| l.strip_prefix("decided "))
+            .collect()
+    }
+
+    /// One deleted set of each outcome a volume shows without its content
+    /// read, in the root after [`with_root`]'s five entries: slots 5 to 13
+    /// of cluster 2, a set straddling into cluster 5, then slots 1 to 15 of
+    /// cluster 5. Findings only, so the volume is complete.
+    #[test]
+    fn each_decided_set_is_counted_in_its_field_and_reported() {
+        let unwritten = file_set(&utf16("unwritten"), 0x20, 33, 0, 512, false);
+        let mut extra = deleted(file("empty", 0, 0));
+        extra.extend(deleted(file("inuse", 30, 512)));
+        extra.extend(deleted(file("short", 31, 1024)));
+        extra.extend(deleted(file("odd", 32, 0)));
+        extra.extend(deleted(unwritten));
+        extra.extend(deleted(file("ok", 34, 512)));
+        extra.extend(deleted(at_times(file("old", 35, 512), 0, 0, 0x90)));
+        extra.extend(deleted(at_times(file("new", 35, 512), 8, 8, 0x90)));
+        extra.extend(deleted(directory("gone", 20, 1)));
+        let mut vol = with_root(&extra);
+        for c in [30, 31, 32, 33, 34, 35, 20] {
+            vol.chain(&[c]);
+        }
+        mark(&mut vol, &[3], &[30]);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            decided(&transcript),
+            [
+                "c2 s5 no data",
+                "c2 s8 condition 1",
+                "c2 s11 condition 4",
+                "c2 s14 condition 4 cluster without data",
+                "c5 s1 condition 3 no valid data",
+                "c5 s4 passed",
+                "c5 s7 condition 2",
+                "c5 s10 passed",
+                "c5 s13 deleted directory",
+            ]
+        );
+        assert_eq!(counts.exfat_no_data(), 1);
+        assert_eq!(counts.exfat_refused_condition_1(), 1);
+        assert_eq!(counts.exfat_refused_condition_4(), 2);
+        assert_eq!(counts.exfat_refused_condition_3(), 1);
+        assert_eq!(counts.exfat_refused_condition_2(), 1);
+        assert_eq!(counts.exfat_refused(), 5);
+        assert_eq!(counts.exfat_passed(), 2);
+        assert_eq!(counts.exfat_deleted_directories(), 1);
+        assert_eq!(counts.exfat_not_assessed(), 0);
+        assert!(transcript.contains(&"deleted directories read 1".to_string()));
+        assert!(transcript.contains(&"claims for 9 sets".to_string()));
+        assert_eq!(counts.coverage(), Coverage::Complete);
+    }
+
+    /// Room for one claimed run: the second set's claim is unseen, so it is
+    /// not assessed, and the claim is a gap of its own.
+    #[test]
+    fn a_set_a_claims_bound_left_unseen_is_not_assessed_and_its_claim_a_gap() {
+        let mut extra = deleted(file("first", 30, 512));
+        extra.extend(deleted(file("second", 40, 512)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30]);
+        vol.chain(&[40]);
+        let limits = Limits {
+            claimed_runs: 1,
+            ..Limits::DEFAULT
+        };
+
+        let (counts, transcript) = analyse(&mut vol, limits);
+        assert_eq!(decided(&transcript), ["c2 s5 passed", "c2 s8 not assessed"]);
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(counts.exfat_claimants_not_followed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// Room for one claimant: the second set is not recorded, so not
+    /// assessed, and the orphan's claim is unseen.
+    #[test]
+    fn sets_and_orphans_past_the_walks_bound_are_gaps() {
+        let mut extra = deleted(file("first", 30, 512));
+        extra.extend(deleted(file("second", 40, 512)));
+        extra.push(orphan_stream(false, 50, 512));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30]);
+        vol.chain(&[40]);
+        let limits = Limits {
+            deleted_sets: 1,
+            ..Limits::DEFAULT
+        };
+
+        let (counts, transcript) = analyse(&mut vol, limits);
+        assert_eq!(decided(&transcript), ["c2 s5 passed"]);
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(counts.exfat_claimants_not_followed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// A deleted set whose checksum is wrong is not usable: never decided,
+    /// and counted on its own line.
+    #[test]
+    fn a_deleted_set_the_walk_found_unusable_is_a_gap() {
+        let mut bad = file("bad", 30, 512);
+        bad[2][2] ^= 1;
+        let mut vol = with_root(&deleted(bad));
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert!(decided(&transcript).is_empty(), "{transcript:?}");
+        assert_eq!(counts.exfat_sets_unusable(), 1);
+        assert_eq!(counts.exfat_not_assessed(), 0);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// `busy`'s cluster is in use, so it is not read: a finding, and the
+    /// claims it holds unseen, the volume's only gap.
+    #[test]
+    fn a_deleted_directory_not_read_is_a_gap() {
+        let mut vol = with_root(&deleted(directory("busy", 20, 1)));
+        vol.chain(&[20]);
+        mark(&mut vol, &[3], &[20]);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(decided(&transcript), ["c2 s5 deleted directory"]);
+        assert_eq!(counts.exfat_deleted_directories(), 1);
+        assert_eq!(counts.exfat_deleted_directories_unread(), 1);
+        assert_eq!(counts.exfat_claimants_not_followed(), 0);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// `full` is read and holds a set that is not usable: a finding, and
+    /// that set's claim unseen, the volume's only gap.
+    #[test]
+    fn a_set_inside_a_deleted_directory_that_is_not_usable_is_a_gap() {
+        let mut vol = with_root(&deleted(directory("full", 21, 1)));
+        vol.chain(&[21]);
+        let mut bad = file("bad", 30, 512);
+        bad[2][2] ^= 1;
+        vol.put(21, 0, &deleted(bad));
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(decided(&transcript), ["c2 s5 deleted directory"]);
+        assert_eq!(counts.exfat_deleted_directories(), 1);
+        assert_eq!(counts.exfat_deleted_directories_unread(), 0);
+        assert_eq!(counts.exfat_claimants_not_followed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// The synthetic volume's 200 clusters give phase 2 a bound of 800
+    /// cluster steps. Three chains of 150, content not read: each is
+    /// charged 300, and the third does not fit.
+    #[test]
+    fn a_set_past_phase_2s_work_bound_is_not_assessed() {
+        let mut extra = deleted(file("a", 40, 150 * 512));
+        extra.extend(deleted(file("b", 40, 150 * 512)));
+        extra.extend(deleted(file("c", 40, 150 * 512)));
+        let mut vol = with_root(&extra);
+        vol.chain(&(40..190).collect::<Vec<u32>>());
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            decided(&transcript).last().copied(),
+            Some("c2 s11 left by bound")
+        );
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// Evidence that, once `arm` has been read, writes `write` and fails
+    /// every later read beginning inside `fail`: a volume that changes, or
+    /// fails, after the walk.
+    struct Tripwire<'a> {
+        image: &'a mut MemoryImage,
+        arm: u64,
+        armed: bool,
+        write: Option<(u64, Vec<u8>)>,
+        fail: Option<std::ops::Range<u64>>,
+    }
+
+    impl EvidenceReader for Tripwire<'_> {
+        fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+            if self.armed && self.fail.as_ref().is_some_and(|r| r.contains(&offset)) {
+                return Err(Error::from_io(
+                    std::path::Path::new("<memory>"),
+                    std::io::Error::other("the evidence failed"),
+                ));
+            }
+            let read = self.image.read_exact_at(offset, buf);
+            if !self.armed && offset == self.arm {
+                self.armed = true;
+                if let Some((at, bytes)) = self.write.take() {
+                    self.image.write(at, &bytes);
+                }
+            }
+            read
+        }
+    }
+
+    /// Analyses through a [`Tripwire`] armed by the first read of the
+    /// bitmap's cluster, 3: the bitmap check, phase 2's first read. The walk
+    /// never reads it.
+    fn analyse_tripped(
+        vol: &mut Vol,
+        write: Option<(u64, Vec<u8>)>,
+        fail: Option<std::ops::Range<u64>>,
+    ) -> (RunCounts, Vec<String>) {
+        let mut counts = RunCounts::default();
+        let mut transcript = Transcript(Vec::new());
+        let boot = vol.boot.clone();
+        let mut tripwire = Tripwire {
+            image: &mut vol.image,
+            arm: Vol::cluster_offset(3),
+            armed: false,
+            write,
+            fail,
+        };
+        report_volume(
+            &mut tripwire,
+            &boot,
+            extent(),
+            Limits::DEFAULT,
+            &mut counts,
+            &mut transcript,
+        );
+        (counts, transcript.0)
+    }
+
+    /// A byte of the set's name changes after the walk: read again, its
+    /// checksum is wrong.
+    #[test]
+    fn a_set_unusable_on_re_read_is_not_assessed() {
+        let mut vol = with_root(&deleted(file("gone", 30, 512)));
+        vol.chain(&[30]);
+        // Slot 7 is the set's name entry; byte 2 its first name unit.
+        let at = Vol::cluster_offset(2) + 7 * 32 + 2;
+
+        let (counts, transcript) = analyse_tripped(&mut vol, Some((at, vec![b'G'])), None);
+        assert_eq!(decided(&transcript), ["c2 s5 unusable on re-read"]);
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// The root's second cluster fails once phase 2 has begun. The fourth
+    /// set straddles into it: the three before are decided, it and the
+    /// fifth are not assessed (S6-3).
+    #[test]
+    fn an_error_deciding_a_set_stops_phase_2_and_leaves_the_rest_not_assessed() {
+        let mut extra = Vec::new();
+        for (name, cluster) in [("a", 30), ("b", 31), ("c", 32), ("d", 33), ("e", 34)] {
+            extra.extend(deleted(file(name, cluster, 512)));
+        }
+        let mut vol = with_root(&extra);
+        for c in 30..35 {
+            vol.chain(&[c]);
+        }
+        let second = Vol::cluster_offset(5);
+
+        let (counts, transcript) = analyse_tripped(&mut vol, None, Some(second..second + 512));
+        assert_eq!(
+            decided(&transcript),
+            ["c2 s5 passed", "c2 s8 passed", "c2 s11 passed"]
+        );
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 2: decide")
+        );
+        assert_eq!(counts.exfat_passed(), 3);
+        assert_eq!(counts.exfat_not_assessed(), 2);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// No room in the queue for the root's directory `D`: it is not read,
+    /// so the bitmap check would cover only part of what is in use, and
+    /// phase 2 does not run (S6-1).
+    #[test]
+    fn a_live_directory_not_read_whole_leaves_every_deleted_set_not_assessed() {
+        let mut extra = deleted(file("a", 30, 512));
+        extra.extend(deleted(file("b", 0, 0)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30]);
+        let limits = Limits {
+            queued_directories: 0,
+            ..Limits::DEFAULT
+        };
+
+        let (counts, transcript) = analyse(&mut vol, limits);
+        assert!(decided(&transcript).is_empty(), "{transcript:?}");
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 2: not read whole")
+        );
+        assert!(!transcript.iter().any(|l| l.starts_with("claims")));
+        assert_eq!(counts.exfat_not_assessed(), 2);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// The bitmap marks no structure cluster but 7 in use, so it is not
+    /// believed, and phase 2 does not run (S6-2).
+    #[test]
+    fn a_bitmap_not_believed_leaves_every_deleted_set_not_assessed() {
+        let mut entries = standard_root();
+        entries.extend(deleted(file("a", 0, 0)));
+        let mut vol = structured(&entries);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert!(decided(&transcript).is_empty(), "{transcript:?}");
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 1: bitmap not believed")
+        );
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// Each reason a deleted directory was not read whole counts once, and
+    /// each kind of set inside whose claim was not recorded: distinct powers
+    /// of two show every field summed, and nothing else.
+    #[test]
+    fn every_deleted_directory_not_read_whole_and_every_unseen_set_inside_is_a_gap() {
+        let read = DeletedDirectoriesRead {
+            directories_read: 1 << 12,
+            not_read_out_of_range: 1,
+            not_read_malformed: 2,
+            not_read_in_use: 4,
+            not_read_before: 8,
+            not_read_bound: 16,
+            partly_read: 32,
+            clusters_read: 1 << 13,
+            sets_inside_recorded: 1 << 14,
+            sets_inside_unusable: 64,
+            sets_inside_unrecorded: 128,
+        };
+        assert_eq!(deleted_directory_gaps(&read), (63, 192));
+    }
+
+    /// The bitmap's cluster has no chain in the FAT, so the bitmap cannot
+    /// be followed and phase 2 does not run (ADR-0022 Decision E).
+    #[test]
+    fn a_bitmap_that_cannot_be_followed_leaves_every_deleted_set_not_assessed() {
+        let mut vol = with_root(&deleted(file("a", 0, 0)));
+        vol.fat(3, 0);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 1: bitmap not opened")
+        );
+        assert_eq!(counts.exfat_not_assessed(), 1);
+    }
+
+    /// The deleted directory `gone` fails as it is read: phase 2 stops, and
+    /// both deleted sets the walk met are not assessed (S6-3).
+    #[test]
+    fn an_error_reading_deleted_directories_stops_phase_2() {
+        let mut extra = deleted(directory("gone", 20, 1));
+        extra.extend(deleted(file("a", 0, 0)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[20]);
+        let gone = Vol::cluster_offset(20);
+
+        let (counts, transcript) = analyse_tripped(&mut vol, None, Some(gone..gone + 512));
+        assert!(decided(&transcript).is_empty(), "{transcript:?}");
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 2: deleted directories")
+        );
+        assert_eq!(counts.exfat_not_assessed(), 2);
+    }
+
+    /// The set's chain is 150, 151, whose FAT entries lie in the FAT's
+    /// second sector (bytes 512 to 1023 of the FAT at sector 24), which
+    /// following the claims is the first to read: it fails, and phase 2
+    /// stops (S6-3).
+    #[test]
+    fn an_error_following_the_claims_stops_phase_2() {
+        let mut vol = with_root(&deleted(file("far", 150, 1024)));
+        vol.chain(&[150, 151]);
+        let second = 24 * 512 + 512;
+
+        let (counts, transcript) = analyse_tripped(&mut vol, None, Some(second..second + 512));
+        assert!(decided(&transcript).is_empty(), "{transcript:?}");
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 1: claims")
+        );
+        assert_eq!(counts.exfat_not_assessed(), 1);
+    }
+
+    /// The root holds a deleted set, then an entry that stops it being
+    /// read: the set it showed is not assessed, beside the root's own gap.
+    #[test]
+    fn deleted_sets_of_a_root_not_read_whole_are_not_assessed() {
+        let mut vol = Vol::new();
+        vol.chain(&[2]);
+        vol.put(2, 0, &deleted(file("gone", 0, 0)));
+        let mut critical = [0u8; 32];
+        critical[0] = 0x84;
+        vol.put(2, 3, &[critical]);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(counts.root_unread(), 1);
+        assert_eq!(counts.exfat_not_assessed(), 1);
+        assert_eq!(
+            transcript.last().map(String::as_str),
+            Some("not assessed 1: not read whole")
+        );
     }
 }

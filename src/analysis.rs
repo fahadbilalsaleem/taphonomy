@@ -23,7 +23,8 @@ use crate::Error;
 use crate::evidence::EvidenceReader;
 use crate::exfat_boot::{BootRegion, ExFatBootFailure, ExFatBootSector};
 use crate::exfat_directory::{
-    DirectorySummary, ExFatBitmapEntry, ExFatDirectoryError, ExFatFile, ExFatPosition, SetRefusal,
+    ClaimsAssessed, DeletedDirectoriesRead, DeletedSetOutcome, DirectorySummary, ExFatBitmapEntry,
+    ExFatDirectoryError, ExFatFile, ExFatPosition, SetRefusal,
 };
 use crate::fat_directory::{
     DeletedDirectory, DeletedDirectoryRefusal, DeletedKind, Directory, DirectoryError, Entry,
@@ -45,7 +46,7 @@ use crate::validation::{Outcome, Validation, validate};
 
 pub mod exfat;
 
-use exfat::{ExFatNotRead, ExFatReached};
+use exfat::{ExFatNotRead, ExFatPhaseTwoStopped, ExFatReached};
 
 /// What the operator asked for.
 ///
@@ -360,6 +361,32 @@ pub enum Event<'a> {
         bound: usize,
         directories_unread: usize,
     },
+
+    /// An exFAT volume's deleted directories, read for the claims of the
+    /// sets inside them, counted. ADR-0022 Decision K and Appendix D. Once
+    /// per volume where phase 2 read them.
+    ExFatDeletedDirectoriesRead(&'a DeletedDirectoriesRead),
+
+    /// The claims followed on an exFAT volume for condition 2, and what the
+    /// bounds left unseen. ADR-0022 section 5. Once per volume where phase 2
+    /// followed them.
+    ExFatClaimsAssessed(&'a ClaimsAssessed),
+
+    /// One recorded deleted exFAT set, decided. ADR-0022 section 6 and
+    /// Appendix E. Its name is in the outcome, except where it was unusable
+    /// on re-read; content is not read.
+    ExFatDeletedSetDecided {
+        position: ExFatPosition,
+        outcome: &'a DeletedSetOutcome,
+    },
+
+    /// Phase 2 did not run on an exFAT volume, or stopped part way, and
+    /// left `sets` deleted sets not assessed, for `reason`. S6-1 to S6-3.
+    /// Recorded only where `sets` is above zero.
+    ExFatDeletedSetsNotAssessed {
+        reason: ExFatPhaseTwoStopped<'a>,
+        sets: usize,
+    },
 }
 
 /// Receives the events of one run, in the order they happened.
@@ -498,15 +525,57 @@ pub struct RunCounts {
     /// Decision C.
     exfat_sets_refused: usize,
 
-    /// An unused exFAT File entry: a deleted entry set, which this tool does
-    /// not examine. One per set, so a run cannot report an exFAT volume
-    /// completely analysed while skipping them. `SAFETY.md` section 12.
-    exfat_deleted_sets_not_examined: usize,
-
     /// An exFAT directory with entries of a type other than zero after its
     /// end marker, which the specification says it does not have. One per
     /// directory. The entries are counted and not interpreted.
     exfat_end_marker_residue: usize,
+
+    /// A deleted exFAT set not assessed, a gap (ADR-0022 section 11 and
+    /// Appendix E): unusable on re-read, left by phase 2's work bound, left
+    /// by a claims bound, not recorded past the walk's bound, or on a volume
+    /// where phase 2 did not run or stopped (S6-1 to S6-3).
+    exfat_not_assessed: usize,
+
+    /// A deleted exFAT set the walk found not usable: it claims nothing, so
+    /// what it held is unseen. A gap (ADR-0022 Decision B, S6-4).
+    exfat_sets_unusable: usize,
+
+    /// An exFAT claimant whose claim a bound left unseen, or a set inside a
+    /// deleted directory that was not usable or not recorded. A gap
+    /// (ADR-0022 Decision D). A deleted set among them is also counted in
+    /// `exfat_not_assessed`: the two measure different things, a set not
+    /// decided and a claim not seen, as S6-4 decided for its case.
+    exfat_claimants_not_followed: usize,
+
+    /// An exFAT deleted directory not read, or read only in part, so the
+    /// claims it holds are unseen. A gap (ADR-0022 Decision K, Appendix D).
+    exfat_deleted_directories_unread: usize,
+
+    /// A deleted exFAT set refused under condition 4, Decision F's second
+    /// shape included. A finding (ADR-0022 section 11).
+    exfat_refused_condition_4: usize,
+
+    /// A deleted exFAT set refused under condition 1. A finding.
+    exfat_refused_condition_1: usize,
+
+    /// A deleted exFAT set refused under condition 2. A finding.
+    exfat_refused_condition_2: usize,
+
+    /// A deleted exFAT set refused under condition 3, Decision F's first
+    /// shape included. A finding.
+    exfat_refused_condition_3: usize,
+
+    /// A deleted exFAT set with no cluster and no data. A finding (ADR-0022
+    /// section 6).
+    exfat_no_data: usize,
+
+    /// A deleted exFAT directory's own set: a finding, never decided under a
+    /// condition (S6-5).
+    exfat_deleted_directories: usize,
+
+    /// A deleted exFAT set that passed conditions 4, 1 and 2, its content
+    /// not read (ADR-0022 Decision G).
+    exfat_passed: usize,
 }
 
 impl RunCounts {
@@ -628,14 +697,73 @@ impl RunCounts {
         self.exfat_sets_refused
     }
 
-    /// An unused exFAT File entry, a deleted set this tool did not examine.
-    pub const fn exfat_deleted_sets_not_examined(&self) -> usize {
-        self.exfat_deleted_sets_not_examined
-    }
-
     /// An exFAT directory holding entries after its end marker.
     pub const fn exfat_end_marker_residue(&self) -> usize {
         self.exfat_end_marker_residue
+    }
+
+    /// A deleted exFAT set not assessed. ADR-0022 section 11, Appendix E.
+    pub const fn exfat_not_assessed(&self) -> usize {
+        self.exfat_not_assessed
+    }
+
+    /// A deleted exFAT set the walk found not usable. ADR-0022 Decision B.
+    pub const fn exfat_sets_unusable(&self) -> usize {
+        self.exfat_sets_unusable
+    }
+
+    /// An exFAT claim not seen. ADR-0022 Decision D.
+    pub const fn exfat_claimants_not_followed(&self) -> usize {
+        self.exfat_claimants_not_followed
+    }
+
+    /// An exFAT deleted directory not read whole. ADR-0022 Decision K.
+    pub const fn exfat_deleted_directories_unread(&self) -> usize {
+        self.exfat_deleted_directories_unread
+    }
+
+    /// A deleted exFAT set refused under condition 4. ADR-0022 section 6.
+    pub const fn exfat_refused_condition_4(&self) -> usize {
+        self.exfat_refused_condition_4
+    }
+
+    /// A deleted exFAT set refused under condition 1. ADR-0022 section 6.
+    pub const fn exfat_refused_condition_1(&self) -> usize {
+        self.exfat_refused_condition_1
+    }
+
+    /// A deleted exFAT set refused under condition 2. ADR-0022 section 6.
+    pub const fn exfat_refused_condition_2(&self) -> usize {
+        self.exfat_refused_condition_2
+    }
+
+    /// A deleted exFAT set refused under condition 3. ADR-0022 section 6.
+    pub const fn exfat_refused_condition_3(&self) -> usize {
+        self.exfat_refused_condition_3
+    }
+
+    /// Deleted exFAT sets refused under any of the four conditions.
+    pub const fn exfat_refused(&self) -> usize {
+        self.exfat_refused_condition_4
+            + self.exfat_refused_condition_1
+            + self.exfat_refused_condition_2
+            + self.exfat_refused_condition_3
+    }
+
+    /// A deleted exFAT set with no cluster and no data. ADR-0022 section 6.
+    pub const fn exfat_no_data(&self) -> usize {
+        self.exfat_no_data
+    }
+
+    /// A deleted exFAT directory's own set. S6-5.
+    pub const fn exfat_deleted_directories(&self) -> usize {
+        self.exfat_deleted_directories
+    }
+
+    /// A deleted exFAT set that passed conditions 4, 1 and 2, its content
+    /// not read. ADR-0022 Decision G.
+    pub const fn exfat_passed(&self) -> usize {
+        self.exfat_passed
     }
 
     /// Everything the run did not analyse, counted once per occurrence.
@@ -643,8 +771,11 @@ impl RunCounts {
     /// The eleven kinds `ADR-0014` Appendix B.4 enumerates, the twelfth
     /// `ADR-0015` section 9 adds, the thirteenth `ADR-0016` Decision D adds,
     /// the fourteenth `ADR-0017` Decision D adds, a partition entry dropped
-    /// as malformed (`ADR-0014` Appendix D), and the three exFAT kinds
-    /// `ADR-0014` Appendix E adds. Not every kind is reached by a fixture,
+    /// as malformed (`ADR-0014` Appendix D), the exFAT kinds `ADR-0014`
+    /// Appendix E adds, less the deleted sets not examined, which `ADR-0022`
+    /// section 11 replaces with the four kinds its examination leaves
+    /// (deleted sets not assessed and not usable, claimants not followed,
+    /// deleted directories not read). Not every kind is reached by a fixture,
     /// and Appendices B.4 and E record which of theirs are; several are
     /// reached only by unit tests, which is why the derivation below is unit
     /// tested rather than measured alone.
@@ -665,8 +796,11 @@ impl RunCounts {
             + self.listings_may_continue
             + self.orphan_search_stopped
             + self.exfat_sets_refused
-            + self.exfat_deleted_sets_not_examined
             + self.exfat_end_marker_residue
+            + self.exfat_not_assessed
+            + self.exfat_sets_unusable
+            + self.exfat_claimants_not_followed
+            + self.exfat_deleted_directories_unread
     }
 
     /// How much of the evidence the run covered.

@@ -1543,7 +1543,8 @@ pub enum DirItem<'a> {
         refusal: &'a SetRefusal,
     },
 
-    /// An unused File entry: a deleted set, not examined in this milestone.
+    /// An unused File entry: a deleted set, recorded by the walk where it is
+    /// usable and decided in phase 2 (ADR-0022 section 5 and Appendix E).
     UnusedFileSet { position: ExFatPosition },
 
     /// The directory held `entries` entries of a type other than zero after
@@ -3796,7 +3797,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn cluster_offset(cluster: u32) -> u64 {
+        pub(crate) fn cluster_offset(cluster: u32) -> u64 {
             (64 + (cluster as u64 - 2)) * 512
         }
 
@@ -3989,7 +3990,7 @@ pub(crate) mod tests {
 
     /// Sets the bit of each of `clusters` in a bitmap whose clusters are
     /// `held`, in order.
-    fn mark(vol: &mut Vol, held: &[u32], clusters: &[u32]) {
+    pub(crate) fn mark(vol: &mut Vol, held: &[u32], clusters: &[u32]) {
         for &c in clusters {
             let byte = (c - 2) as u64 / 8;
             let at = Vol::cluster_offset(held[(byte / 512) as usize]) + byte % 512;
@@ -4206,7 +4207,7 @@ pub(crate) mod tests {
     /// 3), the up-case table (the chain 6, 9) and a directory (cluster 12).
     /// Cluster 7 is marked in use and is no structure's: read contiguously
     /// from 6, the up-case table would take 7 for 9.
-    fn structured(root_entries: &[[u8; 32]]) -> Vol {
+    pub(crate) fn structured(root_entries: &[[u8; 32]]) -> Vol {
         let mut vol = Vol::new();
         vol.chain(&[2, 5]);
         vol.chain(&[3]);
@@ -4223,7 +4224,7 @@ pub(crate) mod tests {
         vol
     }
 
-    fn standard_root() -> Vec<[u8; 32]> {
+    pub(crate) fn standard_root() -> Vec<[u8; 32]> {
         let mut entries = vec![bitmap_entry_at(3, 25), up_case_at(6, 1024)];
         entries.extend(directory("D", 12, 1));
         entries
@@ -4680,7 +4681,7 @@ pub(crate) mod tests {
 
     /// `set` as deletion leaves it: the InUse bit of every entry cleared,
     /// everything else, the checksum included, as the live set had it.
-    fn deleted(mut set: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+    pub(crate) fn deleted(mut set: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
         for entry in set.iter_mut() {
             entry[0] &= !TYPE_IN_USE;
         }
@@ -6783,7 +6784,12 @@ pub(crate) mod tests {
 
     /// `set` created at `created` and last modified at `modified` seconds
     /// after 10:00 on 1 March 2026, both under offset byte `offset`.
-    fn at_times(set: Vec<[u8; 32]>, created: u32, modified: u32, offset: u8) -> Vec<[u8; 32]> {
+    pub(crate) fn at_times(
+        set: Vec<[u8; 32]>,
+        created: u32,
+        modified: u32,
+        offset: u8,
+    ) -> Vec<[u8; 32]> {
         mutated(set, |s| {
             s[0][8..12].copy_from_slice(&stamp(created).to_le_bytes());
             s[0][12..16].copy_from_slice(&stamp(modified).to_le_bytes());
@@ -6795,7 +6801,7 @@ pub(crate) mod tests {
     }
 
     /// An unused Stream Extension naming `first` and `dl`.
-    fn orphan_stream(no_fat_chain: bool, first: u32, dl: u64) -> [u8; 32] {
+    pub(crate) fn orphan_stream(no_fat_chain: bool, first: u32, dl: u64) -> [u8; 32] {
         let flags = FLAG_ALLOCATION_POSSIBLE | if no_fat_chain { FLAG_NO_FAT_CHAIN } else { 0 };
         let mut entry = stream(flags, 0, dl, first, dl);
         entry[0] &= !TYPE_IN_USE;
@@ -7175,7 +7181,7 @@ pub(crate) mod tests {
 
     /// [`structured`]'s volume with `extra` in the root after the standard
     /// entries, and every cluster of structure marked in use.
-    fn with_root(extra: &[[u8; 32]]) -> Vol {
+    pub(crate) fn with_root(extra: &[[u8; 32]]) -> Vol {
         let mut entries = standard_root();
         entries.extend_from_slice(extra);
         let mut vol = structured(&entries);
