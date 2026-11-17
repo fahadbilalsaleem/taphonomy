@@ -847,3 +847,104 @@ unread.
 deleted directories sharing a cluster, an allocation that is not well
 formed, and each bound. The volumes made here hold the first; unit tests
 hold every one, each failing when its rule is removed.
+
+---
+
+## Appendix E: each deleted set decided, and phase 2's bound (2026-11-17)
+
+Stage 6 is split. Its first part, 6a, adds to the exFAT reader the
+reading again of a recorded deleted set (phase 2, section 5) and the
+decision for one set (section 6). Nothing calls them yet; the analysis,
+the writer and the command line are stage 6b, and section 14's
+acceptance measures both together. The points below were decided by the
+planning session under the decision-making the author delegated on
+2026-11-13: S6-1 to S6-6 on 2026-11-14, the rest on 2026-11-17.
+
+**The order, as implemented.** Section 6 lists the four conditions.
+A set is now decided by the first of these that applies:
+
+1. Read again, it does not validate, or is not the set phase 1
+   recorded: unusable on re-read, a gap.
+2. It marks a directory: a deleted directory, a finding, never decided
+   under a condition or written; its data is entries, not content
+   (S6-5). Recovering inside one is M16.
+3. FirstCluster 0 and DataLength 0: it holds no data (section 6).
+4. Phase 2's bound, below, cannot pay for it: not decided, a gap.
+5. Condition 4, `read_content`'s checks, made without reading any
+   data; then Decision F's second shape.
+6. Condition 1, with the first cluster in use reported.
+7. Condition 2, the verdict of the claims (section 5); a set a claims
+   bound left unseen is not assessed, a gap.
+8. Decision F's first shape, under condition 3.
+9. Without `--recover`, condition 3 not checked (Decision G); with it,
+   the content up to ValidDataLength read until a chunk holds a byte
+   that is not zero, at most `CONTENT_CHUNK_BYTES` and within one
+   cluster: zeros only is refused under condition 3, anything else is
+   recoverable.
+
+Section 6's sentence that Decision F's two shapes are refused under
+condition 4 does not match section 8, which refuses the first under
+condition 3. Section 8 is the decision; the implementation follows it,
+and this appendix's order replaces section 6's sentence.
+
+**Reading a set again.** The set's entries are read from the directory
+clusters phase 1 recorded for it, every InUse bit is set, and the set is
+held to what phase 1 held it to, its checksum first. It must also carry
+the attributes, allocation, lengths and times phase 1 recorded, because
+the claims of section 5 were followed by those. A set that fails is
+refused as unusable and never returned as a file: the evidence changed,
+or the reader is wrong.
+
+**Phase 2's bound** is new and this project's choice, not the
+specification's. Deciding a set walks its allocation up to three times:
+for condition 4 when it is a chain, for condition 1, and for content
+when it may be read. The claims of section 5 are held to
+`CLAIM_LINKS_PER_CLUSTER` times the volume's clusters, but they record a
+contiguous run in one step, and a set they left unseen was never walked
+at all; without a bound here, many sets naming one large allocation
+would each be walked whole. So the clusters a set's walks need are
+charged before anything is walked, against one budget of
+`CLAIM_LINKS_PER_CLUSTER` times the volume's clusters over every set
+decided through one reader. A set the budget cannot pay for, and every
+later set with clusters to walk, is not decided, and is counted as a
+gap, never as a refusal. A directory, a set with no data and a set
+unusable on re-read walk nothing and are decided after the bound is
+reached. The charge counts DataLength's clusters for content, which
+over-charges a set whose ValidDataLength is shorter; it never
+under-charges.
+
+**Errors that are not outcomes.** Unreadable evidence while a set is
+decided is an error, not a finding. So is an allocation that passed
+condition 4 and then fails while condition 1 or the content read follows
+it: the same FAT, read moments before, now says otherwise, which is not
+a statement about the set. Claims returned for another walk are refused
+before anything is read.
+
+**Decided for stage 6b** (2026-11-14), to be implemented there:
+
+* S6-1. A live directory not read whole leaves the bitmap unbelieved,
+  so the volume's deleted sets are all reported not assessed, as when
+  the bitmap check fails (Appendix A): the check covers only what the
+  walk saw, and an unread directory's files could be marked free.
+* S6-2. The bitmap check runs once, after the live walk and before any
+  deleted directory is read.
+* S6-3. An evidence error while following claims or deciding a set
+  leaves the volume's deleted sets not assessed and is reported with its
+  error; the run goes on to the next partition. One part way through
+  writing ends in `abort` (Decision H).
+* S6-4. A File entry declaring fewer than two secondaries counts once
+  as an unusable deleted set, and its Stream Extension as an orphan
+  claim: the two measure different things.
+* S6-6. No margin around close times in condition 2: no measured image
+  needs one, and a margin would refuse more sets for no measured gain.
+  The limit Appendix C records stays a known issue.
+
+**What is tested, and what is not.** Unit tests on volumes built in the
+tests hold every outcome, the order of the steps, the gate on the
+bitmap check, a set changed between the two phases, the bound, both
+errors, and the read stopping after the first chunk that is not zeros;
+each fails when its rule is removed. Two places in the order are not
+held by a test, and need none: a set unusable on re-read has no file to
+decide, and a set with no data charges the bound nothing, so the
+bound's place before or after it changes no outcome. No public image is
+decided yet: that is stage 6b's and section 14's.

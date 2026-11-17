@@ -35,7 +35,10 @@
 //! directory is read for the claims of the sets inside it, which are
 //! rivals and are not decided (ADR-0022 Decision K), by
 //! [`ExFatReader::read_deleted_directories`], which nothing calls yet
-//! either. The allocation
+//! either. Each recorded deleted set is then read again and decided, in
+//! the order of ADR-0022 section 6 and Appendix E, by
+//! [`ExFatReader::decide_deleted_set`], which nothing calls yet. The
+//! allocation
 //! bitmap's entry is
 //! located and range checked by the walk. Its contents are read only
 //! through [`ExFatReader::open_bitmap`] and
@@ -1009,6 +1012,12 @@ pub enum SetRefusal {
 
     /// A second allocation bitmap entry. Section 7.1.
     DuplicateBitmap,
+
+    /// A deleted set read again for phase 2 is not the set phase 1
+    /// recorded: an entry of it is no longer unused, or its attributes, its
+    /// allocation or a time differs. The evidence changed, or the reader is
+    /// wrong. ADR-0022 section 5.
+    ChangedSinceWalk,
 }
 
 impl fmt::Display for SetRefusal {
@@ -1119,6 +1128,9 @@ impl fmt::Display for SetRefusal {
                 "allocation bitmap of {data_length} bytes is shorter than the {needed} the volume needs"
             ),
             Self::DuplicateBitmap => f.write_str("second allocation bitmap entry"),
+            Self::ChangedSinceWalk => {
+                f.write_str("deleted set read again is not the set the walk recorded")
+            }
         }
     }
 }
@@ -1334,6 +1346,159 @@ impl From<Error> for ExFatContentError {
     }
 }
 
+/// Why a recorded deleted set could not be read again or decided. None of
+/// these is a statement about the set: it is left not assessed.
+#[derive(Debug)]
+pub enum DeletedSetError {
+    /// The evidence could not be read.
+    Evidence(Error),
+
+    /// The bitmap could not be asked whether a cluster is free.
+    Bitmap(ExFatBitmapError),
+
+    /// A set was to be decided before the bitmap check passed (ADR-0022
+    /// Appendix A). Nothing was read.
+    BitmapNotChecked,
+
+    /// The walk recorded `recorded` deleted sets, and `index` is not one.
+    NoSuchSet { index: usize, recorded: usize },
+
+    /// The claims hold `verdicts` verdicts and the walk recorded `recorded`
+    /// sets: they are another walk's, and no set is decided on them.
+    /// Nothing was read.
+    ClaimsMismatch { verdicts: usize, recorded: usize },
+
+    /// The allocation passed condition 4, then failed a check while
+    /// condition 1 or the content read followed it: the FAT read moments
+    /// before now says otherwise, so the evidence changed or the reader is
+    /// wrong. Not a statement about the set.
+    ChangedDuringDecision(ExFatContentError),
+}
+
+impl fmt::Display for DeletedSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(e) => write!(f, "{e}"),
+            Self::Bitmap(e) => write!(f, "{e}"),
+            Self::BitmapNotChecked => {
+                f.write_str("a deleted set is decided only after the allocation bitmap is checked")
+            }
+            Self::NoSuchSet { index, recorded } => {
+                write!(f, "no deleted set {index}: the walk recorded {recorded}")
+            }
+            Self::ClaimsMismatch { verdicts, recorded } => write!(
+                f,
+                "claims hold {verdicts} verdicts for the {recorded} deleted sets the walk recorded"
+            ),
+            Self::ChangedDuringDecision(e) => {
+                write!(f, "allocation changed while a deleted set was decided: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeletedSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Evidence(e) => Some(e),
+            Self::Bitmap(e) => Some(e),
+            Self::ChangedDuringDecision(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<Error> for DeletedSetError {
+    fn from(e: Error) -> Self {
+        Self::Evidence(e)
+    }
+}
+
+impl From<ExFatBitmapError> for DeletedSetError {
+    fn from(e: ExFatBitmapError) -> Self {
+        Self::Bitmap(e)
+    }
+}
+
+/// One recorded deleted set, decided by
+/// [`ExFatReader::decide_deleted_set`].
+#[derive(Debug)]
+pub struct DeletedSetDecision {
+    /// Where the set's File entry lies, as the walk recorded it.
+    pub position: ExFatPosition,
+
+    /// What was decided.
+    pub outcome: DeletedSetOutcome,
+}
+
+/// What was decided for a deleted set (ADR-0022 section 6 and
+/// Appendix E): the first of these that applies, in this order. Every
+/// outcome but the first carries the set as it was read again, name
+/// included.
+#[derive(Debug)]
+pub enum DeletedSetOutcome {
+    /// Read again from the clusters recorded for it, the set did not
+    /// validate as it did in phase 1, or is not the set recorded. Not
+    /// examined: a gap.
+    UnusableOnReread { refusal: SetRefusal },
+
+    /// The set marks a directory. It is a finding, and is not decided under
+    /// any condition or written: its data is entries, not content.
+    DeletedDirectory { file: ExFatFile },
+
+    /// FirstCluster 0 and DataLength 0: the set holds no data.
+    NoData { file: ExFatFile },
+
+    /// Not decided: phase 2's work bound, [`CLAIM_LINKS_PER_CLUSTER`] times
+    /// the volume's clusters in cluster steps over every set decided through
+    /// one reader, left too few for this set, or an earlier set was already
+    /// left by it. Nothing of the allocation was walked. A gap, never a
+    /// refusal.
+    LeftByBound { file: ExFatFile },
+
+    /// Refused under condition 4: the allocation is not well formed, by
+    /// the checks [`ExFatReader::read_content`] makes before it reads.
+    ConditionFour {
+        file: ExFatFile,
+        reason: ExFatContentError,
+    },
+
+    /// Refused under condition 4: a first cluster with a DataLength of 0
+    /// (ADR-0022 Decision F).
+    ClusterWithoutData { file: ExFatFile },
+
+    /// Refused under condition 1: `cluster`, the first of the allocation in
+    /// its order that the bitmap marks in use.
+    ConditionOne { file: ExFatFile, cluster: u32 },
+
+    /// Refused under condition 2: `verdict` is `Later` or `Unordered`.
+    ConditionTwo {
+        file: ExFatFile,
+        verdict: ConditionTwo,
+    },
+
+    /// Passed conditions 4 and 1; a claims bound left condition 2 not
+    /// assessed for this set.
+    NotAssessed { file: ExFatFile },
+
+    /// Refused under condition 3: DataLength above 0 with a ValidDataLength
+    /// of 0, so no byte was recorded as written (ADR-0022 Decision F).
+    NoValidData { file: ExFatFile },
+
+    /// Passed conditions 4, 1 and 2. Content was not to be read, so
+    /// condition 3 is not checked (ADR-0022 Decision G).
+    ConditionThreeNotChecked { file: ExFatFile },
+
+    /// Refused under condition 3: every byte up to ValidDataLength is zero.
+    ZerosOnly { file: ExFatFile },
+
+    /// Passed all four conditions among the sets examined. Condition 3 was
+    /// settled by the first chunk read (at most `CONTENT_CHUNK_BYTES`, and
+    /// within one cluster) holding a byte that is not zero; nothing after
+    /// that chunk was read.
+    Recoverable { file: ExFatFile },
+}
+
 /// Where a directory's data is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DirectorySource {
@@ -1522,6 +1687,12 @@ pub struct ExFatReader<'a, R: EvidenceReader> {
 
     /// The bitmap check passed: deleted directories may be read.
     bitmap_checked: bool,
+
+    /// Phase 2's work bound (ADR-0022 section 6 and Appendix E): cluster
+    /// steps left for deciding deleted sets, and whether a set has been
+    /// left by it.
+    decide_steps_left: u64,
+    decide_bound_hit: bool,
 }
 
 impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
@@ -1553,6 +1724,8 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             orphans_unrecorded: 0,
             inner: Vec::new(),
             bitmap_checked: false,
+            decide_steps_left: CLAIM_LINKS_PER_CLUSTER * boot.cluster_count as u64,
+            decide_bound_hit: false,
         }
     }
 
@@ -1632,6 +1805,31 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         file: &ExFatFile,
         visit: &mut dyn FnMut(&[u8]),
     ) -> Result<(), ExFatContentError> {
+        self.check_content_allocation(file)?;
+
+        let mut chunk = vec![0u8; file.data_length.min(CONTENT_CHUNK_BYTES as u64) as usize];
+        self.read_valid_data(file, &mut chunk, &mut |bytes| {
+            visit(bytes);
+            true
+        })?;
+
+        let mut zeros_left = file.data_length - file.valid_data_length;
+        chunk.fill(0);
+        while zeros_left > 0 {
+            let take = zeros_left.min(chunk.len() as u64) as usize;
+            visit(&chunk[..take]);
+            zeros_left -= take as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Everything [`Self::read_content`] checks before it reads any data,
+    /// which is condition 4 for a deleted set (ADR-0022 section 6 and
+    /// Appendix E): not a directory, the allocation rules a listing
+    /// applies, and for a chain, exactly the clusters `DataLength` needs and
+    /// then its end. Reads the FAT, and no data.
+    fn check_content_allocation(&mut self, file: &ExFatFile) -> Result<(), ExFatContentError> {
         if file.is_directory() {
             return Err(ExFatContentError::Directory);
         }
@@ -1646,17 +1844,25 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
         )
         .map_err(ExFatContentError::Allocation)?;
 
-        let cluster_bytes = self.boot.cluster_bytes() as u64;
-        let needed = file.data_length.div_ceil(cluster_bytes);
-        if needed == 0 {
-            return Ok(());
-        }
-        if !file.no_fat_chain {
+        let needed = file.data_length.div_ceil(self.boot.cluster_bytes() as u64);
+        if needed > 0 && !file.no_fat_chain {
             self.check_chain(file.first_cluster, needed)?;
         }
+        Ok(())
+    }
 
-        let mut chunk = vec![0u8; file.data_length.min(CONTENT_CHUNK_BYTES as u64) as usize];
-
+    /// Reads a file's data up to `ValidDataLength` into `chunk`, a piece at
+    /// a time, each cluster at most once, handing each piece to `visit`
+    /// until it answers false. The allocation has passed
+    /// [`Self::check_content_allocation`], and `chunk` is not empty where
+    /// there is data.
+    fn read_valid_data(
+        &mut self,
+        file: &ExFatFile,
+        chunk: &mut [u8],
+        visit: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<(), ExFatContentError> {
+        let cluster_bytes = self.boot.cluster_bytes() as u64;
         let mut cluster = file.first_cluster;
         let mut valid_left = file.valid_data_length;
         while valid_left > 0 {
@@ -1666,33 +1872,39 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             while cluster_left > 0 {
                 let take = cluster_left.min(chunk.len() as u64) as usize;
                 self.reader.read_exact_at(offset, &mut chunk[..take])?;
-                visit(&chunk[..take]);
+                if !visit(&chunk[..take]) {
+                    return Ok(());
+                }
                 offset += take as u64;
                 cluster_left -= take as u64;
             }
 
             valid_left -= in_cluster;
             if valid_left > 0 {
-                cluster = if file.no_fat_chain {
-                    cluster + 1
-                } else {
-                    match self.content_link(cluster)? {
-                        Link::Next(next) => next,
-                        _ => return Err(ExFatContentError::ChainEndsEarly { cluster, needed }),
-                    }
-                };
+                cluster = self.next_content_cluster(file, cluster)?;
             }
         }
-
-        let mut zeros_left = file.data_length - file.valid_data_length;
-        chunk.fill(0);
-        while zeros_left > 0 {
-            let take = zeros_left.min(chunk.len() as u64) as usize;
-            visit(&chunk[..take]);
-            zeros_left -= take as u64;
-        }
-
         Ok(())
+    }
+
+    /// The cluster after `cluster` in a file's allocation: the next of a
+    /// run, or the one the FAT names, which a chain that passed
+    /// [`Self::check_chain`] has for every cluster but its last.
+    fn next_content_cluster(
+        &mut self,
+        file: &ExFatFile,
+        cluster: u32,
+    ) -> Result<u32, ExFatContentError> {
+        if file.no_fat_chain {
+            return Ok(cluster + 1);
+        }
+        match self.content_link(cluster)? {
+            Link::Next(next) => Ok(next),
+            _ => Err(ExFatContentError::ChainEndsEarly {
+                cluster,
+                needed: file.data_length.div_ceil(self.boot.cluster_bytes() as u64),
+            }),
+        }
     }
 
     /// Follows a file's chain from `first` through the FAT: links 1 to
@@ -2370,6 +2582,240 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
             }
         }
         Ok(true)
+    }
+
+    /// How many deleted sets the walk recorded: the indexes
+    /// [`Self::read_deleted_set_again`] and [`Self::decide_deleted_set`]
+    /// take, and the length of [`ClaimsAssessed::verdicts`].
+    pub fn deleted_sets_recorded(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// Phase 2's reading of recorded deleted set `index` (ADR-0022 section
+    /// 5): its entries, read again from the directory clusters recorded for
+    /// it, held to what phase 1 held them to. The File entry must be unused
+    /// and declare at least two secondaries, each of which must be an unused
+    /// secondary; with every InUse bit set, the set must pass every check a
+    /// live set does, the checksum first. Returns where the set lies and
+    /// the set, its name included.
+    ///
+    /// A set that does not pass now, or whose attributes, allocation or
+    /// times are not those phase 1 recorded (which the claims were followed
+    /// by), is returned as a refusal and never as a file: the evidence
+    /// changed, or the reader is wrong.
+    pub fn read_deleted_set_again(
+        &mut self,
+        index: usize,
+    ) -> Result<Result<(ExFatPosition, ExFatFile), SetRefusal>, DeletedSetError> {
+        let Some(&set) = self.deleted.get(index) else {
+            return Err(DeletedSetError::NoSuchSet {
+                index,
+                recorded: self.deleted.len(),
+            });
+        };
+        let slots = self.boot.cluster_bytes() as usize / ENTRY_BYTES;
+        let start = set.clusters_start as usize;
+
+        // The File entry, then the secondaries it now declares, from the
+        // slot after it and from slot 0 of each later cluster recorded, as
+        // the walk's cursor took them. At most 256 entries.
+        let mut window = vec![0u8; ENTRY_BYTES];
+        let mut slot = set.position.slot;
+        let at = self.cluster_offset(set.position.cluster) + (slot * ENTRY_BYTES) as u64;
+        self.reader.read_exact_at(at, &mut window)?;
+        let declared = window[1] as usize;
+        if declared < MIN_FILE_SECONDARIES {
+            return Ok(Err(SetRefusal::SecondaryCountTooSmall { count: window[1] }));
+        }
+        slot += 1;
+        for &cluster in &self.deleted_clusters[start..start + set.clusters_len as usize] {
+            let left = declared + 1 - window.len() / ENTRY_BYTES;
+            let take = left.min(slots.saturating_sub(slot));
+            if take > 0 {
+                let filled = window.len();
+                window.resize(filled + take * ENTRY_BYTES, 0);
+                let at = self.cluster_offset(cluster) + (slot * ENTRY_BYTES) as u64;
+                self.reader.read_exact_at(at, &mut window[filled..])?;
+            }
+            slot = 0;
+        }
+        let found = window.len() / ENTRY_BYTES - 1;
+        if found < declared {
+            return Ok(Err(SetRefusal::SetTruncated { declared, found }));
+        }
+
+        let (entries, _) = window.as_chunks_mut::<ENTRY_BYTES>();
+        let unused = entries[0][0] == TYPE_UNUSED_FILE
+            && entries[1..]
+                .iter()
+                .all(|e| e[0] & (TYPE_IN_USE | TYPE_SECONDARY) == TYPE_SECONDARY);
+        if !unused {
+            return Ok(Err(SetRefusal::ChangedSinceWalk));
+        }
+        for entry in entries {
+            entry[0] |= TYPE_IN_USE;
+        }
+        let file = match self.validate_file_set(&window) {
+            Ok(file) => file,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        let as_recorded = file.attributes == set.attributes
+            && file.no_fat_chain == set.no_fat_chain
+            && file.first_cluster == set.first_cluster
+            && file.data_length == set.data_length
+            && file.valid_data_length == set.valid_data_length
+            && raw_times(&window[..ENTRY_BYTES]) == (set.created, set.modified);
+        if !as_recorded {
+            return Ok(Err(SetRefusal::ChangedSinceWalk));
+        }
+        Ok(Ok((set.position, file)))
+    }
+
+    /// Decides recorded deleted set `index` (ADR-0022 section 6 and
+    /// Appendix E), by the first of [`DeletedSetOutcome`]'s cases that
+    /// applies, in its order:
+    /// the set read again, a directory, no data, phase 2's work bound, then
+    /// conditions 4, 1, 2 and 3.
+    ///
+    /// `bitmap` is the one [`Self::check_bitmap`] passed, and `claims` what
+    /// [`Self::assess_claims`] returned for this walk; a set `claims` holds
+    /// no verdict for is not assessed. Content is read only where
+    /// `content_allowed` (ADR-0022 Decision G), only for a set that passed
+    /// conditions 4, 1 and 2, and it stops after the first chunk read (at
+    /// most `CONTENT_CHUNK_BYTES`) that holds a byte that is not zero.
+    ///
+    /// A chain is followed through the FAT up to three times: for condition
+    /// 4, for condition 1, and for content. All of it is charged, before
+    /// anything is walked, to one bound of [`CLAIM_LINKS_PER_CLUSTER`] times
+    /// the volume's clusters, kept by this reader over every call: the
+    /// clusters `DataLength` needs, once for condition 4 when the set is a
+    /// chain, once for condition 1, and once for content when it is allowed.
+    /// A set the bound cannot pay for, and every later set with clusters to
+    /// step, is [`DeletedSetOutcome::LeftByBound`]. Decide each index once:
+    /// a second call charges again.
+    ///
+    /// Refused with [`DeletedSetError::BitmapNotChecked`], and nothing
+    /// read, unless the bitmap check has passed (Appendix A); then with
+    /// [`DeletedSetError::ClaimsMismatch`], and nothing read, unless
+    /// `claims` holds one verdict per recorded set. An evidence error, or an
+    /// allocation that changes while it is decided, is returned as an
+    /// error, never as an outcome.
+    pub fn decide_deleted_set(
+        &mut self,
+        index: usize,
+        bitmap: &mut ExFatBitmap,
+        claims: &ClaimsAssessed,
+        content_allowed: bool,
+    ) -> Result<DeletedSetDecision, DeletedSetError> {
+        if !self.bitmap_checked {
+            return Err(DeletedSetError::BitmapNotChecked);
+        }
+        if claims.verdicts.len() != self.deleted.len() {
+            return Err(DeletedSetError::ClaimsMismatch {
+                verdicts: claims.verdicts.len(),
+                recorded: self.deleted.len(),
+            });
+        }
+        let outcome = match self.read_deleted_set_again(index)? {
+            Ok((_, file)) => {
+                let verdict = claims.verdicts.get(index).copied().flatten();
+                self.deleted_set_outcome(file, bitmap, verdict, content_allowed)?
+            }
+            Err(refusal) => DeletedSetOutcome::UnusableOnReread { refusal },
+        };
+        Ok(DeletedSetDecision {
+            // Recorded: the read above found the index.
+            position: self.deleted[index].position,
+            outcome,
+        })
+    }
+
+    /// The outcome for a set that was read again and is usable.
+    fn deleted_set_outcome(
+        &mut self,
+        file: ExFatFile,
+        bitmap: &mut ExFatBitmap,
+        verdict: Option<ConditionTwo>,
+        content_allowed: bool,
+    ) -> Result<DeletedSetOutcome, DeletedSetError> {
+        use DeletedSetOutcome as Outcome;
+
+        // Once condition 4 has passed, the same FAT cannot fail a check
+        // unless it changed: not a statement about the set.
+        let changed = |reason| match reason {
+            ExFatContentError::Evidence(e) => DeletedSetError::Evidence(e),
+            reason => DeletedSetError::ChangedDuringDecision(reason),
+        };
+
+        if file.is_directory() {
+            return Ok(Outcome::DeletedDirectory { file });
+        }
+        if file.first_cluster == 0 && file.data_length == 0 {
+            return Ok(Outcome::NoData { file });
+        }
+
+        // Phase 2's work bound, charged whole before anything is walked.
+        // `needed` is at most the cluster count (the re-read's checks), so
+        // three times it does not overflow.
+        let needed = file.data_length.div_ceil(self.boot.cluster_bytes() as u64);
+        let walks = 1 + u64::from(!file.no_fat_chain) + u64::from(content_allowed);
+        let charge = needed * walks;
+        if charge > 0 {
+            if self.decide_bound_hit || charge > self.decide_steps_left {
+                self.decide_bound_hit = true;
+                return Ok(Outcome::LeftByBound { file });
+            }
+            self.decide_steps_left -= charge;
+        }
+
+        // Condition 4. Unreadable evidence is an error, anything else is a
+        // finding.
+        match self.check_content_allocation(&file) {
+            Ok(()) => {}
+            Err(ExFatContentError::Evidence(e)) => return Err(DeletedSetError::Evidence(e)),
+            Err(reason) => return Ok(Outcome::ConditionFour { file, reason }),
+        }
+        if file.data_length == 0 {
+            return Ok(Outcome::ClusterWithoutData { file });
+        }
+
+        // Condition 1. Every cluster is in the heap and, for a chain, has
+        // its link: condition 4 passed.
+        let mut cluster = file.first_cluster;
+        for taken in 1..=needed {
+            if self.cluster_allocated(bitmap, cluster)? {
+                return Ok(Outcome::ConditionOne { file, cluster });
+            }
+            if taken < needed {
+                cluster = self.next_content_cluster(&file, cluster).map_err(changed)?;
+            }
+        }
+
+        match verdict {
+            None => return Ok(Outcome::NotAssessed { file }),
+            Some(ConditionTwo::Holds) => {}
+            Some(verdict) => return Ok(Outcome::ConditionTwo { file, verdict }),
+        }
+
+        if file.valid_data_length == 0 {
+            return Ok(Outcome::NoValidData { file });
+        }
+        if !content_allowed {
+            return Ok(Outcome::ConditionThreeNotChecked { file });
+        }
+
+        let mut chunk = vec![0u8; file.valid_data_length.min(CONTENT_CHUNK_BYTES as u64) as usize];
+        let mut zeros = true;
+        self.read_valid_data(&file, &mut chunk, &mut |bytes| {
+            zeros = bytes.iter().all(|&byte| byte == 0);
+            zeros
+        })
+        .map_err(changed)?;
+        Ok(if zeros {
+            Outcome::ZerosOnly { file }
+        } else {
+            Outcome::Recoverable { file }
+        })
     }
 
     /// Locates the up-case table's clusters through its FAT chain.
@@ -3408,8 +3854,8 @@ pub(crate) mod tests {
         walk_with(&mut reader, source)
     }
 
-    fn walk_with(
-        reader: &mut ExFatReader<'_, MemoryImage>,
+    fn walk_with<R: EvidenceReader>(
+        reader: &mut ExFatReader<'_, R>,
         source: DirectorySource,
     ) -> (Result<DirectorySummary, ExFatDirectoryError>, Vec<Seen>) {
         let mut seen = Vec::new();
@@ -6746,7 +7192,7 @@ pub(crate) mod tests {
     }
 
     /// Walks the root and directory 12, and opens the bitmap.
-    fn walk_live(reader: &mut ExFatReader<'_, MemoryImage>) -> ExFatBitmap {
+    fn walk_live<R: EvidenceReader>(reader: &mut ExFatReader<'_, R>) -> ExFatBitmap {
         walk_with(reader, root(2)).0.expect("the root reads");
         let d = DirectorySource::Subdirectory {
             first_cluster: 12,
@@ -7222,5 +7668,655 @@ pub(crate) mod tests {
             assert_eq!(assessed.verdicts, vec![Some(Holds), Some(Holds)]);
             assert_eq!((assessed.inner_sets, assessed.unrecorded), (0, 1));
         });
+    }
+
+    // --- deciding a deleted set (ADR-0022 section 6 and Appendix E) -----------
+
+    use DeletedSetOutcome as Outcome;
+
+    /// Walks [`with_root`]'s volume, checks the bitmap, reads the deleted
+    /// directories, follows the claims and decides every recorded set.
+    /// Returns the outcomes, and every read made while deciding.
+    fn decide_all(
+        vol: &mut Vol,
+        limits: Limits,
+        content_allowed: bool,
+    ) -> (Vec<Outcome>, Vec<(u64, usize)>) {
+        let boot = vol.boot.clone();
+        let mut recording = Recording {
+            image: &mut vol.image,
+            reads: Vec::new(),
+        };
+        let mut reader = ExFatReader::new(&mut recording, &boot, extent(), limits);
+        let mut bitmap = walk_live(&mut reader);
+        reader
+            .check_bitmap(&mut bitmap)
+            .expect("the bitmap is believed");
+        reader.read_deleted_directories(&mut bitmap).expect("reads");
+        let claims = reader.assess_claims().expect("the claims are followed");
+        let before = reader.reader.reads.len();
+        let outcomes = (0..reader.deleted_sets_recorded())
+            .map(|index| {
+                reader
+                    .decide_deleted_set(index, &mut bitmap, &claims, content_allowed)
+                    .expect("decides")
+                    .outcome
+            })
+            .collect();
+        (outcomes, recording.reads.split_off(before))
+    }
+
+    /// The outcome for the volume's one deleted set.
+    fn decide_one(vol: &mut Vol, content_allowed: bool) -> Outcome {
+        let (mut outcomes, _) = decide_all(vol, Limits::DEFAULT, content_allowed);
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        outcomes.remove(0)
+    }
+
+    /// The reads among `reads` that begin at `cluster` or after it.
+    fn reads_from(reads: &[(u64, usize)], cluster: u32) -> Vec<(u64, usize)> {
+        let from = Vol::cluster_offset(cluster);
+        reads.iter().copied().filter(|r| r.0 >= from).collect()
+    }
+
+    /// Three live files with no data fill slots 5 to 13 of the root's first
+    /// cluster, so the deleted set lies in slots 14 and 15 of cluster 2 and
+    /// slot 0 of cluster 5.
+    #[test]
+    fn a_recorded_set_is_read_again_across_two_clusters_with_its_name() {
+        let mut extra = Vec::new();
+        for name in ["a", "b", "c"] {
+            extra.extend(file(name, 0, 0));
+        }
+        extra.extend(deleted(file("straddler", 30, 700)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30, 31]);
+
+        checked(&mut vol, Limits::DEFAULT, |reader, _| {
+            assert_eq!(reader.deleted_sets_recorded(), 1);
+            let (position, file) = reader
+                .read_deleted_set_again(0)
+                .expect("the evidence reads")
+                .expect("the set is usable");
+            assert_eq!(
+                position,
+                ExFatPosition {
+                    cluster: 2,
+                    slot: 14
+                }
+            );
+            assert_eq!(
+                file,
+                ExFatFile {
+                    name: utf16("straddler"),
+                    attributes: 0x20,
+                    first_cluster: 30,
+                    data_length: 700,
+                    valid_data_length: 700,
+                    no_fat_chain: false,
+                }
+            );
+            let error = reader.read_deleted_set_again(1).expect_err("no such set");
+            assert!(matches!(
+                error,
+                DeletedSetError::NoSuchSet {
+                    index: 1,
+                    recorded: 1
+                }
+            ));
+            assert!(!error.to_string().is_empty());
+        });
+    }
+
+    /// Decides the deleted set `gone`, one cluster at 30, after the walk
+    /// and after `replacement` was written over its entries, and returns
+    /// why it was not usable.
+    fn refusal_on_reread(replacement: Vec<[u8; 32]>) -> SetRefusal {
+        let mut vol = with_root(&deleted(file("gone", 30, 512)));
+        vol.chain(&[30]);
+        checked(&mut vol, Limits::DEFAULT, |reader, bitmap| {
+            let claims = reader.assess_claims().expect("the claims are followed");
+            let position = reader.deleted[0].position;
+            let bytes: Vec<u8> = replacement.iter().flatten().copied().collect();
+            let at = Vol::cluster_offset(position.cluster) + position.slot as u64 * 32;
+            reader.reader.write(at, &bytes);
+
+            let decision = reader
+                .decide_deleted_set(0, bitmap, &claims, true)
+                .expect("decides");
+            assert_eq!(decision.position, position);
+            match decision.outcome {
+                Outcome::UnusableOnReread { refusal } => refusal,
+                other => panic!("the changed set was decided: {other:?}"),
+            }
+        })
+    }
+
+    #[test]
+    fn a_set_whose_bytes_changed_after_the_walk_is_unusable_on_re_read() {
+        let stored = || deleted(file("gone", 30, 512));
+        let edited = |edit: fn(&mut Vec<[u8; 32]>)| {
+            let mut set = stored();
+            edit(&mut set);
+            set
+        };
+
+        // One byte of the name: the checksum no longer matches.
+        assert!(matches!(
+            refusal_on_reread(edited(|s| s[2][2] ^= 1)),
+            SetRefusal::ChecksumMismatch { .. }
+        ));
+        // In use again, the secondary and then the File entry: the checksum
+        // does not cover the InUse bit, so it still matches.
+        for edit in [
+            (|s| s[2][0] |= TYPE_IN_USE) as fn(&mut Vec<[u8; 32]>),
+            |s| s[0][0] = TYPE_FILE,
+        ] {
+            assert_eq!(
+                refusal_on_reread(edited(edit)),
+                SetRefusal::ChangedSinceWalk
+            );
+        }
+        // Another valid set where it lay, differing in one recorded field
+        // each: first cluster, times, attributes, DataLength,
+        // ValidDataLength, NoFatChain. The claims were followed by what the
+        // walk recorded.
+        let gone = utf16("gone");
+        for other in [
+            file("gone", 31, 512),
+            timed_file("gone", 30, 512),
+            file_set(&gone, 0x21, 30, 512, 512, false),
+            file_set(&gone, 0x20, 30, 512, 1024, false),
+            file_set(&gone, 0x20, 30, 256, 512, false),
+            file_set(&gone, 0x20, 30, 512, 512, true),
+        ] {
+            assert_eq!(
+                refusal_on_reread(deleted(other)),
+                SetRefusal::ChangedSinceWalk
+            );
+        }
+        // A count too small for a set, and one the clusters recorded do not
+        // hold: slots 6 to 15 of the one cluster are all there is.
+        assert_eq!(
+            refusal_on_reread(edited(|s| s[0][1] = 1)),
+            SetRefusal::SecondaryCountTooSmall { count: 1 }
+        );
+        assert_eq!(
+            refusal_on_reread(edited(|s| s[0][1] = 200)),
+            SetRefusal::SetTruncated {
+                declared: 200,
+                found: 10
+            }
+        );
+        assert!(!SetRefusal::ChangedSinceWalk.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_set_is_decided_only_after_the_bitmap_check_passes() {
+        let mut vol = with_root(&deleted(file("gone", 30, 512)));
+        vol.chain(&[30]);
+        let boot = vol.boot.clone();
+        let mut reader = ExFatReader::new(&mut vol.image, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = walk_live(&mut reader);
+        let claims = reader.assess_claims().expect("the claims are followed");
+
+        let error = reader
+            .decide_deleted_set(0, &mut bitmap, &claims, false)
+            .expect_err("not before the check");
+        assert!(matches!(error, DeletedSetError::BitmapNotChecked));
+        assert!(!error.to_string().is_empty());
+
+        // The gate comes first, before the claims are compared.
+        let mut other = claims.clone();
+        other.verdicts.push(None);
+        let error = reader
+            .decide_deleted_set(0, &mut bitmap, &other, false)
+            .expect_err("not before the check");
+        assert!(matches!(error, DeletedSetError::BitmapNotChecked));
+
+        reader.check_bitmap(&mut bitmap).expect("believed");
+        let decision = reader
+            .decide_deleted_set(0, &mut bitmap, &claims, false)
+            .expect("decides");
+        assert!(matches!(
+            decision.outcome,
+            Outcome::ConditionThreeNotChecked { .. }
+        ));
+    }
+
+    /// Its cluster is marked in use, which would refuse a file under
+    /// condition 1: a directory is not decided (S6-5).
+    #[test]
+    fn a_deleted_directory_is_a_finding_and_is_not_decided() {
+        let mut vol = with_gone();
+        mark(&mut vol, &[3], &[20]);
+        let outcome = decide_one(&mut vol, true);
+        assert!(
+            matches!(&outcome, Outcome::DeletedDirectory { file } if file.name == utf16("gone")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A directory with no allocation is a deleted directory, not a set
+    /// that holds no data (S6-5).
+    #[test]
+    fn a_deleted_directory_with_no_allocation_is_still_a_deleted_directory() {
+        let mut vol = with_root(&deleted(directory("hollow", 0, 0)));
+        let outcome = decide_one(&mut vol, true);
+        assert!(
+            matches!(outcome, Outcome::DeletedDirectory { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_set_with_no_cluster_and_no_data_holds_no_data() {
+        let mut vol = with_root(&deleted(file("empty", 0, 0)));
+        let outcome = decide_one(&mut vol, true);
+        assert!(matches!(outcome, Outcome::NoData { .. }), "{outcome:?}");
+    }
+
+    /// ADR-0022 Decision F's second shape.
+    #[test]
+    fn a_first_cluster_with_no_data_is_refused_under_condition_4() {
+        let mut vol = with_root(&deleted(file("odd", 30, 0)));
+        vol.chain(&[30]);
+        let outcome = decide_one(&mut vol, true);
+        assert!(
+            matches!(outcome, Outcome::ClusterWithoutData { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// The chain ends after one cluster of the two the length needs, and
+    /// that cluster is marked in use: condition 4 is reported, not 1.
+    #[test]
+    fn a_chain_that_is_not_its_length_is_refused_under_condition_4_before_condition_1() {
+        let mut vol = with_root(&deleted(file("short", 30, 1024)));
+        vol.chain(&[30]);
+        mark(&mut vol, &[3], &[30]);
+        let outcome = decide_one(&mut vol, true);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::ConditionFour {
+                    reason: ExFatContentError::ChainEndsEarly {
+                        cluster: 30,
+                        needed: 2
+                    },
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    /// The chain is 31, 40, 7, and 40 and 7 are marked in use: 40 is the
+    /// first in the chain's order. An orphan claims cluster 31 too, which
+    /// would refuse the set under condition 2: condition 1 is reported.
+    #[test]
+    fn a_cluster_in_use_is_refused_under_condition_1_before_condition_2() {
+        let mut extra = deleted(file("reused", 31, 1536));
+        extra.push(orphan_stream(false, 31, 512));
+        let mut vol = with_root(&extra);
+        vol.chain(&[31, 40, 7]);
+        mark(&mut vol, &[3], &[40]);
+        let outcome = decide_one(&mut vol, true);
+        assert!(
+            matches!(outcome, Outcome::ConditionOne { cluster: 40, .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// `old` and `new` both name cluster 30 and `new` was created later;
+    /// `lone` shares cluster 40 with an orphan, which has no time. `old`
+    /// has no valid data, which would refuse it under condition 3:
+    /// condition 2 is reported.
+    #[test]
+    fn a_later_or_unordered_claim_is_refused_under_condition_2_before_condition_3() {
+        let old = file_set(&utf16("old"), 0x20, 30, 0, 512, false);
+        let mut extra = deleted(at_times(old, 0, 0, 0x90));
+        extra.extend(deleted(at_times(file("new", 30, 512), 8, 8, 0x90)));
+        extra.extend(deleted(at_times(file("lone", 40, 512), 0, 0, 0x90)));
+        extra.push(orphan_stream(false, 40, 512));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30]);
+        vol.chain(&[40]);
+        fill_clusters(&mut vol, &[30, 40]);
+
+        let (outcomes, _) = decide_all(&mut vol, Limits::DEFAULT, true);
+        assert!(
+            matches!(
+                outcomes[..],
+                [
+                    Outcome::ConditionTwo { verdict: Later, .. },
+                    Outcome::Recoverable { .. },
+                    Outcome::ConditionTwo {
+                        verdict: Unordered,
+                        ..
+                    },
+                ]
+            ),
+            "{outcomes:?}"
+        );
+    }
+
+    /// One run fits in the claims table: the second set's claim is unseen.
+    #[test]
+    fn a_set_a_claims_bound_left_unseen_is_not_assessed() {
+        let limits = Limits {
+            claimed_runs: 1,
+            ..Limits::DEFAULT
+        };
+        let mut extra = deleted(file("first", 30, 512));
+        extra.extend(deleted(file("second", 40, 512)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30]);
+        vol.chain(&[40]);
+
+        let (outcomes, _) = decide_all(&mut vol, limits, false);
+        assert!(
+            matches!(
+                outcomes[..],
+                [
+                    Outcome::ConditionThreeNotChecked { .. },
+                    Outcome::NotAssessed { .. }
+                ]
+            ),
+            "{outcomes:?}"
+        );
+    }
+
+    /// ADR-0022 Decision F's first shape. The cluster holds bytes that are
+    /// not zero, and none of them was recorded as written.
+    #[test]
+    fn data_with_no_valid_data_is_refused_under_condition_3() {
+        let set = file_set(&utf16("unwritten"), 0x20, 30, 0, 512, false);
+        let mut vol = with_root(&deleted(set));
+        vol.chain(&[30]);
+        fill_clusters(&mut vol, &[30]);
+        // Refused with content allowed or not: it is decided before
+        // condition 3 is reported not checked.
+        for content_allowed in [true, false] {
+            let outcome = decide_one(&mut vol, content_allowed);
+            assert!(
+                matches!(outcome, Outcome::NoValidData { .. }),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    /// ADR-0022 Decision G.
+    #[test]
+    fn without_content_allowed_condition_3_is_not_checked_and_no_content_is_read() {
+        let mut vol = with_root(&deleted(file("unread", 30, 512)));
+        vol.chain(&[30]);
+        fill_clusters(&mut vol, &[30]);
+        let (outcomes, reads) = decide_all(&mut vol, Limits::DEFAULT, false);
+        assert!(
+            matches!(outcomes[..], [Outcome::ConditionThreeNotChecked { .. }]),
+            "{outcomes:?}"
+        );
+        assert_eq!(reads_from(&reads, 30), Vec::new());
+    }
+
+    /// The first cluster is zeros and is all the valid data; the second is
+    /// not zeros, is past ValidDataLength, and is not read.
+    #[test]
+    fn content_that_is_zeros_up_to_valid_data_length_is_refused_under_condition_3() {
+        let set = file_set(&utf16("zeros"), 0x20, 30, 512, 1024, false);
+        let mut vol = with_root(&deleted(set));
+        vol.chain(&[30, 31]);
+        fill_clusters(&mut vol, &[31]);
+        let (outcomes, reads) = decide_all(&mut vol, Limits::DEFAULT, true);
+        assert!(
+            matches!(outcomes[..], [Outcome::ZerosOnly { .. }]),
+            "{outcomes:?}"
+        );
+        assert_eq!(reads_from(&reads, 30), vec![(Vol::cluster_offset(30), 512)]);
+    }
+
+    /// Three clusters: zeros, then two that are not. The second settles
+    /// condition 3, and the third is not read.
+    #[test]
+    fn condition_3_stops_reading_after_the_first_chunk_that_is_not_zeros() {
+        let mut vol = with_root(&deleted(file("found", 30, 1536)));
+        vol.chain(&[30, 31, 32]);
+        fill_clusters(&mut vol, &[31, 32]);
+        let (outcomes, reads) = decide_all(&mut vol, Limits::DEFAULT, true);
+        assert!(
+            matches!(&outcomes[..], [Outcome::Recoverable { file }] if file.name == utf16("found")),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            reads_from(&reads, 30),
+            vec![
+                (Vol::cluster_offset(30), 512),
+                (Vol::cluster_offset(31), 512)
+            ]
+        );
+    }
+
+    /// The synthetic volume's 200 clusters give phase 2 a bound of 800
+    /// cluster steps. `a` and `b` are chains of 150 clusters, each charged
+    /// 450 with content allowed (condition 4, condition 1, content): `a`
+    /// fits, `b` does not. `small`, charged 6, would fit what is left, and
+    /// is left too, as is every later set with clusters to step, though its
+    /// chain would fail condition 4: the bound comes first. `dir`, a
+    /// directory, `odd`, a first cluster with no data, and `empty` step no
+    /// cluster and are decided.
+    #[test]
+    fn sets_past_phase_2s_work_bound_are_left_and_stay_left() {
+        let chain: Vec<u32> = (40..190).collect();
+        let mut extra = deleted(file("a", 40, 150 * 512));
+        extra.extend(deleted(file("b", 40, 150 * 512)));
+        extra.extend(deleted(file("small", 30, 1024)));
+        extra.extend(deleted(directory("dir", 20, 1)));
+        extra.extend(deleted(file("odd", 30, 0)));
+        extra.extend(deleted(file("empty", 0, 0)));
+        let mut vol = with_root(&extra);
+        vol.chain(&chain);
+        vol.chain(&[30]);
+        vol.chain(&[20]);
+
+        let (outcomes, _) = decide_all(&mut vol, Limits::DEFAULT, true);
+        assert!(
+            matches!(
+                &outcomes[..],
+                [
+                    first,
+                    Outcome::LeftByBound { file: b },
+                    Outcome::LeftByBound { file: small },
+                    Outcome::DeletedDirectory { .. },
+                    Outcome::ClusterWithoutData { .. },
+                    Outcome::NoData { .. },
+                ] if !matches!(first, Outcome::LeftByBound { .. })
+                    && b.name == utf16("b")
+                    && small.name == utf16("small")
+            ),
+            "{outcomes:?}"
+        );
+
+        // Without content, each is charged 300, and both fit.
+        let (outcomes, _) = decide_all(&mut vol, Limits::DEFAULT, false);
+        assert!(
+            !outcomes
+                .iter()
+                .any(|o| matches!(o, Outcome::LeftByBound { .. })),
+            "{outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn claims_of_another_walk_are_refused_before_anything_is_read() {
+        let mut vol = with_root(&deleted(file("gone", 30, 512)));
+        vol.chain(&[30]);
+        let boot = vol.boot.clone();
+        let mut recording = Recording {
+            image: &mut vol.image,
+            reads: Vec::new(),
+        };
+        let mut reader = ExFatReader::new(&mut recording, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = walk_live(&mut reader);
+        reader.check_bitmap(&mut bitmap).expect("believed");
+        let mut claims = reader.assess_claims().expect("the claims are followed");
+        claims.verdicts.push(Some(ConditionTwo::Holds));
+        let before = reader.reader.reads.len();
+
+        let error = reader
+            .decide_deleted_set(0, &mut bitmap, &claims, true)
+            .expect_err("not on another walk's claims");
+        assert!(
+            matches!(
+                error,
+                DeletedSetError::ClaimsMismatch {
+                    verdicts: 2,
+                    recorded: 1
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().is_empty());
+        assert_eq!(reader.reader.reads.len(), before);
+    }
+
+    /// What [`Changing`] does once its trigger is reached.
+    enum Change {
+        /// These bytes are written at this offset, after the read.
+        Write(u64, Vec<u8>),
+        /// The read fails.
+        Fail,
+    }
+
+    /// Evidence that changes once the read at `trigger` has been made
+    /// `after` times since `change` was set: an allocation that changes, or
+    /// evidence that fails, while a set is decided.
+    struct Changing<'a> {
+        image: &'a mut MemoryImage,
+        trigger: u64,
+        after: usize,
+        change: Option<Change>,
+    }
+
+    impl EvidenceReader for Changing<'_> {
+        fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+            if offset != self.trigger || self.change.is_none() {
+                return self.image.read_exact_at(offset, buf);
+            }
+            self.after -= 1;
+            if self.after > 0 {
+                return self.image.read_exact_at(offset, buf);
+            }
+            match self.change.take() {
+                Some(Change::Fail) => Err(Error::from_io(
+                    std::path::Path::new("<memory>"),
+                    std::io::Error::other("the evidence failed"),
+                )),
+                Some(Change::Write(at, bytes)) => {
+                    let read = self.image.read_exact_at(offset, buf);
+                    self.image.write(at, &bytes);
+                    read
+                }
+                None => self.image.read_exact_at(offset, buf),
+            }
+        }
+    }
+
+    /// Decides the volume's one deleted set, where `change` happens once
+    /// the FAT's second sector (entries 128 to 255) has been read `after`
+    /// times while it is decided. The FAT is read through a one-sector
+    /// cache, so each read of that sector is a step between the two
+    /// sectors.
+    fn decide_while_changing(
+        vol: &mut Vol,
+        after: usize,
+        change: Change,
+        content_allowed: bool,
+    ) -> Result<DeletedSetDecision, DeletedSetError> {
+        let boot = vol.boot.clone();
+        let mut changing = Changing {
+            image: &mut vol.image,
+            trigger: FAT_BYTE_OFFSET + 512,
+            after,
+            change: None,
+        };
+        let mut reader = ExFatReader::new(&mut changing, &boot, extent(), Limits::DEFAULT);
+        let mut bitmap = walk_live(&mut reader);
+        reader.check_bitmap(&mut bitmap).expect("believed");
+        let claims = reader.assess_claims().expect("the claims are followed");
+        reader.reader.change = Some(change);
+        reader.decide_deleted_set(0, &mut bitmap, &claims, content_allowed)
+    }
+
+    /// FAT entry `cluster` becomes the end of a chain.
+    fn ends_at(cluster: u32) -> Change {
+        Change::Write(
+            FAT_BYTE_OFFSET + cluster as u64 * 4,
+            FAT_END_OF_CHAIN.to_le_bytes().to_vec(),
+        )
+    }
+
+    /// The chain 30, 150, 31: condition 4 reads the FAT's second sector
+    /// first, condition 1 second. Evidence that fails during either is an
+    /// evidence error, never a finding and never a change.
+    #[test]
+    fn evidence_failing_during_condition_4_or_condition_1_is_an_evidence_error() {
+        for after in [1, 2] {
+            let mut vol = with_root(&deleted(file("failing", 30, 1536)));
+            vol.chain(&[30, 150, 31]);
+            let error =
+                decide_while_changing(&mut vol, after, Change::Fail, true).expect_err("fails");
+            assert!(
+                matches!(error, DeletedSetError::Evidence(_)),
+                "{after}: {error:?}"
+            );
+        }
+    }
+
+    /// The chain 30, 150 passes condition 4, which reads entry 150 in the
+    /// FAT's second sector; then entry 30 ends the chain, and condition 1's
+    /// walk finds it one cluster short.
+    #[test]
+    fn a_chain_that_changes_during_condition_1_is_an_error_not_a_finding() {
+        // Without content allowed too, so condition 1's walk alone reports
+        // the change: the content read would report it again.
+        for content_allowed in [true, false] {
+            let mut vol = with_root(&deleted(file("moving", 30, 1024)));
+            vol.chain(&[30, 150]);
+            let error = decide_while_changing(&mut vol, 1, ends_at(30), content_allowed)
+                .expect_err("changed");
+            assert!(
+                matches!(
+                    error,
+                    DeletedSetError::ChangedDuringDecision(ExFatContentError::ChainEndsEarly {
+                        cluster: 30,
+                        needed: 2
+                    })
+                ),
+                "{content_allowed}: {error:?}"
+            );
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    /// The chain 30, 150, 31 of zeros passes condition 4 and condition 1
+    /// (whose step from 150 reads the second sector the second time); then
+    /// entry 150 ends the chain, and the content read finds it one cluster
+    /// short.
+    #[test]
+    fn a_chain_that_changes_during_the_content_read_is_an_error_not_a_finding() {
+        let mut vol = with_root(&deleted(file("moving", 30, 1536)));
+        vol.chain(&[30, 150, 31]);
+        let error = decide_while_changing(&mut vol, 2, ends_at(150), true).expect_err("changed");
+        assert!(
+            matches!(
+                error,
+                DeletedSetError::ChangedDuringDecision(ExFatContentError::ChainEndsEarly {
+                    cluster: 150,
+                    needed: 3
+                })
+            ),
+            "{error:?}"
+        );
     }
 }
