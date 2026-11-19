@@ -6423,11 +6423,11 @@ pub(crate) mod tests {
     }
 
     /// Bytes that say which cluster they were read from, and are never zero.
-    fn cluster_data(cluster: u32) -> Vec<u8> {
+    pub(crate) fn cluster_data(cluster: u32) -> Vec<u8> {
         vec![cluster as u8; 512]
     }
 
-    fn fill_clusters(vol: &mut Vol, clusters: &[u32]) {
+    pub(crate) fn fill_clusters(vol: &mut Vol, clusters: &[u32]) {
         for &cluster in clusters {
             vol.image
                 .write(Vol::cluster_offset(cluster), &cluster_data(cluster));

@@ -29,11 +29,11 @@ use taphonomy::exfat_directory::{DeletedSetOutcome, ExFatPosition, escaped_name}
 use taphonomy::fat_directory::{
     DeletedKind, Directory, Entry, EntryKind, FirstByte, associate, recovered_name,
 };
-use taphonomy::fat_recovery::{Listing, Output};
+use taphonomy::fat_recovery::{Extraction, Listing, Output};
 use taphonomy::fat32::Fat32BootSector;
 use taphonomy::filesystem::Identification;
 use taphonomy::partition::MbrPartition;
-use taphonomy::validation::Outcome;
+use taphonomy::validation::{Outcome, Validation};
 
 /// One line of usage, printed on any argument error.
 const USAGE: &str = "usage: taphonomy <evidence-image> [--recover] \
@@ -447,39 +447,13 @@ impl Sink for StdoutSink {
                 extraction,
                 validation,
                 readback_matches,
-            } => {
-                // `docs/SAFETY.md` section 10 requires the recovered-file
-                // hash and the validation hash to be distinguishable where
-                // both are reported.
-                println!(
-                    "        {:<9} recovered sha256 {} over {} bytes",
-                    "", extraction.digest, extraction.bytes_hashed
-                );
-
-                if let Some(output) = &extraction.output {
-                    print_output(output, readback_matches);
-                }
-
-                match (validation.outcome, validation.reference) {
-                    (Outcome::Match, Some(reference)) => {
-                        println!("        {:<9} reference sha256 {reference} MATCHES", "");
-                    }
-                    (Outcome::Differs, Some(reference)) => {
-                        println!("        {:<9} reference sha256 {reference} DIFFERS", "");
-                    }
-                    // `NotAttempted` carries no reference, and a reference is
-                    // always carried where a comparison happened.
-                    _ => {}
-                }
-            }
+            } => print_extraction(extraction, validation, readback_matches),
             Event::NotExtracted {
                 listing: _,
                 part: _,
                 entry: _,
                 error,
-            } => {
-                println!("        {:<9} NOT EXTRACTED: {error}", "");
-            }
+            } => print_not_extracted(error),
             Event::ExFatBootRegion(boot) => {
                 self.exfat_deleted_heading_printed = false;
                 print_exfat_boot_region(boot);
@@ -581,6 +555,18 @@ impl Sink for StdoutSink {
                 self.head_exfat_deleted();
                 println!("{}", exfat_decision_line(position, outcome));
             }
+            Event::ExFatExtracted {
+                position: _,
+                file: _,
+                extraction,
+                validation,
+                readback_matches,
+            } => print_extraction(extraction, validation, readback_matches),
+            Event::ExFatNotExtracted {
+                position: _,
+                file: _,
+                error,
+            } => print_not_extracted(error),
             Event::ExFatDeletedSetsNotAssessed { reason, sets } => {
                 self.head_exfat_deleted();
                 println!(
@@ -654,13 +640,29 @@ fn exfat_decision_line(position: ExFatPosition, outcome: &DeletedSetOutcome) -> 
                 file.first_cluster, file.data_length
             ),
         ),
-        // Content is never read yet, so neither occurs; reading it will
-        // write them.
         O::ZerosOnly { file } => (
             escaped_name(&file.name),
             "REFUSED, condition 3: zeros only".to_string(),
         ),
-        O::Recoverable { file } => (escaped_name(&file.name), "recoverable".to_string()),
+        // No level word: the level is the summary's (`ADR-0014` Appendix
+        // A.10). The extraction lines follow, as for FAT32.
+        O::Recoverable { file } => {
+            let valid = if file.valid_data_length < file.data_length {
+                format!(
+                    ", {} bytes valid, the rest written as zeros",
+                    file.valid_data_length
+                )
+            } else {
+                String::new()
+            };
+            (
+                escaped_name(&file.name),
+                format!(
+                    "cluster {}, {} bytes, conditions 4, 1, 2 and 3 passed{valid}",
+                    file.first_cluster, file.data_length
+                ),
+            )
+        }
     };
     format!("      {} {name:<13} {text}", exfat_position(position))
 }
@@ -893,6 +895,43 @@ fn print_directory(heading: &str, directory: &Directory) {
     }
 }
 
+/// Prints an extraction: its digest, what became of its file, and its
+/// comparison with the reference. The same lines for a FAT32 run and an
+/// exFAT set, with no level word on them (`ADR-0014` Appendix A.10).
+fn print_extraction(
+    extraction: &Extraction,
+    validation: Validation,
+    readback_matches: Option<bool>,
+) {
+    // `docs/SAFETY.md` section 10 requires the recovered-file hash and the
+    // validation hash to be distinguishable where both are reported.
+    println!(
+        "        {:<9} recovered sha256 {} over {} bytes",
+        "", extraction.digest, extraction.bytes_hashed
+    );
+
+    if let Some(output) = &extraction.output {
+        print_output(output, readback_matches);
+    }
+
+    match (validation.outcome, validation.reference) {
+        (Outcome::Match, Some(reference)) => {
+            println!("        {:<9} reference sha256 {reference} MATCHES", "");
+        }
+        (Outcome::Differs, Some(reference)) => {
+            println!("        {:<9} reference sha256 {reference} DIFFERS", "");
+        }
+        // `NotAttempted` carries no reference, and a reference is always
+        // carried where a comparison happened.
+        _ => {}
+    }
+}
+
+/// Prints an extraction that failed, for either filesystem.
+fn print_not_extracted(error: &dyn std::fmt::Display) {
+    println!("        {:<9} NOT EXTRACTED: {error}", "");
+}
+
 /// Says what became of a written artifact, where one was asked for.
 ///
 /// `ADR-0015` Decision H. The comparison is made in the library rather than
@@ -951,10 +990,11 @@ const GAP_LABEL_WIDTH: usize = 26;
 /// Prints what the run covered and what it produced, once per run.
 ///
 /// `ADR-0003` section 4.7 requires a session to report counts per level and
-/// forbids a single combined success figure. Under `ADR-0014` Decision A one
-/// level is reachable, so the level is one line here and the count on it is
-/// what varies: Appendix A.10 keeps the word off the per-entry lines, and
-/// Appendix B.8 keeps the count on this one.
+/// forbids a single combined success figure. Two levels are reachable,
+/// `RECONSTRUCTED` for FAT32 (`ADR-0014` Decision A) and `UNVERIFIED` for
+/// exFAT (`ADR-0022` Decision A), so the levels share one line here and the
+/// counts on it are what vary: Appendix A.10 keeps the word off the
+/// per-entry lines, and Appendix B.8 keeps the counts on this one.
 ///
 /// The coverage line comes first because it scopes every count below it, and
 /// each line beneath states what was not analysed rather than what was
@@ -983,8 +1023,14 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
         "entries not assessed",
         counts.not_assessed() + counts.exfat_not_assessed(),
     );
-    print_gap("entries not extracted", counts.not_extracted());
-    print_gap("artifacts not written", counts.not_delivered());
+    print_gap(
+        "entries not extracted",
+        counts.not_extracted() + counts.exfat_not_extracted(),
+    );
+    print_gap(
+        "artifacts not written",
+        counts.not_delivered() + counts.exfat_not_delivered(),
+    );
     print_gap("directories not read", counts.directories_unread());
     print_gap("listings that may continue", counts.listings_may_continue());
     print_gap("orphan searches stopped", counts.orphan_search_stopped());
@@ -1005,21 +1051,19 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
 
     // Only `--recover` produces an artifact, so without it the line would
     // report a zero that the invocation already determined.
+    // `ADR-0022` section 3: each level with a count above zero; a run with
+    // no exFAT artifact prints the line it printed before.
     if options.recover {
-        let artifacts = counts.artifacts(options);
-        if artifacts == 0 {
-            println!("artifacts    0");
-        } else {
-            println!("artifacts    {artifacts} {}", Confidence::of_inferred_run());
-        }
+        println!("artifacts    {}", artifacts_by_level(counts, options));
     }
 
     // Only where a reference was supplied. Where none was, the caveat block
     // below already states that nothing was validated, and saying it twice
-    // would present one fact about the invocation as two findings.
+    // would present one fact about the invocation as two findings. Summed
+    // over both filesystems (`ADR-0022` section 11).
     if options.reference.is_some() {
-        let matched = counts.matched();
-        let differed = counts.differed(options);
+        let matched = counts.matched() + counts.exfat_matched();
+        let differed = counts.differed(options) + counts.exfat_differed(options);
         println!("compared     {matched} matched, {differed} differed");
     }
 
@@ -1045,7 +1089,11 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
         counts.not_assessed() + counts.exfat_not_assessed(),
         "not assessed",
     );
-    push_part(&mut unrecovered, counts.not_extracted(), "not extracted");
+    push_part(
+        &mut unrecovered,
+        counts.not_extracted() + counts.exfat_not_extracted(),
+        "not extracted",
+    );
     push_part(
         &mut unrecovered,
         counts.empty() + counts.exfat_no_data(),
@@ -1064,6 +1112,26 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
 
     if !unrecovered.is_empty() {
         println!("unrecovered  {}", unrecovered.join(", "));
+    }
+}
+
+/// The artifacts produced, by level: `0`, or each level with a count above
+/// zero, FAT32's `RECONSTRUCTED` first (`ADR-0022` section 3, `ADR-0003`
+/// section 4.7).
+fn artifacts_by_level(counts: &RunCounts, options: Options<'_>) -> String {
+    let levels = [
+        (counts.artifacts(options), Confidence::of_inferred_run()),
+        (counts.exfat_artifacts(), Confidence::of_metadata_extent()),
+    ];
+    let parts: Vec<String> = levels
+        .iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, level)| format!("{count} {level}"))
+        .collect();
+    if parts.is_empty() {
+        "0".to_string()
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -1104,22 +1172,28 @@ fn push_part(parts: &mut Vec<String>, count: usize, label: &str) {
 /// read as a statement about the last volume printed rather than about the
 /// run it now covers.
 fn print_caveats(counts: &RunCounts, options: Options<'_>) {
-    if counts.free_runs() == 0 {
+    let fat32 = counts.free_runs() > 0;
+    let exfat = counts.exfat_recoverable() + counts.exfat_passed() > 0;
+    if !fat32 && !exfat {
         return;
     }
 
-    // ADR-0003 section 4.2 and ADR-0010 Decision C. Saying only that the run
-    // is free would let a reader take it for a finding. It is the absence of
-    // contrary evidence, which is not the same thing and never becomes it.
-    println!();
-    println!("A free run means nothing has claimed those");
-    println!("clusters since the entry lost them. It is not");
-    println!("evidence that the content there is this file's.");
+    if fat32 {
+        // ADR-0003 section 4.2 and ADR-0010 Decision C. Saying only that the
+        // run is free would let a reader take it for a finding. It is the
+        // absence of contrary evidence, which is not the same thing and never
+        // becomes it.
+        println!();
+        println!("A free run means nothing has claimed those");
+        println!("clusters since the entry lost them. It is not");
+        println!("evidence that the content there is this file's.");
+    }
 
     // ADR-0013 section 8.2. A match is byte equality with what the operator
     // supplied, and where the content is not distinctive that is weaker
-    // evidence than it reads as.
-    if counts.matched() > 0 {
+    // evidence than it reads as. Nothing in it is FAT32's, so a match on
+    // either filesystem prints it.
+    if counts.matched() + counts.exfat_matched() > 0 {
         println!();
         println!("A match establishes that these bytes are the");
         println!("reference's, byte for byte. Where content is not");
@@ -1127,14 +1201,25 @@ fn print_caveats(counts: &RunCounts, options: Options<'_>) {
         println!("bytes.");
     }
 
-    // ADR-0013 Decision E. The causes are listed and none is chosen,
-    // because the evidence does not distinguish between them.
-    if counts.differed(options) > 0 {
+    // ADR-0013 Decision E. The causes are listed and none is chosen, because
+    // the evidence does not distinguish between them. They are a FAT32 run's
+    // causes, so only FAT32's differences print it.
+    if fat32 && counts.differed(options) > 0 {
         println!();
         println!("A differing digest does not say which of these");
         println!("happened: the file was fragmented, clusters of");
         println!("the run were reused, the recorded size is wrong,");
         println!("or the reference is another file.");
+    }
+
+    // ADR-0019 section 5 and ADR-0022 section 15: a set states the checks it
+    // passed and never that the data is the file's. True with content read
+    // or not.
+    if exfat {
+        println!();
+        for line in EXFAT_CAVEAT {
+            println!("{line}");
+        }
     }
 
     // Attached to the paragraph above rather than set apart: each is one
@@ -1145,6 +1230,17 @@ fn print_caveats(counts: &RunCounts, options: Options<'_>) {
         println!("No reference supplied. Nothing was validated.");
     }
 }
+
+/// The caveat printed where any exFAT set was recovered or passed, at most
+/// 50 columns a line, as the FAT32 paragraphs are. True whether or not
+/// content was read: the per-set line names which conditions passed.
+const EXFAT_CAVEAT: [&str; 5] = [
+    "A deleted exFAT file is reported with the",
+    "checks it passed. They show its metadata intact",
+    "and its clusters unclaimed, not that the data is",
+    "this file's: data can be stale, or never",
+    "written, while all of its metadata is intact.",
+];
 
 /// A name the parser could render, or a marker that it could not.
 ///
@@ -1404,6 +1500,56 @@ mod tests {
                 format!("      c5 s0{} {text}", " ".repeat(15))
             );
         }
+    }
+
+    /// A recovered set's line states the four checks it passed, and where
+    /// ValidDataLength is short, that the rest was written as zeros; no
+    /// level word (`ADR-0014` Appendix A.10).
+    #[test]
+    fn a_recoverable_exfat_set_names_the_checks_it_passed() {
+        use taphonomy::exfat_directory::ExFatFile;
+
+        let file = |valid_data_length| ExFatFile {
+            name: "f.bin".encode_utf16().collect(),
+            attributes: 0x20,
+            first_cluster: 30,
+            data_length: 1024,
+            valid_data_length,
+            no_fat_chain: false,
+        };
+        let prefix = format!("      c5 s0{} f.bin         ", " ".repeat(15));
+        assert_eq!(
+            exfat_decision_line(FITS, &DeletedSetOutcome::Recoverable { file: file(1024) }),
+            format!("{prefix}cluster 30, 1024 bytes, conditions 4, 1, 2 and 3 passed")
+        );
+        assert_eq!(
+            exfat_decision_line(FITS, &DeletedSetOutcome::Recoverable { file: file(600) }),
+            format!(
+                "{prefix}cluster 30, 1024 bytes, conditions 4, 1, 2 and 3 passed, \
+                 600 bytes valid, the rest written as zeros"
+            )
+        );
+    }
+
+    /// The exFAT caveat keeps to the width the FAT32 paragraphs keep to,
+    /// and names each check and why it is not evidence of the file.
+    #[test]
+    fn the_exfat_caveat_fits_fifty_columns_and_states_its_limit() {
+        for line in EXFAT_CAVEAT {
+            assert!(line.chars().count() <= 50, "{line}");
+        }
+        // The planning session's text (M15-6b2 review note 1), true whether
+        // or not content was read.
+        assert_eq!(
+            EXFAT_CAVEAT,
+            [
+                "A deleted exFAT file is reported with the",
+                "checks it passed. They show its metadata intact",
+                "and its clusters unclaimed, not that the data is",
+                "this file's: data can be stale, or never",
+                "written, while all of its metadata is intact.",
+            ]
+        );
     }
 
     #[test]

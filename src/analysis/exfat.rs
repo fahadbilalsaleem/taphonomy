@@ -17,13 +17,16 @@ use crate::evidence::EvidenceReader;
 use crate::exfat_boot::{ExFatBootFailure, ExFatBootSector, parse_boot_region};
 use crate::exfat_directory::{
     DeletedDirectoriesRead, DeletedSetError, DeletedSetOutcome, DirItem, DirectorySource,
-    DirectorySummary, ExFatBitmapEntry, ExFatBitmapError, ExFatDirectoryError, ExFatReader,
-    ExFatStructureError, Limits,
+    DirectorySummary, ExFatBitmapEntry, ExFatBitmapError, ExFatDirectoryError, ExFatFile,
+    ExFatPosition, ExFatReader, ExFatStructureError, Limits,
 };
+use crate::exfat_recovery;
+use crate::extraction::Destination;
 use crate::filesystem::{UnknownReason, VolumeExtent};
 use crate::partition::MbrPartition;
+use crate::validation::{Outcome, validate};
 
-use super::{Event, MAX_DEPTH, RunCounts, Sink};
+use super::{Event, MAX_DEPTH, Options, RunCounts, Sink, delivery};
 
 /// How a directory was reached, for the heading its listing is printed under.
 ///
@@ -79,6 +82,17 @@ pub enum ExFatPhaseTwoStopped<'a> {
     Decide(&'a DeletedSetError),
 }
 
+/// Where a volume lies and how it is to be analysed: its partition's extent
+/// and MBR entry, the reader's bounds, and the operator's options.
+#[derive(Clone, Copy)]
+struct Volume<'a> {
+    extent: VolumeExtent,
+    limits: Limits,
+    /// MBR entry, 1 to 4, which names the artifacts written from it.
+    partition: u8,
+    options: Options<'a>,
+}
+
 /// What the live walk of one volume gathered for phase 2.
 #[derive(Default)]
 struct VolumeWalk {
@@ -132,11 +146,20 @@ pub(super) fn report_identified<R: EvidenceReader>(
     evidence: &mut R,
     partition: &MbrPartition,
     extent: VolumeExtent,
+    options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
     match parse_boot_region(evidence, extent) {
-        Ok(boot) => report_volume(evidence, &boot, extent, Limits::DEFAULT, counts, sink),
+        Ok(boot) => {
+            let volume = Volume {
+                extent,
+                limits: Limits::DEFAULT,
+                partition: partition.index,
+                options,
+            };
+            report_volume(evidence, &boot, volume, counts, sink);
+        }
         Err(failure) => report_boot_failure(partition, failure, counts, sink),
     }
 }
@@ -156,6 +179,7 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
     partition: &MbrPartition,
     sector_zero: &UnknownReason,
     extent: VolumeExtent,
+    options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) -> bool {
@@ -165,7 +189,13 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
                 partition,
                 sector_zero,
             });
-            report_volume(evidence, &boot, extent, Limits::DEFAULT, counts, sink);
+            let volume = Volume {
+                extent,
+                limits: Limits::DEFAULT,
+                partition: partition.index,
+                options,
+            };
+            report_volume(evidence, &boot, volume, counts, sink);
             true
         }
         // A region that validates as exFAT was found, and what it says is
@@ -215,14 +245,14 @@ fn report_boot_failure(
 fn report_volume<R: EvidenceReader>(
     evidence: &mut R,
     boot: &ExFatBootSector,
-    extent: VolumeExtent,
-    limits: Limits,
+    volume: Volume<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
     sink.record(Event::ExFatBootRegion(boot));
 
-    let mut reader = ExFatReader::new(evidence, boot, extent, limits);
+    let limits = volume.limits;
+    let mut reader = ExFatReader::new(evidence, boot, volume.extent, limits);
     let mut pending: VecDeque<Pending> = VecDeque::new();
 
     // Directories named and never queued, because queueing them would hold
@@ -344,18 +374,32 @@ fn report_volume<R: EvidenceReader>(
     }
 
     let every_directory_read = counts.directories_unread == unread_before;
-    report_deleted_sets(&mut reader, &walk, every_directory_read, counts, sink);
+    report_deleted_sets(
+        &mut reader,
+        &walk,
+        every_directory_read,
+        volume,
+        counts,
+        sink,
+    );
 }
 
 /// Phase 2 (ADR-0022 sections 5 and 6, Appendix E, S6-1 to S6-3): checks
 /// the bitmap, reads the deleted directories, follows the claims, and
 /// decides every recorded deleted set in the order the walk recorded them.
-/// Content is never read here. Where phase 2 does not run or stops, every
-/// set not yet decided is counted not assessed, with one event saying why.
+/// Where phase 2 does not run or stops, every set not yet decided is counted
+/// not assessed, with one event saying why.
+///
+/// Content is read only under `--recover` (ADR-0022 Decision G): condition 3
+/// is then decided before any file is opened, and each recoverable set is
+/// extracted (Decision H). An extraction that fails is counted not extracted
+/// and the next set is decided, as FAT32's loop does; only an error while
+/// deciding stops phase 2 (S6-3).
 fn report_deleted_sets<R: EvidenceReader>(
     reader: &mut ExFatReader<'_, R>,
     walk: &VolumeWalk,
     every_directory_read: bool,
+    volume: Volume<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
@@ -403,18 +447,76 @@ fn report_deleted_sets<R: EvidenceReader>(
 
     let recorded = reader.deleted_sets_recorded();
     for index in 0..recorded {
-        match reader.decide_deleted_set(index, &mut bitmap, &claims, false) {
+        let recover = volume.options.recover;
+        match reader.decide_deleted_set(index, &mut bitmap, &claims, recover) {
             Ok(decision) => {
                 count_outcome(&decision.outcome, counts);
                 sink.record(Event::ExFatDeletedSetDecided {
                     position: decision.position,
                     outcome: &decision.outcome,
                 });
+                if let DeletedSetOutcome::Recoverable { file } = &decision.outcome {
+                    report_extraction(reader, decision.position, file, volume, counts, sink);
+                }
             }
             Err(error) => {
                 let left = recorded - index;
                 return leave_not_assessed(Stopped::Decide(&error), left, counts, sink);
             }
+        }
+    }
+}
+
+/// Extracts one recoverable set (ADR-0022 Decision H), validates its digest
+/// against the operator's reference, and reports it, as `report_recovery`
+/// does for a FAT32 run. A failure is counted and reported, and is not
+/// returned: the caller goes on to the next set.
+fn report_extraction<R: EvidenceReader>(
+    reader: &mut ExFatReader<'_, R>,
+    position: ExFatPosition,
+    file: &ExFatFile,
+    volume: Volume<'_>,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    // The path is composed from the partition, the File entry's position
+    // and the first cluster; no byte of evidence reaches it.
+    let destination = volume.options.output.map(|directory| Destination {
+        directory,
+        partition: volume.partition,
+        cluster: position.cluster,
+        slot: position.slot,
+    });
+
+    match exfat_recovery::extract(reader, position, file, destination) {
+        Ok(extraction) => {
+            let (delivered, readback_matches) = delivery(&extraction);
+            if !delivered {
+                counts.exfat_not_delivered += 1;
+            }
+            let validation = validate(
+                extraction.digest,
+                extraction.bytes_hashed,
+                volume.options.reference,
+            );
+            if validation.outcome == Outcome::Match {
+                counts.exfat_matched += 1;
+            }
+            sink.record(Event::ExFatExtracted {
+                position,
+                file,
+                extraction: &extraction,
+                validation,
+                readback_matches,
+            });
+        }
+        Err(error) => {
+            counts.exfat_not_extracted += 1;
+            sink.record(Event::ExFatNotExtracted {
+                position,
+                file,
+                error: &error,
+            });
         }
     }
 }
@@ -462,9 +564,9 @@ fn count_outcome(outcome: &DeletedSetOutcome, counts: &mut RunCounts) {
         O::ConditionOne { .. } => &mut counts.exfat_refused_condition_1,
         O::ConditionTwo { .. } => &mut counts.exfat_refused_condition_2,
         O::NoValidData { .. } | O::ZerosOnly { .. } => &mut counts.exfat_refused_condition_3,
-        // Content is never read here, so `Recoverable` cannot occur; it is
-        // counted with the sets that passed until reading content splits it.
-        O::ConditionThreeNotChecked { .. } | O::Recoverable { .. } => &mut counts.exfat_passed,
+        // Passed without content read; with it, condition 3 decided too.
+        O::ConditionThreeNotChecked { .. } => &mut counts.exfat_passed,
+        O::Recoverable { .. } => &mut counts.exfat_recoverable,
     };
     *count += 1;
 }
@@ -539,9 +641,13 @@ mod tests {
     use crate::exfat_boot::{BootRegion, ExFatError};
     use crate::exfat_directory::escaped_name;
     use crate::exfat_directory::tests::{
-        Vol, at_times, deleted, directory, extent, file, file_set, mark, orphan_stream, seal,
-        standard_root, structured, utf16, with_root,
+        Vol, at_times, cluster_data, deleted, directory, extent, file, file_set, fill_clusters,
+        mark, orphan_stream, seal, standard_root, structured, utf16, with_root,
     };
+    use crate::exfat_recovery::tests::scratch;
+    use crate::hash::Sha256Digest;
+    use std::fs;
+    use std::path::Path;
 
     /// Each event as one line of text, in order, so a test reads as a
     /// transcript. Only the exFAT events say anything.
@@ -590,6 +696,17 @@ mod tests {
                 Event::ExFatClaimsAssessed(claims) => {
                     format!("claims for {} sets", claims.verdicts.len())
                 }
+                Event::ExFatExtracted {
+                    position,
+                    extraction,
+                    ..
+                } => format!(
+                    "extracted c{} s{} {}",
+                    position.cluster, position.slot, extraction.digest
+                ),
+                Event::ExFatNotExtracted { position, .. } => {
+                    format!("not extracted c{} s{}", position.cluster, position.slot)
+                }
                 _ => "other".to_string(),
             };
             self.0.push(line);
@@ -637,19 +754,35 @@ mod tests {
         }
     }
 
-    fn analyse(vol: &mut Vol, limits: Limits) -> (RunCounts, Vec<String>) {
+    /// The default invocation: no content read, nothing written.
+    const NOT_RECOVERING: Options<'static> = Options {
+        recover: false,
+        reference: None,
+        output: None,
+    };
+
+    /// Analyses the synthetic volume through `evidence`, as partition 1.
+    fn analyse_through<R: EvidenceReader>(
+        evidence: &mut R,
+        boot: &ExFatBootSector,
+        limits: Limits,
+        options: Options<'_>,
+    ) -> (RunCounts, Vec<String>) {
         let mut counts = RunCounts::default();
         let mut transcript = Transcript(Vec::new());
-        let boot = vol.boot.clone();
-        report_volume(
-            &mut vol.image,
-            &boot,
-            extent(),
+        let volume = Volume {
+            extent: extent(),
             limits,
-            &mut counts,
-            &mut transcript,
-        );
+            partition: 1,
+            options,
+        };
+        report_volume(evidence, boot, volume, &mut counts, &mut transcript);
         (counts, transcript.0)
+    }
+
+    fn analyse(vol: &mut Vol, limits: Limits) -> (RunCounts, Vec<String>) {
+        let boot = vol.boot.clone();
+        analyse_through(&mut vol.image, &boot, limits, NOT_RECOVERING)
     }
 
     #[test]
@@ -994,6 +1127,7 @@ mod tests {
             &partition,
             &sector_zero,
             extent,
+            NOT_RECOVERING,
             &mut counts,
             &mut transcript,
         );
@@ -1251,8 +1385,15 @@ mod tests {
         write: Option<(u64, Vec<u8>)>,
         fail: Option<std::ops::Range<u64>>,
     ) -> (RunCounts, Vec<String>) {
-        let mut counts = RunCounts::default();
-        let mut transcript = Transcript(Vec::new());
+        analyse_tripped_with(vol, write, fail, NOT_RECOVERING)
+    }
+
+    fn analyse_tripped_with(
+        vol: &mut Vol,
+        write: Option<(u64, Vec<u8>)>,
+        fail: Option<std::ops::Range<u64>>,
+        options: Options<'_>,
+    ) -> (RunCounts, Vec<String>) {
         let boot = vol.boot.clone();
         let mut tripwire = Tripwire {
             image: &mut vol.image,
@@ -1261,15 +1402,7 @@ mod tests {
             write,
             fail,
         };
-        report_volume(
-            &mut tripwire,
-            &boot,
-            extent(),
-            Limits::DEFAULT,
-            &mut counts,
-            &mut transcript,
-        );
-        (counts, transcript.0)
+        analyse_through(&mut tripwire, &boot, Limits::DEFAULT, options)
     }
 
     /// A byte of the set's name changes after the walk: read again, its
@@ -1451,5 +1584,150 @@ mod tests {
             transcript.last().map(String::as_str),
             Some("not assessed 1: not read whole")
         );
+    }
+
+    // --- recovering under --recover (ADR-0022 Decisions G and H) ------------
+
+    fn digest_of(bytes: &[u8]) -> crate::hash::Sha256Digest {
+        let mut hasher = crate::hash::Sha256Hasher::new();
+        hasher.update(bytes);
+        hasher.finish().digest
+    }
+
+    /// `found`, two clusters at 30 and 31 in a chain, holding bytes that are
+    /// not zeros: recoverable once content is read.
+    fn with_found() -> (Vol, Vec<u8>) {
+        let mut vol = with_root(&deleted(file("found", 30, 1024)));
+        vol.chain(&[30, 31]);
+        fill_clusters(&mut vol, &[30, 31]);
+        (vol, [cluster_data(30), cluster_data(31)].concat())
+    }
+
+    fn recovering<'a>(output: Option<&'a Path>, reference: Option<Sha256Digest>) -> Options<'a> {
+        Options {
+            recover: true,
+            reference,
+            output,
+        }
+    }
+
+    /// Read, written under its position's name, and counted as an artifact;
+    /// nothing else counted, and the volume complete.
+    #[test]
+    fn a_recoverable_set_is_extracted_written_and_counted() {
+        let dir = scratch("analysis-recovered");
+        let (mut vol, data) = with_found();
+        let boot = vol.boot.clone();
+
+        let (counts, transcript) = analyse_through(
+            &mut vol.image,
+            &boot,
+            Limits::DEFAULT,
+            recovering(Some(&dir), None),
+        );
+        assert_eq!(decided(&transcript), ["c2 s5 recoverable"]);
+        assert!(
+            transcript.contains(&format!("extracted c2 s5 {}", digest_of(&data))),
+            "{transcript:?}"
+        );
+        assert_eq!(
+            fs::read(dir.join("p1-c2-s5-first-30.bin")).expect("written"),
+            data
+        );
+        assert_eq!(counts.exfat_recoverable(), 1);
+        assert_eq!(counts.exfat_artifacts(), 1);
+        assert_eq!(counts.exfat_passed(), 0);
+        assert_eq!(counts.exfat_not_extracted(), 0);
+        assert_eq!(counts.exfat_not_delivered(), 0);
+        assert_eq!(counts.coverage(), Coverage::Complete);
+    }
+
+    /// The reference is the content's digest, then another's: one match,
+    /// then one difference.
+    #[test]
+    fn an_exfat_extraction_is_compared_with_the_reference() {
+        let (mut vol, data) = with_found();
+        let boot = vol.boot.clone();
+        let reference = digest_of(&data);
+        let options = recovering(None, Some(reference));
+
+        let (counts, _) = analyse_through(&mut vol.image, &boot, Limits::DEFAULT, options);
+        assert_eq!(counts.exfat_matched(), 1);
+        assert_eq!(counts.exfat_differed(options), 0);
+
+        let options = recovering(None, Some(digest_of(b"another file")));
+        let (counts, _) = analyse_through(&mut vol.image, &boot, Limits::DEFAULT, options);
+        assert_eq!(counts.exfat_matched(), 0);
+        assert_eq!(counts.exfat_differed(options), 1);
+
+        // No reference: nothing compared, so nothing differed. No
+        // destination: nothing asked for, so nothing undelivered.
+        let options = recovering(None, None);
+        let (counts, _) = analyse_through(&mut vol.image, &boot, Limits::DEFAULT, options);
+        assert_eq!(counts.exfat_artifacts(), 1);
+        assert_eq!(counts.exfat_differed(options), 0);
+        assert_eq!(counts.exfat_not_delivered(), 0);
+        assert_eq!(counts.coverage(), Coverage::Complete);
+    }
+
+    /// A file of that name is there already: the artifact stands, it was
+    /// not delivered, and that is a gap.
+    #[test]
+    fn an_exfat_artifact_not_delivered_is_a_gap() {
+        let dir = scratch("analysis-not-delivered");
+        fs::write(dir.join("p1-c2-s5-first-30.bin"), b"the operator's").expect("planting");
+        let (mut vol, _) = with_found();
+        let boot = vol.boot.clone();
+
+        let (counts, _) = analyse_through(
+            &mut vol.image,
+            &boot,
+            Limits::DEFAULT,
+            recovering(Some(&dir), None),
+        );
+        assert_eq!(counts.exfat_artifacts(), 1);
+        assert_eq!(counts.exfat_not_delivered(), 1);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// `a`'s second cluster fails once phase 2 has begun. Deciding `a`
+    /// reads only its first cluster, which is not zeros, so it is
+    /// recoverable; extracting it reads the second and fails. `b` is still
+    /// decided and extracted: an extraction error does not stop phase 2.
+    #[test]
+    fn an_extraction_error_is_counted_and_the_next_set_is_still_extracted() {
+        let dir = scratch("analysis-not-extracted");
+        let mut extra = deleted(file("a", 30, 1024));
+        extra.extend(deleted(file("b", 40, 512)));
+        let mut vol = with_root(&extra);
+        vol.chain(&[30, 31]);
+        vol.chain(&[40]);
+        fill_clusters(&mut vol, &[30, 31, 40]);
+        let second = Vol::cluster_offset(31);
+
+        let (counts, transcript) = analyse_tripped_with(
+            &mut vol,
+            None,
+            Some(second..second + 512),
+            recovering(Some(&dir), None),
+        );
+        assert_eq!(
+            decided(&transcript),
+            ["c2 s5 recoverable", "c2 s8 recoverable"]
+        );
+        assert!(
+            transcript.contains(&"not extracted c2 s5".to_string()),
+            "{transcript:?}"
+        );
+        assert!(
+            transcript.contains(&format!("extracted c2 s8 {}", digest_of(&cluster_data(40)))),
+            "{transcript:?}"
+        );
+        assert_eq!(counts.exfat_recoverable(), 2);
+        assert_eq!(counts.exfat_not_extracted(), 1);
+        assert_eq!(counts.exfat_artifacts(), 1);
+        assert!(!dir.join("p1-c2-s5-first-30.bin").exists());
+        assert!(dir.join("p1-c2-s8-first-40.bin").exists());
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
     }
 }

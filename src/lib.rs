@@ -62,6 +62,7 @@ pub mod evidence;
 pub mod exfat_boot;
 pub mod exfat_claims;
 pub mod exfat_directory;
+pub mod exfat_recovery;
 pub mod extraction;
 pub mod fat;
 pub mod fat32;

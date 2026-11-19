@@ -7,8 +7,13 @@
 //! implements only what is reachable, on `ADR-0003` section 8's reasoning
 //! that implementing a level no code path can produce is speculative.
 //!
+//! `ADR-0022` Decision A makes a second level reachable, recorded in
+//! `ADR-0003` Appendix C: an exFAT artifact's extent is read from surviving
+//! metadata, so it is `UNVERIFIED`, and a FAT32 artifact stays
+//! `RECONSTRUCTED`.
+//!
 //! This module is filesystem-independent, as `validation` is. A level
-//! states how content was obtained and says nothing about FAT32. It is
+//! states how content was obtained and names no filesystem. It is
 //! kept apart from `validation` because `ADR-0003` section 5 and
 //! `SAFETY.md` section 14 require the two axes not be merged: this module
 //! says how the bytes were obtained, `validation` says what comparing them
@@ -19,14 +24,16 @@ use std::fmt;
 /// How a recovered artifact's content was obtained.
 ///
 /// `ADR-0003` section 4.1 assigns exactly one level to every artifact.
-/// `ADR-0014` Decision A: for this tool that level is always
-/// [`Confidence::Reconstructed`], and a digest match is reported on the
-/// validator axis rather than raising the level.
+/// `ADR-0014` Decision A: a FAT32 artifact's level is always
+/// [`Confidence::Reconstructed`]; `ADR-0022` Decision A: an exFAT
+/// artifact's is always [`Confidence::Unverified`]. In both, a digest match
+/// is reported on the validator axis rather than raising the level.
 ///
-/// One variant. The other five levels are absent because no code path
+/// Two variants. The other four levels are absent because no code path
 /// produces them, not because they were overlooked: `ADR-0014` section 3
-/// names each and the evidence it would require, and section 11 records
-/// what would make another reachable.
+/// names each and the evidence it would require, section 11 records what
+/// would make another reachable, and `ADR-0003` Appendix C records the
+/// second.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confidence {
     /// Content assembled using inference rather than surviving filesystem
@@ -44,6 +51,19 @@ pub enum Confidence {
     /// position in an ordering. The validator result is recorded
     /// separately, which is what `validation::Validation` carries.
     Reconstructed,
+
+    /// Content read from an extent surviving filesystem metadata states,
+    /// with no format-aware validator to check it.
+    ///
+    /// `ADR-0003` section 3.2's level, read as `ADR-0022` section 3 records:
+    /// extraction succeeded, and the validator section 3.2 means, the
+    /// format-aware one `STRUCTURALLY_VALID` requires, does not exist. An
+    /// exFAT deleted set's entry set, chain and lengths survive deletion
+    /// (EXP-0009, EXP-0011), so its extent is read, not inferred. That
+    /// still does not make the bytes the file's: metadata passing every
+    /// check can lie over stale data, which is why a match never raises
+    /// this level (`ADR-0022` Decision A).
+    Unverified,
 }
 
 impl Confidence {
@@ -64,6 +84,15 @@ impl Confidence {
     pub const fn of_inferred_run() -> Self {
         Self::Reconstructed
     }
+
+    /// The level an artifact carries when its extent was read from
+    /// surviving filesystem metadata, and no format-aware validator exists.
+    ///
+    /// Takes no argument, for the reason [`Self::of_inferred_run`] gives:
+    /// the level follows from the method. `ADR-0022` Decision A.
+    pub const fn of_metadata_extent() -> Self {
+        Self::Unverified
+    }
 }
 
 /// Renders the level as `ADR-0003` section 3.2 names it.
@@ -75,6 +104,7 @@ impl fmt::Display for Confidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reconstructed => f.write_str("RECONSTRUCTED"),
+            Self::Unverified => f.write_str("UNVERIFIED"),
         }
     }
 }
@@ -95,5 +125,14 @@ mod tests {
     #[test]
     fn the_rendered_name_is_the_adrs() {
         assert_eq!(Confidence::Reconstructed.to_string(), "RECONSTRUCTED");
+    }
+
+    /// `ADR-0022` Decision A: an extent read from metadata, with no
+    /// format-aware validator, is `UNVERIFIED`, rendered as `ADR-0003`
+    /// section 3.2 names it.
+    #[test]
+    fn a_metadata_extent_is_unverified() {
+        assert_eq!(Confidence::of_metadata_extent(), Confidence::Unverified);
+        assert_eq!(Confidence::Unverified.to_string(), "UNVERIFIED");
     }
 }

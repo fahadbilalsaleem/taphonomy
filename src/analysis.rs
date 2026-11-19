@@ -26,6 +26,7 @@ use crate::exfat_directory::{
     ClaimsAssessed, DeletedDirectoriesRead, DeletedSetOutcome, DirectorySummary, ExFatBitmapEntry,
     ExFatDirectoryError, ExFatFile, ExFatPosition, SetRefusal,
 };
+use crate::exfat_recovery::ExFatExtractionError;
 use crate::fat_directory::{
     DeletedDirectory, DeletedDirectoryRefusal, DeletedKind, Directory, DirectoryError, Entry,
     EntryKind, FirstByte, associate, begins_directory, enumerate_deleted_directory,
@@ -380,6 +381,26 @@ pub enum Event<'a> {
         outcome: &'a DeletedSetOutcome,
     },
 
+    /// A recovered exFAT set that was read, and what became of it. It
+    /// always follows the set's [`Event::ExFatDeletedSetDecided`].
+    /// `readback_matches` is as on [`Event::Extracted`]. The level is
+    /// `Confidence::of_metadata_extent`'s (`ADR-0022` Decision A).
+    ExFatExtracted {
+        position: ExFatPosition,
+        file: &'a ExFatFile,
+        extraction: &'a Extraction,
+        validation: Validation,
+        readback_matches: Option<bool>,
+    },
+
+    /// A recovered exFAT set whose extraction failed. Counted as not
+    /// extracted; phase 2 goes on to the next set.
+    ExFatNotExtracted {
+        position: ExFatPosition,
+        file: &'a ExFatFile,
+        error: &'a ExFatExtractionError,
+    },
+
     /// Phase 2 did not run on an exFAT volume, or stopped part way, and
     /// left `sets` deleted sets not assessed, for `reason`. S6-1 to S6-3.
     /// Recorded only where `sets` is above zero.
@@ -574,8 +595,25 @@ pub struct RunCounts {
     exfat_deleted_directories: usize,
 
     /// A deleted exFAT set that passed conditions 4, 1 and 2, its content
-    /// not read (ADR-0022 Decision G).
+    /// not read because `--recover` was not given (ADR-0022 Decision G).
     exfat_passed: usize,
+
+    /// A deleted exFAT set that passed all four conditions with its content
+    /// read (ADR-0022 Decision G). Each is extracted, or counted in
+    /// `exfat_not_extracted`.
+    exfat_recoverable: usize,
+
+    /// A recoverable exFAT set whose extraction failed. A gap (ADR-0022
+    /// sections 10 and 11).
+    exfat_not_extracted: usize,
+
+    /// An exFAT artifact read and not handed to the operator: the file
+    /// existed, could not be created, or failed. A gap, as FAT32's is
+    /// (`ADR-0015` Decision G, ADR-0022 section 11).
+    exfat_not_delivered: usize,
+
+    /// An exFAT extraction whose digest equalled the operator's reference.
+    exfat_matched: usize,
 }
 
 impl RunCounts {
@@ -766,6 +804,47 @@ impl RunCounts {
         self.exfat_passed
     }
 
+    /// A deleted exFAT set that passed all four conditions. ADR-0022
+    /// Decision G.
+    pub const fn exfat_recoverable(&self) -> usize {
+        self.exfat_recoverable
+    }
+
+    /// A recoverable exFAT set whose extraction failed. ADR-0022 section 10.
+    pub const fn exfat_not_extracted(&self) -> usize {
+        self.exfat_not_extracted
+    }
+
+    /// An exFAT artifact read and not handed to the operator.
+    pub const fn exfat_not_delivered(&self) -> usize {
+        self.exfat_not_delivered
+    }
+
+    /// An exFAT extraction whose digest equalled the operator's reference.
+    pub const fn exfat_matched(&self) -> usize {
+        self.exfat_matched
+    }
+
+    /// exFAT artifacts produced, each `UNVERIFIED` (ADR-0022 Decision A).
+    ///
+    /// Every recoverable set is extracted or counted as not extracted, as
+    /// [`Self::artifacts`] reasons for FAT32. A set is recoverable only when
+    /// content was read, which only `--recover` does.
+    pub const fn exfat_artifacts(&self) -> usize {
+        self.exfat_recoverable
+            .saturating_sub(self.exfat_not_extracted)
+    }
+
+    /// exFAT extractions compared against a reference that did not equal
+    /// it.
+    pub const fn exfat_differed(&self, options: Options<'_>) -> usize {
+        if options.reference.is_some() {
+            self.exfat_artifacts().saturating_sub(self.exfat_matched)
+        } else {
+            0
+        }
+    }
+
     /// Everything the run did not analyse, counted once per occurrence.
     ///
     /// The eleven kinds `ADR-0014` Appendix B.4 enumerates, the twelfth
@@ -775,7 +854,9 @@ impl RunCounts {
     /// Appendix E adds, less the deleted sets not examined, which `ADR-0022`
     /// section 11 replaces with the four kinds its examination leaves
     /// (deleted sets not assessed and not usable, claimants not followed,
-    /// deleted directories not read). Not every kind is reached by a fixture,
+    /// deleted directories not read), and exFAT's own artifacts not
+    /// extracted and not delivered (`ADR-0022` sections 10 and 11). Not
+    /// every kind is reached by a fixture,
     /// and Appendices B.4 and E record which of theirs are; several are
     /// reached only by unit tests, which is why the derivation below is unit
     /// tested rather than measured alone.
@@ -801,6 +882,8 @@ impl RunCounts {
             + self.exfat_sets_unusable
             + self.exfat_claimants_not_followed
             + self.exfat_deleted_directories_unread
+            + self.exfat_not_extracted
+            + self.exfat_not_delivered
     }
 
     /// How much of the evidence the run covered.
@@ -995,7 +1078,7 @@ fn report_partition<R: EvidenceReader>(
     // it finds decides what the heading says.
     if let Identification::Unknown { reason } = &id
         && p.partition_type == EXFAT_OR_NTFS_TYPE
-        && exfat::report_unidentified_0x07(evidence, p, reason, extent, counts, sink)
+        && exfat::report_unidentified_0x07(evidence, p, reason, extent, options, counts, sink)
     {
         return;
     }
@@ -1016,7 +1099,7 @@ fn report_partition<R: EvidenceReader>(
     match id.filesystem() {
         Some(Filesystem::Fat32) => {}
         Some(Filesystem::ExFat) => {
-            exfat::report_identified(evidence, p, extent, counts, sink);
+            exfat::report_identified(evidence, p, extent, options, counts, sink);
             return;
         }
         Some(_) => {
@@ -1466,6 +1549,25 @@ fn report_subdirectory<R: EvidenceReader>(
     );
 }
 
+/// What became of an extraction's file: whether it was handed to the
+/// operator, and where it was written, whether what was read back equals
+/// the digest. Shared by FAT32's and exFAT's extractions.
+///
+/// `ADR-0015` Decision G and section 9: the digest stands even where the
+/// destination has no say in what the evidence holds. A file that existed,
+/// could not be created, or failed was not delivered; one written and not
+/// read back was, and no comparison is possible. Without a destination
+/// nothing was asked for, so nothing failed to arrive.
+pub(crate) fn delivery(extraction: &Extraction) -> (bool, Option<bool>) {
+    match &extraction.output {
+        None | Some(Output::Unverified { .. }) => (true, None),
+        Some(Output::Written { readback, .. }) => (true, Some(*readback == extraction.digest)),
+        Some(Output::Exists { .. } | Output::NotCreated { .. } | Output::Failed { .. }) => {
+            (false, None)
+        }
+    }
+}
+
 /// Reports what the volume says about each deleted entry's content.
 ///
 /// `ADR-0010` Decision B. Without `--recover` this reads the FAT and reports
@@ -1572,22 +1674,9 @@ fn report_recovery<R: EvidenceReader>(
 
                     match extract(&found, boot, extent, evidence, destination) {
                         Ok(extracted) => {
-                            // `ADR-0015` Decision G and section 9: the digest
-                            // stands even where the destination has no say
-                            // in what the evidence holds.
-                            let mut readback_matches = None;
-                            if let Some(output) = &extracted.output {
-                                match output {
-                                    Output::Exists { .. }
-                                    | Output::NotCreated { .. }
-                                    | Output::Failed { .. } => {
-                                        counts.not_delivered += 1;
-                                    }
-                                    Output::Written { readback, .. } => {
-                                        readback_matches = Some(*readback == extracted.digest);
-                                    }
-                                    Output::Unverified { .. } => {}
-                                }
+                            let (delivered, readback_matches) = delivery(&extracted);
+                            if !delivered {
+                                counts.not_delivered += 1;
                             }
 
                             let validation = validate(
