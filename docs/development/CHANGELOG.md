@@ -87,11 +87,12 @@ history.
 - An exFAT partition, previously counted as a filesystem identified and
   not analysed, is now analysed, so a run's coverage on an exFAT disk
   changes accordingly.
-- The coverage block: the "deleted sets not examined" line, which
-  counted deleted exFAT sets while they were not examined, is gone,
-  because each is now decided or counted not assessed. "Deleted sets
-  not usable", "claimants not followed" and "deleted directories
-  unread" are new gaps (`ADR-0022` section 11). "Entries not assessed",
+- The coverage block: the "deleted sets not examined" line now counts
+  only the deleted sets inside deleted directories, read for their
+  claims and not examined (`ADR-0022` Decision K); every other deleted
+  set is decided or counted not assessed. "Deleted sets not usable",
+  "claimants not followed" and "deleted directories unread" are new
+  gaps (`ADR-0022` section 11). "Entries not assessed",
   "entries not extracted", "artifacts not written" and "compared", and
   the parts of the `unrecovered` line, count both filesystems.
 - The `artifacts` line lists each level with a count above zero, as in

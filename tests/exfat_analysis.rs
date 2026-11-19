@@ -291,8 +291,10 @@ fn reseal(set: &mut [u8]) {
 ///   fails, so it is not usable.
 /// * FILL010.bin (slot 43) marked a directory of one cluster, 219, and
 ///   sealed again; cluster 219 is zeroed and given a copy of FILL012.bin's
-///   set (slot 49) with a byte of its name changed. The directory is read,
-///   and the set inside is not usable, so its claim is unseen.
+///   set (slot 49) with a byte of its name changed, then an intact copy of
+///   a FILL233.bin set. The directory is read: the first set inside is not
+///   usable, so its claim is unseen; the second is recorded for its claim
+///   and not examined.
 #[test]
 fn a_deleted_directory_not_read_and_an_unusable_set_are_gaps_on_image_a() {
     let (output, out) = run_altered_a("directory-and-unusable", |bytes| {
@@ -315,9 +317,14 @@ fn a_deleted_directory_not_read_and_an_unusable_set_are_gaps_on_image_a() {
 
         let mut inside = bytes[image_a_root_slot(49)..image_a_root_slot(49) + 96].to_vec();
         inside[2 * 32 + 2] ^= 1;
+        // A usable set beside it: a FILL233.bin set (cluster 3407, slot
+        // 72), which has no allocation, so its claim changes nothing.
+        let usable_at = image_a_cluster(3407) + 72 * 32;
+        let usable = bytes[usable_at..usable_at + 96].to_vec();
         let cluster = image_a_cluster(219);
         bytes[cluster..cluster + 4096].fill(0);
         bytes[cluster..cluster + 96].copy_from_slice(&inside);
+        bytes[cluster + 96..cluster + 192].copy_from_slice(&usable);
     });
 
     assert_eq!(output.status.code(), Some(0), "{out}");
@@ -332,6 +339,12 @@ fn a_deleted_directory_not_read_and_an_unusable_set_are_gaps_on_image_a() {
     );
     assert!(
         out.contains(&gap_line("claimants not followed", 1)),
+        "{out}"
+    );
+    // The usable set inside FILL010.bin: read for its claim and not
+    // examined (`ADR-0022` Decision K).
+    assert!(
+        out.contains(&gap_line("deleted sets not examined", 1)),
         "{out}"
     );
     for name in ["FILL002.bin", "FILL010.bin"] {

@@ -1048,6 +1048,11 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
         "deleted directories unread",
         counts.exfat_deleted_directories_unread(),
     );
+    // ADR-0022 Decision K's words for a set inside a deleted directory.
+    print_gap(
+        "deleted sets not examined",
+        counts.exfat_sets_inside_not_examined(),
+    );
 
     // Only `--recover` produces an artifact, so without it the line would
     // report a zero that the invocation already determined.

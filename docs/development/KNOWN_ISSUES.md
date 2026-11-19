@@ -511,12 +511,13 @@ Recorded in `ADR-0021` section 14.
 ## Most exFAT gap kinds are reached only by unit tests
 
 EXP-0009's committed images A and B reach no exFAT gap: both report
-`coverage complete` (`tests/exfat_analysis.rs`). That file reaches five
+`coverage complete` (`tests/exfat_analysis.rs`). That file reaches six
 kinds on copies of image A it alters in the test:
 
 * deleted sets not assessed (the bitmap zeroed, so it is not believed);
-* deleted sets not usable, claimants not followed and deleted
-  directories unread (deleted sets altered and sealed again);
+* deleted sets not usable, claimants not followed, deleted directories
+  unread and deleted sets not examined (deleted sets altered and sealed
+  again);
 * artifacts not written (a second run into the same directory).
 
 Every other exFAT gap kind is reached only by unit tests on volumes
@@ -557,9 +558,11 @@ Recorded in `ADR-0022` section 14 and Appendix F.
 ## Files inside deleted exFAT directories are not recovered
 
 A deleted directory is read only for the claims of the sets inside it,
-so condition 2 sees them; nothing in it is decided or recovered. On the
-Linux-made image of `ADR-0022` Appendix F, every deleted file lies in a
-deleted directory, and none is recovered. Recovering them is M16.
+so condition 2 sees them; nothing in it is decided or recovered. Each
+usable set inside is counted as a deleted set not examined, a gap, so a
+volume holding one reports `incomplete`. On the Linux-made image of
+`ADR-0022` Appendix F, every deleted file lies in a deleted directory,
+and none is recovered. Recovering them is M16.
 
 Recorded in `ADR-0022` Decision K and Appendix D.
 

@@ -426,9 +426,10 @@ fn report_deleted_sets<R: EvidenceReader>(
 
     match reader.read_deleted_directories(&mut bitmap) {
         Ok(read) => {
-            let (unread, unseen) = deleted_directory_gaps(&read);
+            let (unread, unseen, not_examined) = deleted_directory_gaps(&read);
             counts.exfat_deleted_directories_unread += unread;
             counts.exfat_claimants_not_followed += unseen;
+            counts.exfat_sets_inside_not_examined += not_examined;
             sink.record(Event::ExFatDeletedDirectoriesRead(&read));
         }
         Err(error) => {
@@ -523,8 +524,10 @@ fn report_extraction<R: EvidenceReader>(
 
 /// The gaps a reading of the deleted directories leaves (ADR-0022 Decision
 /// K, Appendix D): the deleted directories not read whole, each kind of
-/// reason summed, and the sets inside whose claims were not recorded.
-fn deleted_directory_gaps(read: &DeletedDirectoriesRead) -> (usize, usize) {
+/// reason summed; the sets inside whose claims were not recorded; and the
+/// sets inside recorded for their claims, which are never decided, so not
+/// examined. Each set inside is in exactly one of the last two.
+fn deleted_directory_gaps(read: &DeletedDirectoriesRead) -> (usize, usize, usize) {
     let unread = read.not_read_out_of_range
         + read.not_read_malformed
         + read.not_read_in_use
@@ -532,7 +535,11 @@ fn deleted_directory_gaps(read: &DeletedDirectoriesRead) -> (usize, usize) {
         + read.not_read_bound
         + read.partly_read;
     let unseen = read.sets_inside_unusable + read.sets_inside_unrecorded;
-    (unread as usize, unseen as usize)
+    (
+        unread as usize,
+        unseen as usize,
+        read.sets_inside_recorded as usize,
+    )
 }
 
 /// Counts `sets` deleted sets not assessed for `reason`, and reports it
@@ -1306,6 +1313,34 @@ mod tests {
         assert_eq!(counts.exfat_deleted_directories(), 1);
         assert_eq!(counts.exfat_deleted_directories_unread(), 1);
         assert_eq!(counts.exfat_claimants_not_followed(), 0);
+        // Not read, so no set inside was seen to count as not examined.
+        assert_eq!(counts.exfat_sets_inside_not_examined(), 0);
+        assert_eq!(counts.coverage(), Coverage::Incomplete);
+    }
+
+    /// `full` is read and holds two usable sets: each recorded for its
+    /// claim and never decided, a deleted set not examined, and the
+    /// volume's only gap (ADR-0022 Decision K).
+    #[test]
+    fn usable_sets_inside_a_read_deleted_directory_are_not_examined_and_a_gap() {
+        let mut vol = with_root(&deleted(directory("full", 21, 1)));
+        vol.chain(&[21]);
+        let mut inside = deleted(file("a", 0, 0));
+        inside.extend(deleted(file("b", 0, 0)));
+        vol.put(21, 0, &inside);
+
+        let (counts, transcript) = analyse(&mut vol, Limits::DEFAULT);
+        assert_eq!(decided(&transcript), ["c2 s5 deleted directory"]);
+        assert!(
+            transcript.contains(&"deleted directories read 1".to_string()),
+            "{transcript:?}"
+        );
+        assert_eq!(counts.exfat_sets_inside_not_examined(), 2);
+        assert_eq!(counts.exfat_deleted_directories(), 1);
+        assert_eq!(counts.exfat_deleted_directories_unread(), 0);
+        assert_eq!(counts.exfat_claimants_not_followed(), 0);
+        assert_eq!(counts.exfat_not_assessed(), 0);
+        assert_eq!(counts.exfat_sets_unusable(), 0);
         assert_eq!(counts.coverage(), Coverage::Incomplete);
     }
 
@@ -1324,6 +1359,8 @@ mod tests {
         assert_eq!(counts.exfat_deleted_directories(), 1);
         assert_eq!(counts.exfat_deleted_directories_unread(), 0);
         assert_eq!(counts.exfat_claimants_not_followed(), 1);
+        // Counted once, as a claim not followed; never also not examined.
+        assert_eq!(counts.exfat_sets_inside_not_examined(), 0);
         assert_eq!(counts.coverage(), Coverage::Incomplete);
     }
 
@@ -1510,7 +1547,7 @@ mod tests {
             sets_inside_unusable: 64,
             sets_inside_unrecorded: 128,
         };
-        assert_eq!(deleted_directory_gaps(&read), (63, 192));
+        assert_eq!(deleted_directory_gaps(&read), (63, 192, 1 << 14));
     }
 
     /// The bitmap's cluster has no chain in the FAT, so the bitmap cannot

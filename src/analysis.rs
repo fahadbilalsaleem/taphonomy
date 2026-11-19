@@ -572,6 +572,12 @@ pub struct RunCounts {
     /// claims it holds are unseen. A gap (ADR-0022 Decision K, Appendix D).
     exfat_deleted_directories_unread: usize,
 
+    /// A set inside a deleted exFAT directory, recorded for its claim and
+    /// never decided: a deleted set not examined, a gap (ADR-0022 Decision
+    /// K). A set inside that was not usable or not recorded is counted in
+    /// `exfat_claimants_not_followed` instead, so none is counted twice.
+    exfat_sets_inside_not_examined: usize,
+
     /// A deleted exFAT set refused under condition 4, Decision F's second
     /// shape included. A finding (ADR-0022 section 11).
     exfat_refused_condition_4: usize,
@@ -755,6 +761,12 @@ impl RunCounts {
         self.exfat_claimants_not_followed
     }
 
+    /// A set inside a deleted exFAT directory, read for its claim and not
+    /// examined. ADR-0022 Decision K.
+    pub const fn exfat_sets_inside_not_examined(&self) -> usize {
+        self.exfat_sets_inside_not_examined
+    }
+
     /// An exFAT deleted directory not read whole. ADR-0022 Decision K.
     pub const fn exfat_deleted_directories_unread(&self) -> usize {
         self.exfat_deleted_directories_unread
@@ -852,9 +864,10 @@ impl RunCounts {
     /// the fourteenth `ADR-0017` Decision D adds, a partition entry dropped
     /// as malformed (`ADR-0014` Appendix D), the exFAT kinds `ADR-0014`
     /// Appendix E adds, less the deleted sets not examined, which `ADR-0022`
-    /// section 11 replaces with the four kinds its examination leaves
+    /// section 11 replaces with the five kinds its examination leaves
     /// (deleted sets not assessed and not usable, claimants not followed,
-    /// deleted directories not read), and exFAT's own artifacts not
+    /// deleted directories not read, and the sets inside those read, not
+    /// examined: Decision K), and exFAT's own artifacts not
     /// extracted and not delivered (`ADR-0022` sections 10 and 11). Not
     /// every kind is reached by a fixture,
     /// and Appendices B.4 and E record which of theirs are; several are
@@ -882,6 +895,7 @@ impl RunCounts {
             + self.exfat_sets_unusable
             + self.exfat_claimants_not_followed
             + self.exfat_deleted_directories_unread
+            + self.exfat_sets_inside_not_examined
             + self.exfat_not_extracted
             + self.exfat_not_delivered
     }
