@@ -169,9 +169,10 @@ pub const MAX_DELETED_SETS: usize = 1 << 20;
 /// each, 56 MiB at [`MAX_DELETED_SETS`]), the runs sorted and merged, their
 /// boundaries, the ranges they become, a tree of counts (at most 2^22 nodes
 /// of 8 bytes) and the claimants grouped by offset byte. At both bounds the
-/// peak is about 150 MiB: 149 MiB computed from the types' sizes, and 152
-/// MiB resident, measured once in a trial run of 2^20 claimants and 2^20
-/// runs. The most runs claimed on any volume measured is
+/// peak is about 149 MiB, computed from the types' sizes (the record sizes
+/// are held by a test). A single trial run outside the repository, of 2^20
+/// claimants and 2^20 runs, showed about 152 MiB resident; no committed
+/// command repeats it. The most runs claimed on any volume measured is
 /// 262 (dfr-09, dfr-10). A claimant whose claim would pass the bound, and
 /// every one after it, is not recorded: its claims are unseen and, if it is
 /// a set, it is not assessed.
@@ -186,8 +187,9 @@ pub const MAX_CLAIMED_RUNS: usize = 1 << 20;
 /// leaves room for clusters reused by several deleted files, and stops a
 /// volume that points millions of sets at one long chain after reading the
 /// FAT four times over. The most clusters claimed on any volume measured is
-/// 0.9994 of its ClusterCount (dfr-06). Past the bound, the claimant being
-/// followed and every one after it are not recorded.
+/// about one times its ClusterCount (dfr-06): `exp-0011-run.sh` prints 1.00
+/// in its section on clusters claimed by deleted sets. Past the bound, the
+/// claimant being followed and every one after it are not recorded.
 pub const CLAIM_LINKS_PER_CLUSTER: u64 = 4;
 
 /// How many clusters the bitmap check looks up for live allocations, as a
@@ -629,7 +631,12 @@ pub struct ClaimsAssessed {
     /// Runs of clusters held in the claims table.
     pub runs: u64,
 
-    /// FAT links followed.
+    /// Steps taken from one cluster of a chain to the next its claim needs,
+    /// each counted before its FAT entry is read. The count includes a step
+    /// whose entry then does not link on, the one step that passed
+    /// [`CLAIM_LINKS_PER_CLUSTER`]'s bound (counted, and not read), and
+    /// every step of a claimant let go at a bound, whose runs were dropped.
+    /// A contiguous run takes none.
     pub links: u64,
 
     /// Deleted sets the walk found not usable: they claim nothing, so what
@@ -7175,6 +7182,7 @@ pub(crate) mod tests {
         assert_eq!(MAX_CLAIMED_RUNS * std::mem::size_of::<ClaimRun>(), 12 << 20);
         assert_eq!(std::mem::size_of::<OrphanStream>(), 32);
         assert_eq!(std::mem::size_of::<InnerSet>(), 32);
+        assert_eq!(std::mem::size_of::<Claimant>(), 56);
     }
 
     // --- deleted directories (ADR-0022 Decision K) ---------------------------

@@ -414,3 +414,17 @@ describes: the status word names coverage, not success, and the
 
 No decision of this ADR is amended. The six definitions of §3.2 stand
 as written, and §4.1 to §4.6 stand as rules.
+
+---
+
+## Appendix D: Appendix C's table was written before the code (2026-11-19)
+
+Appendix C, dated 2026-10-21, records `UNVERIFIED` as implemented and
+§4.7's aggregate as implemented for two levels. On that date neither
+was: the decision existed (`ADR-0022` Decision A) and the code did not.
+Both have been true since `2ed6c4d` (2026-11-19): every exFAT artifact
+is counted under `Confidence::Unverified`, and the `artifacts` line
+lists each level with a count above zero, as `RECONSTRUCTED` is listed
+for FAT32's. Appendix C's
+table is to be read as the state from that commit. Nothing else in it
+changes.

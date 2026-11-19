@@ -441,6 +441,11 @@ already queued are neither read nor counted as directories not read.
 The root's failure is the gap counted (`root_unread`), and the volume is
 not counted as analysed (`report_volume` in `src/analysis/exfat.rs`).
 
+The deleted sets the root showed before it failed are counted as not
+assessed, since `a3448e5`
+(`deleted_sets_of_a_root_not_read_whole_are_not_assessed`). The
+subdirectories are still not counted.
+
 Found while documenting M14 (2026-10-20). Not fixed.
 
 ---
@@ -449,9 +454,11 @@ Found while documenting M14 (2026-10-20). Not fixed.
 
 exfatprogs' checker treats such an entry as an error
 (`ER_FILE_FIRST_CLUS`). Taphonomy has refused it for a directory since
-`780d6f0`, and still accepts it for a file.
+`780d6f0`, and still accepts it for a live file. A deleted set of that
+shape is refused under condition 4 (`ADR-0022` Decision F, since
+`c9f0279`).
 
-Recorded in `ADR-0021` sections 5 and 10.
+Recorded in `ADR-0021` sections 5 and 10, and `ADR-0022` section 8.
 
 ---
 
@@ -469,10 +476,15 @@ Seen in `read_content` in `src/exfat_directory.rs`. Not fixed.
 
 Every other error is found before the first byte is handed over. A read
 failure part way through leaves the bytes already handed over, and
-they stand. M15, which writes content through `ArtifactWriter`, must
-call `abort` on such an error.
+they stand: `read_content` itself does not undo them. Its caller is the
+guard. M15 writes recovered content through `ArtifactWriter` in
+`exfat_recovery::extract`, which calls `abort` on any error, so no
+partial file is left
+(`an_evidence_error_part_way_through_removes_the_partial_file`). Any
+other caller must do the same.
 
-Recorded in `ADR-0021` section 8 and `ADR-0020` Decision C.
+Recorded in `ADR-0021` section 8, `ADR-0020` Decision C and `ADR-0022`
+Decision H.
 
 ---
 
@@ -498,9 +510,123 @@ Recorded in `ADR-0021` section 14.
 
 ## Most exFAT gap kinds are reached only by unit tests
 
-EXP-0009's images A and B reach one exFAT gap kind, "deleted sets not
-examined", and no other. The other two new kinds, and the exFAT cases
-of the older kinds, are reached only by unit tests on volumes built in
-memory. No fixture holds them.
+EXP-0009's committed images A and B reach no exFAT gap: both report
+`coverage complete` (`tests/exfat_analysis.rs`). That file reaches five
+kinds on copies of image A it alters in the test:
 
-Recorded in `ADR-0014` Appendix E.
+* deleted sets not assessed (the bitmap zeroed, so it is not believed);
+* deleted sets not usable, claimants not followed and deleted
+  directories unread (deleted sets altered and sealed again);
+* artifacts not written (a second run into the same directory).
+
+Every other exFAT gap kind is reached only by unit tests on volumes
+built in memory: entry sets not used, entries after end marker, the
+exFAT cases of directories and root directories not read, and entries
+not extracted. No committed command prints which gap lines the public
+images reach.
+
+Recorded in `ADR-0014` Appendix E and `ADR-0022` section 11.
+
+---
+
+## Volumes with no partition table are not read
+
+A disk image that is one volume with no partition table, a superfloppy,
+is read as if its first sector were an MBR. On two of the images
+published with Nordvik and Axelsson's study the exFAT boot code is read
+as a partition table, and nothing is analysed: the run reports
+`coverage none`, failing closed rather than misreading the volume.
+
+Found running those images (2026-10-29); the author decided then to fix
+it after M15. Recorded here only. Not fixed.
+
+---
+
+## GPT disks are not analysed
+
+A GPT disk is detected and reported as unsupported. NIST's nine GPT
+exFAT deleted-file-recovery images are therefore measured only by
+EXP-0011's scripts, never through the binary. Among them are dfr-02 and
+dfr-05, on which `ADR-0022` section 15 expects two wrong recoveries;
+that they are not seen is not evidence that they are fixed.
+
+Recorded in `ADR-0022` section 14 and Appendix F.
+
+---
+
+## Files inside deleted exFAT directories are not recovered
+
+A deleted directory is read only for the claims of the sets inside it,
+so condition 2 sees them; nothing in it is decided or recovered. On the
+Linux-made image of `ADR-0022` Appendix F, every deleted file lies in a
+deleted directory, and none is recovered. Recovering them is M16.
+
+Recorded in `ADR-0022` Decision K and Appendix D.
+
+---
+
+## Stale exFAT data that is not zeros is recovered as the file's
+
+A deleted set whose metadata passes every check can lie over clusters
+that hold another file's data, or data never written. Condition 3
+detects only zeros, so such data is recovered and labelled `UNVERIFIED`,
+with a caveat that the checks do not show the data is the file's.
+`ADR-0022` section 15 names two such recoveries on NIST's GPT images.
+
+Recorded in `ADR-0022` sections 15 and 16, and `ADR-0019` section 5.
+EXP-0010 is open.
+
+---
+
+## Condition 2 compares close times with no margin
+
+Two claims whose times are close are ordered by those times as they
+stand. The same offset byte on two sets is not proof that one clock
+wrote both, so two sets can be ordered wrongly, and the earlier
+recovered.
+
+Decided in S6-6 (`ADR-0022` Appendix E); the limit is recorded in
+`ADR-0022` Appendix C. Not changed.
+
+---
+
+## The command line panics when its output is closed early
+
+Piping the output into a command that stops reading, such as `| head`,
+makes the process panic with "failed printing to stdout: Broken pipe".
+Rust's `println!` panics when standard output is a closed pipe, and the
+command line prints through it.
+
+Found 2026-11-19. Not fixed.
+
+---
+
+## exFAT's "not extracted" sums are not tested through the binary
+
+An exFAT extraction that fails part way is counted as not extracted,
+and a unit test holds the count
+(`an_extraction_error_is_counted_and_the_next_set_is_still_extracted`).
+The two summary lines that add it to FAT32's, `entries not extracted`
+and the `not extracted` part of `unrecovered`, are reached by no test
+through the binary: no image file can make a read fail part way through
+an extraction.
+
+Recorded in the M15 stage 6b2 review.
+
+---
+
+## exFAT claims: worst-case memory is computed, and measured once outside
+
+The claims table holds at most `MAX_CLAIMED_RUNS` (2^20) runs of 12
+bytes: 12 MiB full, up to 18 MiB while it grows. Each claimant is 56
+bytes, 56 MiB at `MAX_DELETED_SETS` (2^20). Deciding condition 2 holds
+these, the runs sorted and merged, their boundaries, the ranges they
+become, a tree of counts and the claimants grouped by offset byte. At
+both bounds the peak is about 149 MiB, computed from the types' sizes;
+the run and claimant sizes are held by
+`claim_records_are_the_sizes_their_bounds_assume`. A single trial run
+outside the repository, of 2^20 claimants and 2^20 runs, showed about
+152 MiB resident. No committed command repeats that measurement.
+
+Recorded in `ADR-0022` section 12 and the docs of `MAX_CLAIMED_RUNS` in
+`src/exfat_directory.rs`.

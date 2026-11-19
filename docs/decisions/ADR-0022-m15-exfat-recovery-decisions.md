@@ -948,3 +948,92 @@ held by a test, and need none: a set unusable on re-read has no file to
 decide, and a set with no data charges the bound nothing, so the
 bound's place before or after it changes no outcome. No public image is
 decided yet: that is stage 6b's and section 14's.
+
+---
+
+## Appendix F: acceptance (2026-11-19)
+
+Stage 6 is committed (`c9f0279`, `a3448e5`, `2ed6c4d`): the analysis
+decides every recorded deleted set, and with `--recover` reads its
+content, writes it through `ArtifactWriter` and classifies it
+`UNVERIFIED` (Decisions A, G, H, I). Section 14's five items were
+checked on the release build of `2ed6c4d` on 2026-11-19 by the planning
+session, under the decision-making the author delegated on 2026-11-13.
+
+**Items 1 and 2: EXP-0009's images.** On image B the binary recovers 99
+files, `FRAG.bin` among them by its chain; refuses `FILL006.bin` under
+condition 1, three sets under condition 2 and sixteen under condition 3;
+and reports the six `FILL233.bin` sets as holding no data. On image A it
+recovers 96, refuses four under condition 1 and sixteen under condition
+3, and reports six as holding no data; the copy of A with its first
+exFAT sector zeroed gives the same. Every recovered file equals, byte for
+byte, what EXP-0009's generator wrote for that name and length. These
+are held by `tests/exfat_analysis.rs`, whose expected figures come from
+EXP-0011's scripts and whose content check reimplements the generator,
+never from the binary.
+
+**Item 3: agreement with EXP-0011.** `scripts/experiments/m15-acceptance.sh`
+runs the binary with `--recover --output` on NIST's eleven MBR images
+and the Linux image, and for each deleted set the scripts decide outside
+a deleted directory compares the binary's decision with
+`exp-0011-score-nist.py`'s under rule `moec`. For each set the binary
+recovers, it requires one written file equal to the clusters the scanner
+lists up to ValidDataLength and zeros after, and judges it by ground
+truth: NIST's block tags, or the format of macOS's own files, through
+the scorer's `truth`; the published originals for the Linux image.
+
+| Image | Sets decided | Agree | Recovered | Right |
+| --- | --- | --- | --- | --- |
+| dfr-05-braid | 4 | 4 | 3 | 3 |
+| dfr-05-nest | 5 | 5 | 2 | 2 |
+| dfr-06 | 3 | 3 | 2 | 2 |
+| dfr-07-one | 4 | 4 | 2 | 2 |
+| dfr-07-two | 3 | 3 | 1 | 1 |
+| dfr-08 | 15 | 15 | 14 | 14 |
+| dfr-09 | 262 | 262 | 261 | 261 |
+| dfr-10 | 262 | 262 | 261 | 261 |
+| dfr-13 | 121 | 121 | 82 | 82 |
+| dfr-15 | 2 | 2 | 1 | 1 |
+| dfr-17 | 2 | 2 | 1 | 1 |
+| Linux | 4 | 4 | 0 | 0 |
+| **Total** | **687** | **687** | **630** | **630** |
+
+No recovery is wrong. The two wrong recoveries of section 15 lie on
+dfr-02 and dfr-05, both GPT images, which the binary does not read, so
+none was expected here; this is not evidence that they are fixed. The
+Linux image's deleted files lie inside deleted directories, which are
+read for their claims and not recovered (Decision K), so its originals
+judged no recovery. Each part of the check was shown able to fail before
+it was relied on: a decision printed as another, a byte of a written
+file changed, another file's content under a set's name, and a refused
+set reported recovered with its data each produced a failure.
+
+**Item 4: identity.** At stages 6b1 and 6b2 the binary before and after
+was run in the three modes of `ADR-0018` section 5 over the 31 `.img`
+fixtures, by two scripts written apart, and by one of them over the
+three CFReDS images as well. Every run on an image with no exFAT volume
+gave the same standard output, standard error, exit status and written
+files; on A, zeroed A and B every line of the live listing was
+unchanged.
+
+**Item 5: unit tests.** Each case has a test at `2ed6c4d`: the offset
+rule, both shapes of Decision F, a bitmap that is a chain, the bitmap
+check, an orphan stream, a live entry inside a deleted span, a set
+straddling two directory clusters, a deleted directory read for claims
+and one that is not (a cluster in use, a cluster already read, a chain
+not its length), a set in use inside a deleted directory, the sweep
+against a direct check of every pair, both claims bounds, and an
+evidence error part way through a write. The removals that show each
+failing with its rule removed are recorded in each stage's review, not
+repeated here.
+
+**Section 5's algorithm and section 12's bounds.** Appendix C's two-pass
+decision replaced section 5's single-flag sweep; it was implemented by
+`d7ad2a0`, and its test compares it with a direct check of every pair.
+Section 12 calls each bound "a parameter a test can make small".
+`Limits::claimed_runs` is one. `CLAIM_LINKS_PER_CLUSTER` is a constant;
+the link bound it sets scales with the volume's ClusterCount, and tests
+make it small through a volume with few clusters.
+
+**Not measured:** NIST's nine GPT images, until GPT is read;
+recovery inside deleted directories, which is M16.

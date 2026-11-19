@@ -351,15 +351,21 @@ partition's filesystem from its structure. On a FAT32 volume it reads every
 directory the root reaches, a deleted one from its first cluster alone, and
 then searches the clusters it did not reach for directories nothing names.
 It recovers a file whose implied run is entirely free and refuses one whose
-run reaches a cluster in use. With `--output` each artifact is written, read
-back and verified; with `--reference-digest` it is compared against the
-operator's digest. Every artifact carries the one confidence level
-`ADR-0003`'s model leaves reachable, and every run states what it did not
-analyse.
+run reaches a cluster in use. On an exFAT volume it reads every directory
+and live file, decides each deleted file in two phases, and with
+`--recover` recovers those that meet the conditions of `ADR-0022`. With
+`--output` each artifact is written, read back and verified; with
+`--reference-digest` it is compared against the operator's digest. A FAT32
+artifact is `RECONSTRUCTED` and an exFAT artifact `UNVERIFIED`, the two
+levels `ADR-0003`'s model leaves reachable, and every run states what it
+did not analyse.
 
 Milestones M1 to M9 of `ADR-0002` section 8 are complete. M10 added the
 output path (`ADR-0015`), M11 the reading of every directory
 (`ADR-0016`), and M12 the search for orphaned directories (`ADR-0017`).
+M13 added the shared artifact writer (`ADR-0020`), M14 the reading of
+exFAT volumes (`ADR-0021`), and M15 the recovery of deleted exFAT files
+(`ADR-0022`), accepted on 2026-11-19 (Appendix F).
 
 The test fixtures, 28 disk images, are generated from ordinary filesystem
 tools and are byte-identical on every build. EXP-0008 measured the tool
@@ -377,9 +383,9 @@ Against the phases of section 8:
 | 1 Safe device discovery | Not started: the tool reads disk images, and physical devices are outside its current scope |
 | 2 Evidence acquisition | Not started, for the same reason |
 | 3 Evidence inspection | Done for MBR partition tables and the FAT family's identification |
-| 4 First recovery engine | Done for FAT32 |
+| 4 First recovery engine | Done for FAT32 and exFAT |
 | 5 Recovery laboratory | In part: deletion, two fragmentation arrangements, single-field corruption and known-good files are fixtures; filesystem-wide corruption and partial damage are not |
-| 6 Additional filesystems | Not started; FAT12 and FAT16 are the nearest |
+| 6 Additional filesystems | In part: exFAT is read and recovered from; FAT12 and FAT16 are the nearest |
 | 7 Specialized recovery | Not started |
 
 Against the development sequence the project began with:
@@ -395,7 +401,7 @@ Against the development sequence the project began with:
    appropriate. In part: regression and integration tests exist; property
    and fuzz tests do not.
 7. Expand recovery capabilities based on research and measured results.
-   Under way: M10 to M12.
+   Under way: M10 to M15.
 
 The technology stack is selected and recorded in ADR-0001. The safety
 and development contracts this section previously described as pending

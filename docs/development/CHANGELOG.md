@@ -16,20 +16,48 @@ history.
   - every live file and directory, with a live file's content readable
     through the library.
 
-  Deleted entry sets are counted and not examined. TexFAT is identified
-  and not analysed.
+  TexFAT is identified and not analysed.
+- Deleted exFAT files are decided, and with `--recover` recovered
+  (`ADR-0019`, `ADR-0022`). Recovery runs in two phases: the walk
+  records every deleted entry set, and only then is each decided, in
+  the order of `ADR-0022` section 6 and Appendix E. A set is refused
+  where its allocation is not well formed (condition 4), a cluster of
+  it is in use in the allocation bitmap (condition 1), a later claim
+  among every claim the walk saw shares a cluster (condition 2), or,
+  with `--recover`, its content up to ValidDataLength is zeros only
+  (condition 3). A recovered file is written through the same writer as
+  a FAT32 artifact, named by its partition, its File entry's cluster and
+  slot, and its first cluster, and classified `UNVERIFIED` (`ADR-0022`
+  Decisions A and H).
+- The allocation bitmap is read through its FAT chain, and is believed
+  only once every cluster the walk read or located as structure, and
+  every live allocation, is marked in use in it (`ADR-0022` Decision E,
+  Appendix A).
+- Deleted exFAT directories are read for the claims of the sets inside
+  them, and nothing in them is recovered (`ADR-0022` Decision K,
+  Appendix D).
+- After each exFAT volume's listing, under the heading `deleted entry
+  sets`, one line per deleted set names what was decided: the condition
+  that refused it, no data, a deleted directory, not assessed and why,
+  or the checks it passed. With `--recover` the extraction lines a FAT32
+  recovery prints follow it.
+- A caveat wherever an exFAT set passed or was recovered: it states the
+  checks passed, and that they do not show the data is the file's
+  (`ADR-0019` section 5).
 - A partition of type `0x07` whose first sector identifies nothing is
   tried as exFAT from its backup boot region. It is reported as
   "filesystem exFAT, identified from its backup boot region".
-- Three new coverage lines: "entry sets not used", "deleted sets not
-  examined" and "entries after end marker". Each is a gap.
+- Two new coverage lines for exFAT directories: "entry sets not used"
+  and "entries after end marker". Each is a gap.
 - A subdirectory whose allocation exceeds its DataLength is reported as
   a directory not read. That covers a chain that goes on, a last link
   that is not end-of-chain, and a first cluster with a DataLength of 0.
 - New public modules `taphonomy::exfat_boot`,
-  `taphonomy::exfat_directory` and `taphonomy::analysis::exfat`, and
-  fourteen `Event` variants whose names begin `ExFat`. No stability is
-  promised for these yet (`ADR-0021` section 14).
+  `taphonomy::exfat_directory`, `taphonomy::exfat_claims`,
+  `taphonomy::exfat_recovery` and `taphonomy::analysis::exfat`,
+  `Confidence::Unverified`, and twenty `Event` variants whose names
+  begin `ExFat`. No stability is promised for these yet (`ADR-0021`
+  section 14).
 
 ### Fixed
 
@@ -59,6 +87,22 @@ history.
 - An exFAT partition, previously counted as a filesystem identified and
   not analysed, is now analysed, so a run's coverage on an exFAT disk
   changes accordingly.
+- The coverage block: the "deleted sets not examined" line, which
+  counted deleted exFAT sets while they were not examined, is gone,
+  because each is now decided or counted not assessed. "Deleted sets
+  not usable", "claimants not followed" and "deleted directories
+  unread" are new gaps (`ADR-0022` section 11). "Entries not assessed",
+  "entries not extracted", "artifacts not written" and "compared", and
+  the parts of the `unrecovered` line, count both filesystems.
+- The `artifacts` line lists each level with a count above zero, as in
+  `artifacts    2 RECONSTRUCTED, 5 UNVERIFIED`. A run with no exFAT
+  artifact prints the line it printed before.
+- An exFAT directory's `entries` count counts a deleted entry set once,
+  however many secondaries it holds, as its documentation says
+  (`ADR-0022` Appendix B). The per-directory line is now `deleted entry
+  sets {n}`, its decisions listed after the volume.
+- EXP-0009's images, which hold no deleted directory and no gap of any
+  other kind, now report `coverage complete`.
 
 ## 0.1.0 - 2026-09-24
 

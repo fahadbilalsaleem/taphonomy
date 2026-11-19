@@ -27,10 +27,16 @@ the measurement is linked.
   ([ADR-0016](docs/decisions/ADR-0016-m11-subdirectory-traversal-decisions.md)).
 * Reads exFAT volumes: the boot region, from its backup when the first
   sector is damaged; every directory; every live file, whose content
-  the library reads. Deleted exFAT files are counted and not yet
-  examined
+  the library reads
   ([ADR-0019](docs/decisions/ADR-0019-exfat-decisions.md),
   [ADR-0021](docs/decisions/ADR-0021-m14-exfat-analysis-decisions.md)).
+* Recovers deleted exFAT files where their metadata allows it: the entry
+  set's checksum is valid, the allocation is well formed, every cluster
+  is free in the allocation bitmap, no later claim the walk saw shares a
+  cluster, and with `--recover` the content is not zeros only. Each is
+  labelled `UNVERIFIED`: its extent is read from surviving metadata, and
+  no validator checks the data
+  ([ADR-0022](docs/decisions/ADR-0022-m15-exfat-recovery-decisions.md)).
 * Finds directories that nothing names, such as the tree a quick format
   leaves behind, and offers the files they list for recovery
   ([ADR-0017](docs/decisions/ADR-0017-m12-orphaned-directory-decisions.md),
@@ -68,6 +74,16 @@ happened to reach the right one. Across the three images Taphonomy reached
 four of the fifteen deleted files and refused that one. The other ten sit
 on the FAT12 and FAT16 partitions each image carries, which it identifies
 and does not yet analyse.
+
+For exFAT, `scripts/experiments/m15-acceptance.sh` runs Taphonomy with
+`--recover` on NIST's eleven MBR exFAT deleted-file-recovery images and
+on an image Linux made. It compares the decision for each deleted set
+outside a deleted directory with that of EXP-0011's scripts, written
+apart from the code, and judges each recovered file by the image's
+ground truth: 687 sets decided, 687 agreeing, 630 recovered, 630 right
+([ADR-0022](docs/decisions/ADR-0022-m15-exfat-recovery-decisions.md)
+Appendix F). On EXP-0009's two images every recovered file equals, byte
+for byte, what the generator wrote (`tests/exfat_analysis.rs`).
 
 ## Quick start
 
@@ -140,22 +156,32 @@ about the evidence and also exits 0.
 
 Taphonomy is early, and deliberately narrow.
 
-* FAT32 is analysed and recovered from, and exFAT is analysed
-  read-only. FAT12 and FAT16 are identified and not read; NTFS and
-  TexFAT are identified and reported as unsupported.
+* FAT32 and exFAT are analysed and recovered from. FAT12 and FAT16 are
+  identified and not read; NTFS and TexFAT are identified and reported
+  as unsupported.
 * It reads disk images, not physical devices, and only MBR partition
-  tables with 512-byte sectors.
-* Recovery assumes a file's clusters were contiguous. Deletion erases the
-  cluster chain, so for a fragmented file whose clusters have since been
-  freed, the run its entry implies can hold content that is not the file's.
-  Taphonomy cannot detect that case, and every recovery carries a caveat
-  saying so. Only a reference digest establishes that content is the
-  file's.
-* A deleted directory is read from its first cluster only; a listing that
-  may continue past it is reported as a gap.
+  tables with 512-byte sectors. A volume with no partition table is not
+  read. GPT disks are not analysed, so NIST's nine GPT exFAT images are
+  unmeasured, among them the two on which ADR-0022 section 15 expects a
+  wrong recovery.
+* A FAT32 recovery assumes a file's clusters were contiguous. Deletion
+  erases the cluster chain, so for a fragmented file whose clusters have
+  since been freed, the run its entry implies can hold content that is
+  not the file's. Taphonomy cannot detect that case, and every recovery
+  carries a caveat saying so. Only a reference digest establishes that
+  content is the file's.
+* An exFAT recovery reads the extent its metadata states, and that
+  metadata can pass every check while the clusters hold stale data that
+  is not zeros. Such data is recovered as if it were the file's; every
+  exFAT recovery carries a caveat saying so.
+* Files inside a deleted exFAT directory are not recovered: the directory
+  is read only for the claims of the sets inside it.
+* A deleted FAT32 directory is read from its first cluster only; a
+  listing that may continue past it is reported as a gap.
 * A directory nothing names is found only while its first cluster still
   identifies itself. On a card written to after a format, none does.
-* Long file names are not assembled: every name is shown in its 8.3 form.
+* FAT32 long file names are not assembled: every FAT32 name is shown in
+  its 8.3 form.
 
 The full list, each with the measurement behind it, is in
 [KNOWN_ISSUES.md](docs/development/KNOWN_ISSUES.md).
@@ -196,12 +222,9 @@ research in [RESEARCH_LOG.md](docs/development/RESEARCH_LOG.md); changes in
 
 Not yet implemented, in this order:
 
-1. Recovering deleted exFAT files. Reading exFAT is done; recovery must
-   meet the conditions ADR-0019 sets, and pass its test on EXP-0009's
-   image B.
-2. FAT12 and FAT16, where ten of the fifteen deleted files in EXP-0008
+1. FAT12 and FAT16, where ten of the fifteen deleted files in EXP-0008
    were out of reach.
-3. Long file names.
+2. Long file names.
 
 Each has, or will get, its own decision record, with the measurements it
 must meet, before any code.
