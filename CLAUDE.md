@@ -46,9 +46,11 @@ Where a passage is ambiguous, treat it as attribution and omit it.
 
 ## 0.2 Version Control
 
-Every push and every tag is performed manually by the author, in the
-terminal. Coding agents may make local commits (decided by the author on
-2026-11-12), under these conditions only:
+Every tag, and so every release, is made by the author, in the terminal.
+Coding agents commit and push under the conditions below (decided by the
+author on 2026-11-12 for commits and on 2026-11-19 for pushes).
+
+A commit, by an agent, is made only where:
 
 * the change has been reviewed by its diff, and formatting, lint, the
   documentation check and the tests have passed on the tree being
@@ -61,21 +63,39 @@ terminal. Coding agents may make local commits (decided by the author on
   never sets or overrides `user.name`, `user.email`, `--author` or any
   other identity.
 
+A push, by an agent, is made only where:
+
+* a new commit goes first to a branch named `factory/<task>`;
+* the repository's local hooks passed: `commit-msg` (no trailer,
+  co-author line or tool name) and `pre-push` (the checks above and the
+  task's proofs, recorded for the commit pushed);
+* a push to `main` is only a fast-forward to a commit whose CI run on its
+  `factory/` branch passed; nothing else ever reaches `main`;
+* it never forces, never deletes a branch or tag on the remote, and never
+  rewrites a commit that was pushed.
+
+`git fetch` from the repository's own remote is allowed, to check that a
+push to `main` is a fast-forward.
+
 Coding agents must never run:
 
-* `git push`
-* `git tag`
+* `git tag`, or any push of a tag
+* `git push --force`, `--force-with-lease`, `--delete`, or a push that is
+  not a fast-forward
 * `git commit --amend`
-* `git merge`, `git rebase`, `git reset`, `git revert`, `git cherry-pick`
+* `git merge` other than `--ff-only`, `git rebase`, `git reset`,
+  `git revert`, `git cherry-pick`
 * `git filter-branch`, `git gc --prune`, or any history-rewriting command
-* any command that contacts a remote
+* any command that contacts a remote other than the pushes and the fetch
+  this section allows
 
-Coding agents may run read-only git commands such as `status`, `diff`, `log`,
-`show`, `ls-files`, and `check-ignore`. They may run `git mv` only when
-explicitly instructed, and must report the result.
+Coding agents may run read-only git commands such as `status`, `diff`,
+`log`, `show`, `ls-files`, and `check-ignore`. They may run `git mv` only
+when explicitly instructed, and must report the result.
 
-An agent that believes a push, a tag or a history change is required must
-stop and say so.
+An agent that believes a tag, a forced push or a history change is
+required must stop and say so. Before removing any file or work, an agent
+explains why and asks the author (decided 2026-11-17).
 
 # Taphonomy Agent Instructions
 
@@ -702,8 +722,8 @@ work
 
 # 31. No Premature Commit
 
-Agents commit only as §0.2 allows, never automatically after every edit, and
-never push. Every push is made by the author.
+Agents commit and push only as §0.2 allows, never automatically after every
+edit. Every tag is made by the author.
 
 First:
 

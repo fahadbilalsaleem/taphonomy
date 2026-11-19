@@ -62,9 +62,10 @@ procedures.
 
 ## Commits
 
-Commits are made by the author, or locally by a coding agent under the
-conditions in `CLAUDE.md` section 0.2, with the author's own identity and a
-message that describes only the change. Every push and every tag is made by
+Commits are made by the author, or by a coding agent under the conditions
+in `CLAUDE.md` section 0.2, with the author's own identity and a message
+that describes only the change. Section 0.2 also governs an agent's pushes
+to `factory/` branches and the fast-forward of `main`. Every tag is made by
 the author.
 
 A commit should represent one coherent change. Commit messages describe the
