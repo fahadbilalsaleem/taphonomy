@@ -7,6 +7,10 @@ history.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.0 - 2026-11-19
+
 ### Added
 
 - exFAT volumes are analysed, read-only (`ADR-0019`, `ADR-0021`):

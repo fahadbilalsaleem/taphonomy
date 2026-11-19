@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/fahadbilalsaleem/taphonomy/actions/workflows/ci.yml/badge.svg)](https://github.com/fahadbilalsaleem/taphonomy/actions/workflows/ci.yml)
 
-Taphonomy recovers deleted files, and files whose directories were lost to
-a quick format, from FAT32 disk images. It opens evidence read-only, reports
-what it could not analyse, and refuses a recovery it cannot support rather
-than guessing. It is written in Rust.
+Taphonomy recovers deleted files from FAT32 and exFAT disk images, and from
+FAT32 ones also files whose directories were lost to a quick format. It
+opens evidence read-only, reports what it could not analyse, and refuses a
+recovery it cannot support rather than guessing. It is written in Rust.
 
 Every behaviour below is recorded in a decision record and measured in an
 experiment record in this repository. Where a claim rests on a measurement,

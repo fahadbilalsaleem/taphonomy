@@ -2,8 +2,9 @@
 //!
 //! # Status
 //!
-//! Milestones M1 to M9 of ADR-0002 section 8, and M10 to M12 as ADR-0015,
-//! ADR-0016 and ADR-0017 define them. Taphonomy can open a RAW evidence
+//! Milestones M1 to M9 of ADR-0002 section 8, M10 to M12 as ADR-0015,
+//! ADR-0016 and ADR-0017 define them, and M13 to M15 as ADR-0020, ADR-0021
+//! and ADR-0022 define them. Taphonomy can open a RAW evidence
 //! image read-only and hash it, parse an MBR partition table, identify the
 //! filesystem in a partition from its own structure, validate a FAT32 boot
 //! sector against the extent it occupies, read every directory the root
@@ -12,6 +13,9 @@
 //! entries in each, including those beyond the terminator, recover the data
 //! of an unfragmented deleted file, write it to a directory the operator
 //! names, and validate it against a reference digest the operator supplies.
+//! On an exFAT volume it reads every directory and live file, decides each
+//! deleted file in two phases, and with `--recover` recovers those that meet
+//! ADR-0022's conditions.
 //!
 //! Recovery extracts to memory and reports a digest. With `--output` the
 //! same bytes are also written to a file in a directory the operator names,
@@ -19,7 +23,7 @@
 //! compared with what was read: ADR-0015. Nothing is written without it,
 //! and the evidence is never written.
 //!
-//! Deletion zeroes the cluster chain, so nothing in the evidence
+//! On FAT32, deletion zeroes the cluster chain, so nothing in the evidence
 //! establishes that a deleted file was unfragmented. The run its entry
 //! implies is checked against the active FAT and refused where any cluster
 //! in it is in use. A run of free clusters is the absence of contrary
@@ -32,9 +36,10 @@
 //! is supplied nothing is validated, which is reported rather than left as
 //! a silence.
 //!
-//! A reconstructed artifact carries the one confidence level ADR-0003's
-//! model leaves reachable, reported once for the run rather than against
-//! each entry: ADR-0014 Decision A and Appendix A.10.
+//! A FAT32 artifact is `RECONSTRUCTED` and an exFAT artifact `UNVERIFIED`,
+//! the two levels ADR-0003's model leaves reachable, each reported once for
+//! the run rather than against each entry: ADR-0014 Decision A and
+//! Appendix A.10, ADR-0022 Decision A.
 //!
 //! A run also reports what it did not analyse. A directory that could not
 //! be read, a partition entry with no sectors or reaching past the end of
@@ -48,7 +53,7 @@
 //! everything it could reach and still recover, for a fragmented deleted
 //! file, content that is not that file's.
 //!
-//! A deleted entry's long name is not decoded.
+//! A deleted FAT32 entry's long name is not decoded.
 //!
 //! # Safety model
 //!

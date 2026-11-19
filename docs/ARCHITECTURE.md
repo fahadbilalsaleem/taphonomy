@@ -6,7 +6,7 @@
 
 **Project:** Taphonomy
 **Document:** Architecture Specification
-**Version:** 0.1.0
+**Version:** 0.2.0
 **Status:** Partly implemented; see section 47
 **Last Updated:** 2026-11-19
 
