@@ -1,0 +1,103 @@
+0	src/partition.rs	249	return Err(ParseError::ShortSector {
+1	src/partition.rs	256	return Err(ParseError::MissingSignature { found: signature });
+2	src/fat32.rs	252	return Err(Fat32Error::NotFat32 {
+3	src/fat32.rs	261	return Err(Fat32Error::UnsupportedSectorSize {
+4	src/fat32.rs	270	return Err(Fat32Error::InvalidField {
+5	src/fat32.rs	278	return Err(Fat32Error::InvalidField {
+6	src/fat32.rs	286	return Err(Fat32Error::InvalidField {
+7	src/fat32.rs	311	return Err(Fat32Error::InvalidField {
+8	src/fat32.rs	322	return Err(Fat32Error::InvalidField {
+9	src/fat32.rs	330	return Err(Fat32Error::VolumeExceedsExtent {
+10	src/fat32.rs	339	return Err(Fat32Error::InvalidRootCluster {
+11	src/fat32.rs	351	return Err(Fat32Error::FatTooSmall {
+12	src/fat32.rs	388	return Err(Fat32Error::InvalidField {
+13	src/fat_directory.rs	915	return Err(DirectoryError::ClusterOutOfRange {
+14	src/fat_directory.rs	967	return Err(DirectoryError::ClusterOutOfRange {
+15	src/fat_directory.rs	1073	return Err(DirectoryError::ClusterOutOfRange {
+16	src/fat_directory.rs	1079	return Err(DirectoryError::CyclicChain { cluster });
+17	src/fat_directory.rs	1082	return Err(DirectoryError::TooLarge {
+18	src/fat_directory.rs	1150	return Err(DirectoryError::TooLarge {
+19	src/fat_directory.rs	1180	return Err(DirectoryError::BadCluster { cluster: next });
+20	src/fat_directory.rs	1183	return Err(DirectoryError::ReservedChainLink {
+21	src/fat_recovery.rs	506	return Err(match writer.abort() {
+22	src/exfat_boot.rs	492	return Err(refused_everywhere(ExFatError::RegionOutsidePartition {
+23	src/exfat_boot.rs	641	return Ok(Err(ExFatError::RegionOutsidePartition {
+24	src/exfat_boot.rs	694	return Err(ExFatError::RegionOutsidePartition {
+25	src/exfat_boot.rs	702	return Err(ExFatError::BytesPerSectorShift { value: shift });
+26	src/exfat_boot.rs	708	return Err(ExFatError::RegionOutsidePartition {
+27	src/exfat_boot.rs	718	return Err(ExFatError::JumpBoot { found: jump });
+28	src/exfat_boot.rs	724	return Err(ExFatError::FileSystemName { found: name });
+29	src/exfat_boot.rs	731	return Err(ExFatError::MustBeZero {
+30	src/exfat_boot.rs	738	return Err(ExFatError::BootSignature { found: signature });
+31	src/exfat_boot.rs	744	return Err(ExFatError::SectorsPerClusterShift {
+32	src/exfat_boot.rs	752	return Err(ExFatError::NumberOfFats { value: fats });
+33	src/exfat_boot.rs	771	return Err(ExFatError::RevisionOutOfRange { major, minor });
+34	src/exfat_boot.rs	774	return Err(ExFatError::RevisionUnsupported { major, minor });
+35	src/exfat_boot.rs	796	return Err(ExFatError::VolumeLongerThanPartition {
+36	src/exfat_boot.rs	812	return Err(ExFatError::TexFat);
+37	src/exfat_boot.rs	842	return Err(ExFatError::ChecksumMismatch { computed, stored });
+38	src/exfat_boot.rs	847	return Err(ExFatError::ChecksumNotRepeated { word });
+39	src/exfat_boot.rs	872	return Err(ExFatError::VolumeLengthTooSmall {
+40	src/exfat_boot.rs	879	return Err(ExFatError::FatOffsetTooSmall {
+41	src/exfat_boot.rs	889	return Err(ExFatError::FatLengthTooSmall {
+42	src/exfat_boot.rs	900	return Err(ExFatError::ClusterHeapBeforeFatEnd {
+43	src/exfat_boot.rs	911	return Err(ExFatError::ClusterHeapOffsetTooLarge {
+44	src/exfat_boot.rs	918	return Err(ExFatError::ClusterCountTooLarge {
+45	src/exfat_boot.rs	924	return Err(ExFatError::ClusterCountTooSmall {
+46	src/exfat_boot.rs	935	return Err(ExFatError::ClusterCountMismatch {
+47	src/exfat_boot.rs	943	return Err(ExFatError::RootClusterOutOfRange {
+48	src/exfat_boot.rs	956	return Err(ExFatError::ActiveFat { flags });
+49	src/exfat_boot.rs	960	return Err(ExFatError::PercentInUse { value: percent });
+50	src/exfat_directory.rs	1461	return Err(ExFatDirectoryError::ClusterWithoutData {
+51	src/exfat_directory.rs	1504	return Err(ExFatContentError::Directory);
+52	src/exfat_directory.rs	1600	return Err(ExFatBitmapError::FirstClusterOutOfRange {
+53	src/exfat_directory.rs	1606	return Err(ExFatBitmapError::TooShort {
+54	src/exfat_directory.rs	1617	return Err(ExFatBitmapError::LongerThanVolumeNeeds {
+55	src/exfat_directory.rs	1659	return Err(ChainFault::LinkOutOfRange { from: cluster, to });
+56	src/exfat_directory.rs	1720	return Err(ExFatBitmapError::OtherVolume.into());
+57	src/exfat_directory.rs	1728	return Err(ExFatStructureError::LiveAllocationsUnrecorded {
+58	src/exfat_directory.rs	1782	return Err(ExFatStructureError::LiveClustersBeyondBound { limit });
+59	src/exfat_directory.rs	1802	return Err(ExFatStructureError::MarkedFree { structure, cluster });
+60	src/exfat_directory.rs	1983	return Err(ExFatStructureError::UpCaseFirstClusterOutOfRange {
+61	src/exfat_directory.rs	1988	return Err(ExFatStructureError::UpCaseEmpty);
+62	src/exfat_directory.rs	1991	return Err(ExFatStructureError::UpCaseTooLong {
+63	src/exfat_directory.rs	2020	return Err(ExFatBitmapError::OtherVolume);
+64	src/exfat_directory.rs	2023	return Err(ExFatBitmapError::ClusterOutOfRange { cluster });
+65	src/exfat_directory.rs	2201	return Err(ExFatDirectoryError::CriticalPrimaryOutsideRoot {
+66	src/exfat_directory.rs	2232	return Err(ExFatDirectoryError::UnrecognisedCriticalPrimary {
+67	src/exfat_directory.rs	2237	return Err(ExFatDirectoryError::CriticalPrimaryOutsideRoot {
+68	src/exfat_directory.rs	2270	return Ok(Err(SetRefusal::SetTruncated { declared, found }));
+69	src/exfat_directory.rs	2313	return Err(e);
+70	src/exfat_directory.rs	2426	return Ok(Err(SetRefusal::SecondaryCountTooSmall { count: declared }));
+71	src/exfat_directory.rs	2430	return Ok(Err(refusal));
+72	src/exfat_directory.rs	2444	return Err(SetRefusal::ChecksumMismatch { stored, computed });
+73	src/exfat_directory.rs	2452	return Err(SetRefusal::StreamExtensionMissing { found: stream[0] });
+74	src/exfat_directory.rs	2455	return Err(SetRefusal::AllocationNotPossible);
+75	src/exfat_directory.rs	2460	return Err(SetRefusal::NameLengthOutOfRange {
+76	src/exfat_directory.rs	2473	return Err(SetRefusal::NameEntries { expected, found });
+77	src/exfat_directory.rs	2480	return Err(SetRefusal::UnrecognisedCriticalSecondary { entry_type: kind });
+78	src/exfat_directory.rs	2532	return Err(SetRefusal::ValidDataLengthExceedsDataLength {
+79	src/exfat_directory.rs	2539	return Err(SetRefusal::DirectoryTooLarge { data_length });
+80	src/exfat_directory.rs	2542	return Err(SetRefusal::DirectoryValidDataLength {
+81	src/exfat_directory.rs	2550	return Err(SetRefusal::DataLengthTooLarge { data_length });
+82	src/exfat_directory.rs	2555	return Err(SetRefusal::DataWithoutCluster { data_length });
+83	src/exfat_directory.rs	2558	return Err(SetRefusal::NoFatChainWithoutCluster);
+84	src/exfat_directory.rs	2563	return Err(SetRefusal::FirstClusterOutOfRange {
+85	src/exfat_directory.rs	2570	return Err(SetRefusal::NoFatChainWithoutData);
+86	src/exfat_directory.rs	2574	return Err(SetRefusal::AllocationOutOfRange {
+87	src/exfat_directory.rs	2595	return Err(SetRefusal::DuplicateBitmap);
+88	src/exfat_directory.rs	2598	return Err(SetRefusal::BitmapIdentifier { flags: entry[1] });
+89	src/exfat_directory.rs	2604	return Err(SetRefusal::BitmapFirstCluster {
+90	src/exfat_directory.rs	2612	return Err(SetRefusal::BitmapTooShort {
+91	src/exfat_directory.rs	2716	return Err(ExFatDirectoryError::ChainEndsEarly {
+92	src/exfat_directory.rs	2723	return Err(ExFatDirectoryError::BadCluster {
+93	src/exfat_directory.rs	2728	return Err(ExFatDirectoryError::LinkOutOfRange {
+94	src/exfat_directory.rs	2737	return Err(if cursor.clusters_taken == 0 {
+95	src/exfat_directory.rs	2748	return Err(ExFatDirectoryError::ChainTooLong {
+96	src/exfat_directory.rs	2753	return Err(ExFatDirectoryError::ClusterCapReached {
+97	src/exfat_directory.rs	2758	return Err(ExFatDirectoryError::ClusterAlreadyRead { cluster: next });
+98	src/exfat_directory.rs	2769	return Err(ExFatDirectoryError::BadCluster { cluster: next });
+99	src/exfat_directory.rs	2840	return Err(SetRefusal::LabelLength { count });
+100	src/exfat_claims.rs	172	verdicts[owner] = Some(ConditionTwo::Unordered);
+101	src/exfat_claims.rs	192	verdicts[s] = Some(ConditionTwo::Unordered);
+102	src/exfat_claims.rs	230	verdicts[s] = Some(ConditionTwo::Later);

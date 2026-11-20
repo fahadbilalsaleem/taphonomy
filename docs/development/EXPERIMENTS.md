@@ -3088,3 +3088,383 @@ relan took its offsets from TZ, set by the host, not from a time zone a
 device was in. The scripts check each deleted set's checksum, not every
 check of ADR-0021 section 4; no deleted set on these volumes fails its
 checksum.
+
+---
+
+## EXP-0012: Fuzzing the parsers, and what resealing checksums adds
+
+**Date:** 2026-11-12 (design fixed) to 2026-11-20 (analysis)
+**Milestone:** after M15 stage 4 (`d7ad2a0`); informs ADR-0023
+**Related:** `ADR-0001` sections 3.1 and 13; `SECURITY.md` sections 35
+and 36; `KNOWN_ISSUES.md`, "No fuzz testing exists"; `ADR-0021`;
+`ADR-0022`; EXP-0011 Appendix C
+
+---
+
+### Question
+
+1. Q1: does a harness mutator that reseals exFAT checksums make
+   libFuzzer trigger more of the parsers' refusal sites, and sooner,
+   than libFuzzer alone?
+2. Q2: which refusal sites can a fuzzer trigger at all from the seeds,
+   and which only from the empty seed?
+3. Q3: does fuzzing the unmodified code find any crash, hang or
+   excessive allocation?
+
+### Why it matters
+
+`SECURITY.md` section 36 asks for fuzzing to find crashes, panics,
+hangs and memory exhaustion in the binary parsers, and none existed.
+exFAT checks the boot region's checksum and each entry set's checksum
+before it reads the fields they cover, so a mutation that changes a
+field almost never passes: a fuzzer that cannot pass a checksum tests
+little beyond it. The author decided on 2026-11-03 to adopt cargo-fuzz
+in `fuzz/`, recorded by an ADR, where research and tests here back it.
+Before that ADR (ADR-0023), the project needed to know what a fuzzer
+reaches here, measured as the published evaluations measure it, not
+assumed.
+
+### Hypothesis
+
+Fixed in the design of 2026-11-12, before the first measured run:
+
+1. H1: with the mutator, more refusal sites are triggered per trial
+   than without it (Mann-Whitney U, one-sided, alpha 0.05), most
+   clearly among sites after a set or boot checksum.
+2. For Q3, the null: no crash is found. Finding none would not show
+   that none exists.
+
+### Input
+
+* **Code:** Taphonomy at `d7ad2a0`, exported by
+  `scripts/experiments/exp-0012-tree.sh`.
+* **Ground truth, canaries:** by rule, with no sampling, one canary
+  before every `return Err(` and `return Ok(Err(` line outside
+  `#[cfg(test)]` in `src/partition.rs` (2), `src/fat32.rs` (11),
+  `src/fat_directory.rs` (8), `src/fat_recovery.rs` (1),
+  `src/exfat_boot.rs` (28) and `src/exfat_directory.rs` (50), and before
+  each of the three condition-2 verdict assignments in
+  `src/exfat_claims.rs`: 103 in all. `exp-0012-canaries.py` places them
+  in the exported copy, never in the repository; the map, with each
+  site's line at `d7ad2a0`, is `exp-0012-canaries.tsv`. A canary prints,
+  once per process, its id and the executions so far; the refusal then
+  happens as in the unmodified code.
+* **Seeds, S-full (35):** the 29 generated fixtures in
+  `fixtures/partition` (checked by its manifest) other than the two
+  fragmented ones, whose seeds would be 66 MB, far over the trials'
+  input limit of 131,072 bytes; and the six volumes of EXP-0011
+  Appendix C (`exp-0011-claims-images.sh`: FatFs's `reuse` and `orphan`
+  and relan's `tz`, each at 512- and 4,096-byte clusters).
+  `exp-0012-seeds.sh` makes them, with the `recover` flag set; their
+  digests are `exp-0012-seeds.sha256`. The four FatFs volumes are the
+  same on every run of that script and their seeds are remade byte for
+  byte; relan's two carry the clock's times, so theirs match only from
+  the volumes of this run (`exp-0012-made-volumes.sha256`).
+* **Seed, S-empty:** 5 bytes declaring 8,192 sectors and no data.
+* **Screen (a):** replayed once each on both targets, the full seeds
+  fire 7 canaries with no mutation (#1, #9, #10, #11, #100, #101, #102;
+  `exp-0012-seed-screen.sh`). They are counted in each trial's total
+  and reported apart where it matters.
+
+### Environment
+
+The author's machine: WSL2 (kernel 6.18.58.1), 4 cores, 3 GiB of
+memory. Rust 1.98.0, the pinned stable toolchain, with no nightly
+features; cargo-fuzz 0.13.2, built outside the project;
+libfuzzer-sys 0.4.13, whose build compiles libFuzzer with g++ 13.3.0;
+Python 3.12.3 run with `-I`; scipy 1.18.1 and numpy 2.5.4, unpacked
+from their wheels for the statistics check only.
+
+### Method
+
+**Harness** (`exp-0012-harness/`, its own workspace and `Cargo.lock`, so
+the crate's lock file and tests never see it). Each input is a sparse
+image: a declared length in sectors, capped at 2^18 (128 MiB), a flags
+byte, then runs of sectors; every other sector reads as zero, and a read
+past the length fails, as `EvidenceReader` requires. Two targets:
+
+* `analyse_image` runs `analysis::run` with no output directory, so
+  nothing is ever written, and `recover` from the flags byte.
+* `exfat_reader` tries the whole image as a volume at sector 0 and each
+  MBR partition, walks the live tree, opens and checks the allocation
+  bitmap, and assesses condition 2 over the claims: the order stage 6
+  was to use, which `analysis::run` did not yet follow at `d7ad2a0`.
+
+**The mutator.** After libFuzzer's own mutation, on half the mutations,
+the harness recomputes the set checksum of every File entry followed by
+a Stream Extension that lies whole in one run, and reseals every exFAT
+boot region that does; both from the specification, not with the
+crate's functions, so a fault there is not copied into the input. The
+environment variable `FUZZ_NO_FIX` turns it off in the same build.
+
+**Configurations** (`exp-0012-queue.txt`), budgets in executions:
+
+| Configuration | Target | Seeds | Mutator | Executions | Trials |
+| --- | --- | --- | --- | --- | --- |
+| C1 | `exfat_reader` | full | on | 25,000,000 | 10 |
+| C2 | `exfat_reader` | full | off | 25,000,000 | 10 |
+| C3 | `exfat_reader` | empty | on | 25,000,000 | 10 |
+| C4 | `analyse_image` | full | on | 150,000 | 10 |
+| C5 | `analyse_image` | full | off | 150,000 | 10 |
+| L1 | `exfat_reader` | full | on | 300,000,000 | 1 |
+| L4 | `analyse_image` | full | on | 1,500,000 | 1 |
+
+Trial i of C1 and of C2 share libFuzzer's `-seed`, as do C4 and C5. The
+design sized the budgets to about two hours (C1 to C5) and about a day
+(L1, L4) at the rates seen before the runs. `exp-0012-run.sh` runs at
+most three trials at once, each pinned to its own core (1 to 3), with
+`-max_len=131072 -rss_limit_mb=700 -malloc_limit_mb=700 -timeout=0`;
+after each trial its final corpus is replayed with a 10-second limit on
+the same core: that replay is Q3's hang check. A crash would end its
+trial.
+
+**The design changed twice before any result was read.** Version 2
+(2026-11-13): builds went on during the runs, so trials were pinned to
+cores 1 to 3 and builds to core 0, executions became the primary time
+measure, and the libFuzzer seeds were paired. Version 3 (2026-11-14):
+the host paused repeatedly on 2026-11-13, for minutes to hours, which
+invalidated most of version 2's trials under its own rule and made
+libFuzzer's hang alarm fire falsely on resume. So budgets became
+executions, which a pause does not change; the alarm was turned off and
+replaced by the replay above; and seconds became a secondary record.
+Version 2's trials are not used. From 2026-11-19 the fuzzers were also
+stopped by day and resumed at night (the author's decision of that
+date); a stop changes no execution count. Trials cut short by a restart
+of WSL (on 2026-11-14, 2026-11-15 and 2026-11-19) were run again from
+their seeds, and the cut ones set aside unread. The trials of record
+ran from 2026-11-15 02:10 to 2026-11-20 12:03 (UTC+4).
+
+**Analysis.** `exp-0012-stats.py`, standard-library Python, reads every
+trial's `META` and `log`: a trial is valid when it ran its whole budget
+or crashed. Canaries per trial; Mann-Whitney U, asymptotic, with tie and
+continuity correction, and Vargha and Delaney's A12, for C1 against C2
+and C4 against C5; per canary, the Kaplan-Meier estimate of executions
+to trigger, a canary not triggered being censored at the trial's
+budget, with the median taken as the first count at which the estimate
+is at most 0.5 and its 95% interval from the log-log band.
+`exp-0012-stats-check.py` compares these with scipy on 2,000 random
+cases. The script first applied version 2's validity rule (a heartbeat
+gap voids a trial); it was corrected to version 3 before any result was
+read. Under version 2's rule 11 trials would have been dropped.
+
+**Screen (b).** Every canary no trial triggered was given a hand-made
+input (`exp-0012-screen-b.sh`), or a named unit test, or a reason no
+input can reach it, never counted as a miss without one of the three.
+
+**Coverage** (secondary). `exp-0012-coverage.sh` replays each trial's
+final corpus on a coverage build of its target and reports lines
+covered per file. `cargo fuzz coverage` writes one raw profile per 100
+inputs and merges every profile in its folder, so the script empties the
+folder before each trial. A first pass without that merged each of the
+ten small C3 corpora (32 to 44 inputs) with three profiles left by the
+trial before; only the C3 rows changed when it was corrected.
+
+### Expected result
+
+H1 as stated, and no crash.
+
+### Actual result
+
+**Validity.** All 52 trials ran their whole budgets: 52 valid, none
+invalid. Inputs digest (the manifest of the 107 files the statistics
+read) `c3c5f79eebedd9e852c536cad02ddc82fd09c8dfb74a88876934a57e716d0071`.
+
+**Canaries per trial**, the seven of screen (a) included:
+
+| Configuration | Canaries per trial | Median |
+| --- | --- | --- |
+| C1 | 60 60 61 61 61 61 62 62 62 63 | 61 |
+| C2 | 44 45 46 46 47 48 49 49 49 50 | 47.5 |
+| C3 | 4 4 4 4 4 4 4 4 4 5 | 4 |
+| C4 | 11 12 13 13 13 13 13 14 14 14 | 13 |
+| C5 | 12 12 12 12 13 13 13 13 13 14 | 13 |
+| L1 | 66 | |
+| L4 | 15 | |
+
+* **C1 against C2:** U = 100, one-sided p = 8.15e-05 (two-sided
+  0.000163), A12 = 1.00: every C1 trial triggered more canaries than
+  every C2 trial. H1 is supported for `exfat_reader`.
+* **C4 against C5:** U = 63, one-sided p = 0.153, A12 = 0.63. Not
+  supported for `analyse_image` at 150,000 executions.
+* **Sooner.** By median executions to trigger, over the 96 canaries not
+  fired by the seeds alone: C1 sooner on 46, C2 on 10, equal on 2,
+  undecided on 2 (triggered in fewer than half the trials of each), and
+  36 triggered in neither. On 23 of the 46 C1's 95% interval ends
+  before C2's begins (`sooner.tsv`); on none of the 10 does C2's.
+  Fourteen of the 23 are canaries C2 triggered in at most half its
+  trials, six of them in none (#31, #33, #40, #45, #47, #83). These
+  intervals are
+  descriptive, one pair per canary, with no correction for the number of
+  canaries.
+* **By file** (`by_file.tsv`, median canaries per trial, C1 against
+  C2): `exfat_boot.rs` 24 against 15.5 of 28; `exfat_directory.rs` 34
+  against 28 of 50; `exfat_claims.rs` 3 against 3 of 3. H1's second
+  clause, "most clearly after a checksum", was not given a test of its
+  own; these counts are consistent with it and do not test it.
+* **Q2.** The empty seed triggered 5 canaries in some trial (#1, #23,
+  #25, #27, #37), each also triggered from the full seeds; none only
+  from the empty seed. 81 of the 103 canaries were triggered in some
+  trial; 3 only in the long runs (#3 in L4; #73 and #77 in L1); 22 in
+  none.
+* **Q3.** Fuzzing exit status 0 in all 52 trials; the hang check exit
+  status 0 in all 52; no crash, timeout or out-of-memory artifact. The
+  only artifacts are 13 slow-unit reports; replayed alone on core 1,
+  each runs in 0 to 148 ms by libFuzzer's own measure
+  (`exp-0012-q3.sh`), against its report threshold of 10 seconds. They
+  are read as the host's pauses, not as slow inputs.
+
+**Screen (b): the 22 never triggered** (sites are lines at `d7ad2a0`):
+
+* **Reached by a hand-made input (3).** #17 (`fat_directory.rs:1082`, a
+  directory chain one cluster over the bound) on `analyse_image`; #36
+  (`exfat_boot.rs:812`, TexFAT, two FATs) and #58
+  (`exfat_directory.rs:1782`, live clusters over the bound) on
+  `exfat_reader`. Each input is a seed changed for that site and
+  resealed; each fires its canary on the canary build.
+* **Reachable only beyond the harness's 128 MiB cap (4), each reached by
+  a unit test with small limits.**
+  * #44 (`exfat_boot.rs:918`, over 2^32 clusters):
+    `a_cluster_count_above_the_most_a_fat_can_describe_is_refused`.
+  * #57 (`exfat_directory.rs:1728`, over 2^22 live allocations):
+    `live_sets_past_the_bound_leave_the_bitmap_unbelieved`.
+  * #95 (`exfat_directory.rs:2748`, a directory over 256 MiB):
+    `a_chain_over_the_byte_limit_is_a_fault`.
+  * #96 (`exfat_directory.rs:2753`, 2^20 directory clusters):
+    `the_cluster_cap_stops_a_walk_with_its_reason` and
+    `the_cluster_cap_spans_every_directory_read_through_one_reader`.
+* **Unreachable from any input (15), reasoned from the callers, not
+  executed.** Re-checks of what the caller or the walk already refused:
+  #0, #2, #14, #22, #24, #52, #53, #64, #94. Guards against a
+  programming error: #56, #63. A read failing part way through a run of
+  a validated volume: #21 (held by unit tests with a failing reader). A
+  function neither harness calls: #51. A link already refused at the
+  same condition when the cluster was entered: #92; its hand-made input
+  fires #98 instead. And #18.
+* **#18 is a check that cannot fail.** `fat_directory.rs:1150` refuses a
+  directory over 65,536 entries, but it runs before the entry is added,
+  so it needs a 65,537th; the cluster bound before it allows exactly
+  65,536 at every legal cluster size, so #17 fires first. Its hand-made
+  input, exactly 65,536 entries, is read whole and fires nothing. What
+  to do with the check is the author's to decide.
+
+**Coverage**, median lines covered per file over each configuration's
+trials (`coverage.tsv`):
+
+| File (lines) | C1 | C2 | C3 | C4 | C5 | L1 | L4 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `partition.rs` (157) | 68.8% | 68.8% | 5.1% | 70.7% | 70.7% | 68.8% | 70.7% |
+| `fat32.rs` (174) | 0% | 0% | 0% | 72.7% | 70.7% | 0% | 77.0% |
+| `fat_directory.rs` (494) | 0% | 0% | 0% | 73.9% | 73.9% | 0% | 79.6% |
+| `fat_recovery.rs` (165) | 0% | 0% | 0% | 66.7% | 66.7% | 0% | 66.7% |
+| `exfat_boot.rs` (466) | 76.0% | 68.2% | 28.1% | 10.7% | 10.7% | 76.0% | 10.9% |
+| `exfat_directory.rs` (1349) | 72.9% | 71.4% | 0% | 0% | 0% | 74.0% | 0% |
+| `exfat_claims.rs` (224) | 99.1% | 96.0% | 0% | 0% | 0% | 99.1% | 0% |
+
+* The mutator's gain is where the canaries showed it: `exfat_boot.rs`
+  318 to 354 lines and `exfat_claims.rs` 215 to 222, C2 to C1 (medians).
+* From the empty seed no trial reached the directory reader, as its
+  canaries showed.
+* **`analyse_image` never reached the exFAT directory reader**: 0 lines
+  of `exfat_directory.rs` in every C4, C5 and L4 trial. Every exFAT
+  seed is a volume with no partition table, which the analysis does not
+  read, and the one seed with an exFAT partition type holds no exFAT
+  volume. The analysis's exFAT path was not fuzzed; the reader was,
+  through `exfat_reader`.
+
+### Conclusion
+
+1. **Resealing checksums pays on exFAT.** With it libFuzzer triggered
+   more refusal sites in every paired trial, and most of them sooner.
+   Without it a fuzzer stops at the checksums.
+2. **The analysis target says nothing yet about the mutator**: its
+   exFAT path was never reached, so C4 and C5 compared FAT32 and MBR
+   code, which the mutator does not touch.
+3. **The seeds are necessary.** From the empty seed the fuzzer
+   triggered at most five canaries in 25 million executions, all
+   reached from the seeds as well.
+4. **No crash, hang or excessive allocation was found** in 52 trials.
+   That is not evidence that none exists.
+5. **Every site no trial reached is accounted for:** 3 reached by
+   hand, 4 beyond the harness's size cap and held by unit tests, 15
+   unreachable by reasoning. One of the 15 is a check that cannot fail.
+6. **The experiment tested `d7ad2a0`.** Stages 5 and 6 of M15 (deleted
+   directories, deciding, extracting) were not fuzzed.
+
+### Limitations
+
+1. Ten trials per configuration, as Magma ran, where Klees et al. ran
+   at least 30; one long run each instead of several.
+2. One machine, which paused; no conclusion rests on seconds.
+3. The 15 unreachable sites are reasoned, not executed; the four
+   beyond the cap are held by unit tests, not by fuzzing.
+4. The canary function has one branch of its own, taken when a canary
+   first fires in a process, which libFuzzer's coverage can see. That
+   it rewards at most the first few such inputs, equally in every
+   configuration, is reasoning, not measured.
+5. The mutator does not reseal the up-case table's checksum, and an
+   insert or erase mutation shifts every later byte of the sparse
+   format.
+6. "Sooner" is descriptive: medians and intervals per canary, with no
+   test across canaries.
+7. Coverage is of each final corpus, not over time.
+8. The binaries rebuilt by `exp-0012-tree.sh` differ in digest from
+   those of the run, as builds made in another directory do; they were
+   shown to behave the same on 82 single-input replays and on two
+   trials' whole corpora, not on every input.
+9. relan's two seeds can be remade only from the volumes of this run.
+10. The trials' corpora and logs (734 MB) are not committed; the
+    statistics print the digest of the files they read.
+
+### External practice
+
+* Klees, Ruef, Cooper, Wei and Hicks, "Evaluating Fuzz Testing", CCS
+  2018 (arXiv 1808.09700v2): multiple trials and a statistical test,
+  the Mann-Whitney U (section 4, which also notes Vargha and Delaney's
+  A12); documented seeds including the empty seed (section 5); runs of
+  at least 24 hours with performance over time (section 6); ground
+  truth rather than heuristics such as unique crashes (section 7). They
+  generally measured at least 30 trials per configuration (section 3).
+* Hazimeh, Herrera and Payer, "Magma: A Ground-Truth Fuzzing
+  Benchmark" (arXiv 2009.01120v2): bugs instrumented with oracles
+  ("canaries" here) that record reach and trigger without stopping the
+  run, built so as not to leak information through coverage (section
+  5.4); a proof of vulnerability for every bug, and manual inspection of
+  reachability for bugs never triggered (5.5); time to bug by the
+  Kaplan-Meier estimator, treating bugs not found in time as missing
+  data (6.2); the Mann-Whitney U on bug counts (6.3.1); ten campaigns of
+  24 hours and of 7 days per fuzzer and target (6.1).
+
+### Next action
+
+1. ADR-0023, recording the author's decision of 2026-11-03 to adopt
+   cargo-fuzz in `fuzz/`, with the harness moved to the current tree.
+2. Seeds that put exFAT inside an MBR partition (EXP-0009's images A
+   and B fit the cap), so the analysis's exFAT path is fuzzed; and
+   volumes with no partition table once the analysis reads them.
+3. The hand-made inputs of screen (b) kept as regression inputs, and a
+   replay in CI.
+4. #18 is put to the author.
+
+### Reproducing
+
+`scripts/experiments/`, in order; `WORK` is any empty directory:
+
+```text
+exp-0012-tree.sh REPO WORK/tree build
+exp-0011-claims-images.sh WORK/made
+exp-0012-seeds.sh REPO/fixtures/partition WORK/made/claims/img WORK/seeds
+exp-0012-seed-screen.sh WORK/tree WORK/seeds WORK/seed-triggered.txt
+exp-0012-run.sh WORK/tree WORK/seeds WORK/run exp-0012-queue.txt
+exp-0012-stats.py WORK/run/trials WORK/run/heartbeat.log
+    exp-0012-canaries.tsv WORK/seed-triggered.txt WORK/stats
+exp-0012-stats-check.py SITE_DIR
+exp-0012-q3.sh WORK/tree WORK/run/trials
+exp-0012-screen-b.sh WORK/tree WORK/seeds WORK/screen-b
+exp-0012-coverage.sh WORK/tree WORK/run/trials WORK/coverage
+```
+
+They call `exp-0012-canaries.py`, `exp-0012-seed.py`,
+`exp-0012-screen-b.py` and `exp-0012-coverage.py`, and read the data
+files named above. Every figure above is printed by one of these over
+the trials of record. A new run gives new trials, and its figures will
+differ by chance.
