@@ -42,7 +42,10 @@ use crate::filesystem::{
     identify,
 };
 use crate::hash::Sha256Digest;
-use crate::partition::{Anomaly, MbrPartition, ParseError, PartitionTable, SECTOR_SIZE, parse_mbr};
+use crate::partition::{
+    Anomaly, MbrPartition, ParseError, PartitionTable, SECTOR_SIZE, SectorZero,
+    classify_sector_zero, parse_mbr,
+};
 use crate::validation::{Outcome, Validation, validate};
 
 pub mod exfat;
@@ -155,6 +158,28 @@ pub enum Event<'a> {
 
     /// A GPT protective MBR, which this tool does not analyse.
     GptDetected,
+
+    /// Sector 0 is a volume boot record and no partition table, so the
+    /// whole image is one volume, analysed as a partition is. Recorded in
+    /// place of the disk signature and the partitions, and followed by the
+    /// volume's analysis. `ADR-0024`.
+    WholeImageVolume(&'a Identification),
+
+    /// Sector 0 is neither a partition table nor a volume boot record.
+    /// Nothing is analysed.
+    SectorZeroNeither,
+
+    /// Sector 0 is a volume boot record of `filesystem` that also lists
+    /// `used_entries` used partition entries. Which it is cannot be told, so
+    /// nothing is analysed.
+    SectorZeroAmbiguous {
+        filesystem: Filesystem,
+        used_entries: usize,
+    },
+
+    /// A whole-image volume's boot region could not be read: the
+    /// whole-image counterpart of [`Event::PartitionUnread`].
+    WholeImageUnread(&'a Error),
 
     /// Interpretable but unusual observations on the partition table.
     /// Never empty.
@@ -479,6 +504,10 @@ pub struct RunCounts {
     /// The partition table was read and refused.
     table_rejected: usize,
 
+    /// Sector 0 was neither a partition table nor a volume boot record, or
+    /// was both. A gap: nothing was analysed (`ADR-0024` Decision D).
+    sector_zero_not_analysed: usize,
+
     /// A partition entry rejected as malformed, zero length or beyond the
     /// image, and not analysed. The table's other entries were.
     partitions_anomalous: usize,
@@ -646,6 +675,12 @@ impl RunCounts {
     /// The partition table was read and refused.
     pub const fn table_rejected(&self) -> usize {
         self.table_rejected
+    }
+
+    /// Sector 0 was neither a partition table nor a volume boot record, or
+    /// was both.
+    pub const fn sector_zero_not_analysed(&self) -> usize {
+        self.sector_zero_not_analysed
     }
 
     /// A partition entry rejected as malformed, zero length or beyond the
@@ -886,6 +921,7 @@ impl RunCounts {
     const fn gaps(&self) -> usize {
         self.table_unread
             + self.table_rejected
+            + self.sector_zero_not_analysed
             + self.partitions_anomalous
             + self.gpt
             + self.partition_unread
@@ -1009,6 +1045,40 @@ pub fn run<R: EvidenceReader>(
         Ok(()) => {
             let image_sectors = length / SECTOR_SIZE as u64;
 
+            // `ADR-0024` Decision A: sector 0 is classified before it is
+            // parsed as a table, because a volume with no table leaves the
+            // table area zero or holding boot code.
+            match classify_sector_zero(&sector) {
+                SectorZero::Table => {}
+                SectorZero::VolumeBootRecord(_) => {
+                    report_whole_image(
+                        evidence,
+                        &sector,
+                        image_sectors,
+                        options,
+                        &mut counts,
+                        sink,
+                    );
+                    return counts;
+                }
+                SectorZero::Neither => {
+                    sink.record(Event::SectorZeroNeither);
+                    counts.sector_zero_not_analysed += 1;
+                    return counts;
+                }
+                SectorZero::Ambiguous {
+                    filesystem,
+                    used_entries,
+                } => {
+                    sink.record(Event::SectorZeroAmbiguous {
+                        filesystem,
+                        used_entries,
+                    });
+                    counts.sector_zero_not_analysed += 1;
+                    return counts;
+                }
+            }
+
             match parse_mbr(&sector, image_sectors) {
                 Ok(outcome) => {
                     match &outcome.table {
@@ -1122,6 +1192,76 @@ fn report_partition<R: EvidenceReader>(
         type_match,
     });
 
+    let site = Site {
+        extent,
+        number: p.index,
+        partition: Some(p),
+    };
+    report_volume(evidence, &vbr, &id, site, options, counts, sink);
+}
+
+/// Where a volume lies and what names its artifacts.
+#[derive(Clone, Copy)]
+struct Site<'a> {
+    extent: VolumeExtent,
+
+    /// The MBR entry's position, 1 to 4, or 0 for a whole-image volume.
+    /// `ADR-0024` Decision C.
+    number: u8,
+
+    /// The MBR entry, or `None` for a whole-image volume, which has none:
+    /// a failure to read it is [`Event::WholeImageUnread`], not a partition
+    /// event.
+    partition: Option<&'a MbrPartition>,
+}
+
+/// The extent of a volume that is the whole image.
+///
+/// shortcut: an image past 2 TiB (`u32::MAX` sectors) is given the extent
+/// of its first 2 TiB, because `VolumeExtent` counts in `u32`. A volume
+/// whose own geometry reaches past that is then refused as larger than its
+/// extent, a reported gap rather than a wrong analysis; upgrade when
+/// `VolumeExtent` widens.
+fn whole_image_extent(image_sectors: u64) -> VolumeExtent {
+    VolumeExtent {
+        start_lba: 0,
+        sector_count: u32::try_from(image_sectors).unwrap_or(u32::MAX),
+    }
+}
+
+/// Reports a volume whose sector 0 was classified as a volume boot record
+/// and not a partition table, over the whole image. `ADR-0024` Decision B.
+fn report_whole_image<R: EvidenceReader>(
+    evidence: &mut R,
+    sector: &[u8; VBR_SIZE],
+    image_sectors: u64,
+    options: Options<'_>,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    let id = identify(sector);
+    sink.record(Event::WholeImageVolume(&id));
+    let site = Site {
+        extent: whole_image_extent(image_sectors),
+        number: 0,
+        partition: None,
+    };
+    report_volume(evidence, sector, &id, site, options, counts, sink);
+}
+
+/// Reports what a volume's boot record identified, for a partition and for
+/// a whole-image volume alike.
+fn report_volume<R: EvidenceReader>(
+    evidence: &mut R,
+    vbr: &[u8; VBR_SIZE],
+    id: &Identification,
+    site: Site<'_>,
+    options: Options<'_>,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    let extent = site.extent;
+
     // Two different gaps, separated because `CLAUDE.md` section 14 requires
     // an unsupported format and unreadable metadata to be told apart: a
     // volume whose filesystem was identified and not analysed is not the
@@ -1129,7 +1269,7 @@ fn report_partition<R: EvidenceReader>(
     match id.filesystem() {
         Some(Filesystem::Fat32) => {}
         Some(Filesystem::ExFat) => {
-            exfat::report_identified(evidence, p, extent, options, counts, sink);
+            exfat::report_identified(evidence, site, options, counts, sink);
             return;
         }
         Some(_) => {
@@ -1142,10 +1282,10 @@ fn report_partition<R: EvidenceReader>(
         }
     }
 
-    match parse_boot_sector(&vbr, extent) {
+    match parse_boot_sector(vbr, extent) {
         Ok(boot) => {
             sink.record(Event::BootSector(&boot));
-            report_root_directory(evidence, &boot, extent, p.index, options, counts, sink);
+            report_root_directory(evidence, &boot, extent, site.number, options, counts, sink);
         }
         Err(e) => {
             sink.record(Event::BootSectorRejected(&e));
@@ -1862,6 +2002,25 @@ mod tests {
         };
 
         assert_eq!(counts.coverage(), Coverage::NothingAnalysed);
+    }
+
+    #[test]
+    fn a_sector_zero_not_analysed_leaves_nothing_analysed() {
+        let counts = RunCounts {
+            sector_zero_not_analysed: 1,
+            ..RunCounts::default()
+        };
+
+        assert_eq!(counts.coverage(), Coverage::NothingAnalysed);
+    }
+
+    #[test]
+    fn a_whole_image_past_two_tebibytes_is_given_the_extent_of_its_first_two() {
+        let past = u64::from(u32::MAX) + 1;
+
+        assert_eq!(whole_image_extent(past).sector_count, u32::MAX);
+        assert_eq!(whole_image_extent(past).start_lba, 0);
+        assert_eq!(whole_image_extent(131_072).sector_count, 131_072);
     }
 
     #[test]

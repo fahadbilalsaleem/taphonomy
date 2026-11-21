@@ -13,6 +13,7 @@ b4a178b1716c5c24750cadcf67e349b7221410e563dfdfadaf8022f25a4ae3f9  ./fat32-format
 c14c1dddf21dd458d3e7b60434a93b36bba1f6c36ebbd95622d822a355254fba  ./fat32-hidden-mismatch.img
 c69df5d9f36b2877127fd4ee472e879594bcce004fe4c344e0736a749db5b616  ./fat32-nested-directories.img
 ea5c4f22440548b0b1fbed15fcdf5ac3d1808d66c17fcf6650c460cb6feed9fe  ./fat32-no-backup-boot-sector.img
+32a792d992d17e37f88972c223e26e6a21115a2815d33d269509ef64807417a8  ./fat32-no-partition-table.img
 6bac910972cde75d292a1752cc399c82cfe1bc8f9c84e4b26f83d746c63a9593  ./fat32-oversized-volume.img
 08112bbe0b758b41acaa9d0cf2b46808d423e39a3f0b5867e54b1f50c3e7a5b3  ./fat32-recover-collision.img
 304791217568dc3eff4dce4184da4baf97647fc6faf4b685a3beba4fefc3d180  ./fat32-recover-run.img

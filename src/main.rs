@@ -34,7 +34,6 @@ use taphonomy::fat_directory::{
 use taphonomy::fat_recovery::{Extraction, Listing, Output};
 use taphonomy::fat32::Fat32BootSector;
 use taphonomy::filesystem::Identification;
-use taphonomy::partition::MbrPartition;
 use taphonomy::validation::{Outcome, Validation};
 
 /// One line of usage, printed on any argument error.
@@ -443,7 +442,35 @@ impl Sink for StdoutSink<'_> {
                 partition,
                 identification,
                 type_match,
-            } => print_partition_identified(self.out, partition, identification, type_match),
+            } => print_identified(
+                self.out,
+                &format!("partition {}", partition.index),
+                identification,
+                (type_match == Some(false)).then_some(partition.partition_type),
+            ),
+            Event::WholeImageVolume(identification) => {
+                let filesystem = identification
+                    .filesystem()
+                    .map_or_else(|| "unknown".to_string(), |f| f.to_string());
+                say!(
+                    self.out,
+                    "partition table  none: volume boot record at sector 0 ({filesystem})"
+                );
+                say!(self.out);
+                print_identified(self.out, "whole image", identification, None);
+            }
+            Event::SectorZeroNeither => say!(
+                self.out,
+                "partition table  none: sector 0 is neither a partition table nor a volume boot record"
+            ),
+            Event::SectorZeroAmbiguous {
+                filesystem,
+                used_entries,
+            } => say!(
+                self.out,
+                "partition table  ambiguous: volume boot record at sector 0 ({filesystem}), used entries {used_entries}; not analysed"
+            ),
+            Event::WholeImageUnread(error) => say_err!("error: whole image: {error}"),
             Event::ExFatIdentifiedFromBackup {
                 partition,
                 sector_zero,
@@ -948,27 +975,23 @@ fn heading_of(reached: Reached<'_>) -> String {
     }
 }
 
-/// Prints what a partition's volume boot record identified.
-fn print_partition_identified(
+/// Prints what a volume's boot record identified, under `heading`:
+/// `partition N`, or `whole image` for a volume with no partition table.
+///
+/// `mismatched_type` is the partition's declared type where it disagrees
+/// with the filesystem observed, which a whole-image volume never has.
+fn print_identified(
     out: &mut Report,
-    partition: &MbrPartition,
+    heading: &str,
     identification: &Identification,
-    type_match: Option<bool>,
+    mismatched_type: Option<u8>,
 ) {
     match identification {
         Identification::Identified { filesystem, .. } => {
-            say!(
-                out,
-                "partition {}   filesystem {filesystem}",
-                partition.index
-            );
+            say!(out, "{heading}   filesystem {filesystem}");
         }
         Identification::Unknown { reason } => {
-            say!(
-                out,
-                "partition {}   filesystem unknown ({reason})",
-                partition.index
-            );
+            say!(out, "{heading}   filesystem unknown ({reason})");
         }
     }
 
@@ -982,13 +1005,12 @@ fn print_partition_identified(
         say!(out, "    first data sector    {}", g.first_data_sector());
     }
 
-    if type_match == Some(false)
+    if let Some(declared) = mismatched_type
         && let Some(filesystem) = identification.filesystem()
     {
         say!(
             out,
-            "    MISMATCH: declared type {:#04x} disagrees with observed filesystem {filesystem}",
-            partition.partition_type
+            "    MISMATCH: declared type {declared:#04x} disagrees with observed filesystem {filesystem}"
         );
     }
 
@@ -1215,6 +1237,11 @@ fn print_summary(out: &mut Report, counts: &RunCounts, options: Options<'_>) {
     print_count(out, "volumes analysed", counts.volumes_analysed());
     print_gap(out, "partition table not read", counts.table_unread());
     print_gap(out, "partition table not parsed", counts.table_rejected());
+    print_gap(
+        out,
+        "sector 0 not analysed",
+        counts.sector_zero_not_analysed(),
+    );
     print_gap(
         out,
         "partition entries rejected",

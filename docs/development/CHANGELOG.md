@@ -15,6 +15,14 @@ history.
   writes no further recovered file, and one line on standard error says
   the report is incomplete and, with `--output`, that files already
   written may be missing from it.
+- A volume with no partition table is read (`ADR-0024`). Before, such a
+  volume was reported as a disk with an empty partition table,
+  `coverage complete`, exit status 0. Sector 0 is now classified before
+  it is parsed as a table: a FAT32 or exFAT boot record that lists no
+  partition is analysed as one volume over the whole image, its
+  artifacts named `p0-`; a sector 0 that is neither a table nor a boot
+  record, or is both, is not analysed and the run reports `coverage
+  none`, exit status 3.
 
 ### Changed
 

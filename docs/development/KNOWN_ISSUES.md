@@ -530,16 +530,19 @@ Recorded in `ADR-0014` Appendix E and `ADR-0022` section 11.
 
 ---
 
-## Volumes with no partition table are not read
+## A sector 0 that is both a boot record and a partition table is not read
 
-A disk image that is one volume with no partition table, a superfloppy,
-is read as if its first sector were an MBR. On two of the images
-published with Nordvik and Axelsson's study the exFAT boot code is read
-as a partition table, and nothing is analysed: the run reports
-`coverage none`, failing closed rather than misreading the volume.
+A volume with no partition table is read when sector 0 is a volume boot
+record and lists no used partition entry (`ADR-0024`). Where sector 0 is
+a boot record and also lists one or more used entries, the run fails
+closed: it reports the sector as ambiguous, analyses nothing, and
+reports `coverage none`. That case is not measured on any public image.
 
-Found running those images (2026-10-29); the author decided then to fix
-it after M15. Recorded here only. Not fixed.
+A FAT12, FAT16 or NTFS volume at sector 0 is identified and not
+analysed, as it is in a partition.
+
+Found running the images published with Nordvik and Axelsson's study
+(2026-10-29).
 
 ---
 

@@ -26,7 +26,7 @@ use crate::filesystem::{UnknownReason, VolumeExtent};
 use crate::partition::MbrPartition;
 use crate::validation::{Outcome, validate};
 
-use super::{Event, MAX_DEPTH, Options, RunCounts, Sink, delivery};
+use super::{Event, MAX_DEPTH, Options, RunCounts, Sink, Site, delivery};
 
 /// How a directory was reached, for the heading its listing is printed under.
 ///
@@ -144,23 +144,22 @@ struct Pending {
 /// not analysed.
 pub(super) fn report_identified<R: EvidenceReader>(
     evidence: &mut R,
-    partition: &MbrPartition,
-    extent: VolumeExtent,
+    site: Site<'_>,
     options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
-    match parse_boot_region(evidence, extent) {
+    match parse_boot_region(evidence, site.extent) {
         Ok(boot) => {
             let volume = Volume {
-                extent,
+                extent: site.extent,
                 limits: Limits::DEFAULT,
-                partition: partition.index,
+                partition: site.number,
                 options,
             };
             report_volume(evidence, &boot, volume, counts, sink);
         }
-        Err(failure) => report_boot_failure(partition, failure, counts, sink),
+        Err(failure) => report_boot_failure(site.partition, failure, counts, sink),
     }
 }
 
@@ -205,7 +204,7 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
                 partition,
                 sector_zero,
             });
-            report_boot_failure(partition, failure, counts, sink);
+            report_boot_failure(Some(partition), failure, counts, sink);
             true
         }
         // No region validated, or the evidence could not be read: as before.
@@ -213,15 +212,20 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
     }
 }
 
+/// `partition` is `None` for a whole-image volume, which has no partition
+/// to name in an unreadable-region event.
 fn report_boot_failure(
-    partition: &MbrPartition,
+    partition: Option<&MbrPartition>,
     failure: ExFatBootFailure,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
     match &failure {
         ExFatBootFailure::Unreadable(error) => {
-            sink.record(Event::PartitionUnread { partition, error });
+            match partition {
+                Some(partition) => sink.record(Event::PartitionUnread { partition, error }),
+                None => sink.record(Event::WholeImageUnread(error)),
+            }
             counts.partition_unread += 1;
         }
         ExFatBootFailure::TexFat(region) => {
@@ -1094,7 +1098,7 @@ mod tests {
         let mut transcript = Transcript(Vec::new());
 
         report_boot_failure(
-            &partition,
+            Some(&partition),
             ExFatBootFailure::TexFat(BootRegion::Main),
             &mut counts,
             &mut transcript,
@@ -1125,7 +1129,7 @@ mod tests {
         ] {
             let mut counts = RunCounts::default();
             let mut transcript = Transcript(Vec::new());
-            report_boot_failure(&partition, failure, &mut counts, &mut transcript);
+            report_boot_failure(Some(&partition), failure, &mut counts, &mut transcript);
 
             assert_eq!(counts.boot_rejected(), 1);
             assert_eq!(counts.coverage(), Coverage::NothingAnalysed);

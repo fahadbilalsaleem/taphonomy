@@ -25,6 +25,8 @@
 
 use std::fmt;
 
+use crate::filesystem::{Filesystem, identify};
+
 /// Bytes per sector. Fixed at 512 for now; 4Kn media requires a decision
 /// that has not been made.
 pub const SECTOR_SIZE: usize = 512;
@@ -236,6 +238,69 @@ pub struct ParseOutcome {
     pub anomalies: Vec<Anomaly>,
 }
 
+/// What the first sector of an image is, before it is parsed as a table.
+///
+/// A volume written at sector 0 with no partition table leaves the bytes
+/// where a table's entries would be zero (`mkfs.vfat`, `mkfs.exfat`) or
+/// holding boot code (Windows), so reading it as a table either reports an
+/// empty table or fails. This follows util-linux `libblkid`'s order, which
+/// classified every image measured for `ADR-0024` correctly; the kernel's
+/// boot-indicator test alone and The Sleuth Kit's OEM-name test each call
+/// every partitionless volume a table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SectorZero {
+    /// A partition table, or a sector with no 0x55AA signature: parsed by
+    /// [`parse_mbr`], which reports the second as an error.
+    Table,
+    /// A volume boot record of this filesystem, with no partition table.
+    VolumeBootRecord(Filesystem),
+    /// Not a table, and not a volume boot record either.
+    Neither,
+    /// A volume boot record whose table area also lists used entries. Which
+    /// it is cannot be told, so neither is read.
+    Ambiguous {
+        filesystem: Filesystem,
+        used_entries: usize,
+    },
+}
+
+/// Classifies the first sector of an image.
+///
+/// Performs no I/O. In order: no signature, a table (the existing path); a
+/// boot indicator other than 0x00 or 0x80, not a table; a sector that
+/// identifies as a volume boot record is a volume when no entry is used and
+/// ambiguous otherwise; anything else is a table. An entry is used when its
+/// type and its sector count are both non-zero.
+pub fn classify_sector_zero(sector: &[u8]) -> SectorZero {
+    if sector.len() < SECTOR_SIZE || sector[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 2] != SIGNATURE {
+        return SectorZero::Table;
+    }
+
+    let entries =
+        || (0..ENTRY_COUNT).map(|slot| &sector[TABLE_OFFSET + slot * ENTRY_SIZE..][..ENTRY_SIZE]);
+    let indicators_valid = entries().all(|e| e[0] == 0x00 || e[0] == 0x80);
+    let boot_record = identify(sector).filesystem();
+
+    if !indicators_valid {
+        return boot_record.map_or(SectorZero::Neither, SectorZero::VolumeBootRecord);
+    }
+
+    let Some(filesystem) = boot_record else {
+        return SectorZero::Table;
+    };
+    let used_entries = entries()
+        .filter(|e| e[4] != TYPE_UNUSED && e[12..16] != [0; 4])
+        .count();
+    if used_entries == 0 {
+        SectorZero::VolumeBootRecord(filesystem)
+    } else {
+        SectorZero::Ambiguous {
+            filesystem,
+            used_entries,
+        }
+    }
+}
+
 /// Parses an MBR from the first sector of evidence.
 ///
 /// `image_sectors` is the true size of the evidence in sectors. Every
@@ -394,6 +459,95 @@ mod tests {
         sector[base + 4] = ptype;
         sector[base + 8..base + 12].copy_from_slice(&start.to_le_bytes());
         sector[base + 12..base + 16].copy_from_slice(&count.to_le_bytes());
+    }
+
+    /// A FAT32 boot sector as `mkfs.vfat` writes it: bytes 446 to 509 zero.
+    fn fat32_boot_record() -> Vec<u8> {
+        crate::fat::tests::fat32_sector()
+    }
+
+    fn exfat_boot_record() -> Vec<u8> {
+        let mut s = fat32_boot_record();
+        s[3..11].copy_from_slice(b"EXFAT   ");
+        s
+    }
+
+    #[test]
+    fn zero_entry_area_and_a_fat32_boot_record_is_a_volume() {
+        assert_eq!(
+            classify_sector_zero(&fat32_boot_record()),
+            SectorZero::VolumeBootRecord(Filesystem::Fat32)
+        );
+    }
+
+    #[test]
+    fn zero_entry_area_and_an_exfat_boot_record_is_a_volume() {
+        assert_eq!(
+            classify_sector_zero(&exfat_boot_record()),
+            SectorZero::VolumeBootRecord(Filesystem::ExFat)
+        );
+    }
+
+    #[test]
+    fn boot_code_in_the_entry_area_and_an_exfat_boot_record_is_a_volume() {
+        // Windows writes boot code over the table area, so a boot indicator
+        // other than 0x00 and 0x80 appears, and its bytes also look like
+        // used entries: only the indicator test tells this from ambiguous.
+        let mut s = exfat_boot_record();
+        s[TABLE_OFFSET..TABLE_OFFSET + ENTRY_COUNT * ENTRY_SIZE].fill(0x33);
+        assert_eq!(
+            classify_sector_zero(&s),
+            SectorZero::VolumeBootRecord(Filesystem::ExFat)
+        );
+    }
+
+    #[test]
+    fn a_bad_boot_indicator_and_no_boot_record_is_neither() {
+        let mut s = blank_sector();
+        s[TABLE_OFFSET + ENTRY_SIZE] = 0x33;
+        assert_eq!(classify_sector_zero(&s), SectorZero::Neither);
+    }
+
+    #[test]
+    fn a_boot_record_listing_a_used_entry_is_ambiguous() {
+        let mut s = fat32_boot_record();
+        write_entry(&mut s, 0, 0, 0x0c, 2048, 1000);
+        assert_eq!(
+            classify_sector_zero(&s),
+            SectorZero::Ambiguous {
+                filesystem: Filesystem::Fat32,
+                used_entries: 1
+            }
+        );
+    }
+
+    #[test]
+    fn an_entry_with_a_type_and_no_sectors_or_sectors_and_no_type_is_not_used() {
+        let mut s = fat32_boot_record();
+        write_entry(&mut s, 0, 0, 0x0c, 2048, 0);
+        write_entry(&mut s, 1, 0, 0x00, 2048, 1000);
+        assert_eq!(
+            classify_sector_zero(&s),
+            SectorZero::VolumeBootRecord(Filesystem::Fat32)
+        );
+    }
+
+    #[test]
+    fn an_mbr_with_grub_style_jump_code_and_a_used_entry_is_a_table() {
+        let mut s = blank_sector();
+        s[..3].copy_from_slice(&[0xEB, 0x63, 0x90]);
+        write_entry(&mut s, 0, 0x80, 0x83, 2048, 1000);
+        assert_eq!(classify_sector_zero(&s), SectorZero::Table);
+    }
+
+    #[test]
+    fn all_zero_entries_and_no_boot_record_is_a_table() {
+        assert_eq!(classify_sector_zero(&blank_sector()), SectorZero::Table);
+    }
+
+    #[test]
+    fn a_sector_with_no_signature_is_left_to_the_table_parser() {
+        assert_eq!(classify_sector_zero(&[0u8; SECTOR_SIZE]), SectorZero::Table);
     }
 
     #[test]

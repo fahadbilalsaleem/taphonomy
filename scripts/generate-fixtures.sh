@@ -1540,6 +1540,41 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# A FAT32 volume written over the whole image, with no partition table.
+#
+#     mkfs.vfat leaves bytes 446 to 509 of sector 0 zero, so sector 0 is a
+#     volume boot record and also parses as an empty partition table. That
+#     is what ADR-0024's classification exists to tell apart. --mbr=n is
+#     given because mkfs.vfat's default can write a table over that area,
+#     which would make this image ambiguous.
+#
+#     GONE.TXT is the only file: forty lines of forty bytes (four clusters),
+#     written and deleted, so nothing is reused. A test asserting its
+#     recovered bytes rebuilds them from the same loop.
+# ---------------------------------------------------------------------------
+fixture_fat32_no_partition_table() {
+    local path="$OUT_DIR/fat32-no-partition-table.img"
+    printf 'fat32-no-partition-table.img\n'
+    blank_image "$path"
+
+    mkfs.vfat --invariant --mbr=n -F 32 -n "$FAT32_LABEL" "$path" >/dev/null
+
+    local work i
+    work="$(mktemp -d)"
+    : > "$work/gone.txt"
+    for i in $(seq 1 40); do
+        printf 'taphonomy no-partition-table line %03d\n' "$i" >> "$work/gone.txt"
+    done
+
+    MTOOLS_SKIP_CHECK=1 mcopy -i "$path" "$work/gone.txt" ::/GONE.TXT
+    MTOOLS_SKIP_CHECK=1 mdel -i "$path" ::/GONE.TXT
+
+    rm -rf "$work"
+
+    note "a whole-image FAT32 volume, one four-cluster file written and deleted"
+}
+
+# ---------------------------------------------------------------------------
 
 printf 'Generating fixtures in %s\n\n' "$OUT_DIR"
 
@@ -1574,6 +1609,7 @@ fixture_fat32_formatted_reused
 fixture_fat32_deleted_nested
 fixture_fat32_two_partitions
 fixture_mbr_truncated_last_partition
+fixture_fat32_no_partition_table
 
 # ---------------------------------------------------------------------------
 # The two exFAT images EXP-0009 measured.

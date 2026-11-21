@@ -161,8 +161,11 @@ Taphonomy is early, and deliberately narrow.
   identified and not read; NTFS and TexFAT are identified and reported
   as unsupported.
 * It reads disk images, not physical devices, and only MBR partition
-  tables with 512-byte sectors. A volume with no partition table is not
-  read. GPT disks are not analysed, so NIST's nine GPT exFAT images are
+  tables with 512-byte sectors. A volume with no partition table is read
+  when sector 0 is a FAT32 or exFAT boot record that lists no partition,
+  as util-linux's libblkid decides; a sector 0 that is neither a table
+  nor a boot record, or is both, is not analysed. GPT disks are not
+  analysed, so NIST's nine GPT exFAT images are
   unmeasured, among them the two on which ADR-0022 section 15 expects a
   wrong recovery.
 * A FAT32 recovery assumes a file's clusters were contiguous. Deletion
