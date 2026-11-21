@@ -12,7 +12,9 @@
 //! See `docs/development/RESEARCH_LOG.md` conclusion 6 and `CLAUDE.md`
 //! section 11.
 
+use std::fmt;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -39,11 +41,70 @@ use taphonomy::validation::{Outcome, Validation};
 const USAGE: &str = "usage: taphonomy <evidence-image> [--recover] \
                      [--output <directory>] [--reference-digest <hex>]";
 
+/// The one writer of the report on standard output.
+///
+/// `ADR-0018` Appendix A. `println!` panics when standard output is closed
+/// or full, so every line goes through here instead. The first error a write
+/// returns is kept and nothing is written after it: a report with a hole in
+/// the middle would read as a complete one, and `SAFETY.md` section 12
+/// forbids a failure being converted into a partial success. The sink
+/// reports itself stopped once this has failed, and `main` exits with 4.
+///
+/// Standard output keeps its own line buffering, so the order of what it
+/// and standard error show on a terminal is as `println!` gave it.
+struct Report {
+    stdout: io::Stdout,
+    failed: Option<io::Error>,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self {
+            stdout: io::stdout(),
+            failed: None,
+        }
+    }
+
+    /// Writes one line, unless a write has already failed.
+    fn line(&mut self, text: fmt::Arguments<'_>) {
+        if self.failed.is_some() {
+            return;
+        }
+        if let Err(e) = writeln!(self.stdout, "{text}") {
+            self.failed = Some(e);
+        }
+    }
+}
+
+/// One line of the report: `say!(out)` for an empty line, otherwise the
+/// arguments of `format!` after the writer.
+macro_rules! say {
+    ($out:expr) => {
+        $out.line(format_args!(""))
+    };
+    ($out:expr, $($text:tt)+) => {
+        $out.line(format_args!($($text)+))
+    };
+}
+
+/// One line on standard error. A failure to write it is not reported:
+/// nothing is left to report it to, and the exit status still says what
+/// happened (`ADR-0018` Appendix A, Decision G).
+fn warn(text: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr(), "{text}");
+}
+
+macro_rules! say_err {
+    ($($text:tt)+) => {
+        warn(format_args!($($text)+))
+    };
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
 
     let Some(path) = args.next() else {
-        eprintln!("{USAGE}");
+        say_err!("{USAGE}");
         return ExitCode::from(2);
     };
 
@@ -70,13 +131,13 @@ fn main() -> ExitCode {
             // the ambiguity `CLAUDE.md` section 39 says must be an error.
             Some("--output") => {
                 if output.is_some() {
-                    eprintln!("error: --output given more than once");
-                    eprintln!("{USAGE}");
+                    say_err!("error: --output given more than once");
+                    say_err!("{USAGE}");
                     return ExitCode::from(2);
                 }
                 let Some(value) = args.next() else {
-                    eprintln!("error: --output requires a directory");
-                    eprintln!("{USAGE}");
+                    say_err!("error: --output requires a directory");
+                    say_err!("{USAGE}");
                     return ExitCode::from(2);
                 };
 
@@ -84,13 +145,13 @@ fn main() -> ExitCode {
             }
             Some("--reference-digest") => {
                 if options.reference.is_some() {
-                    eprintln!("error: --reference-digest given more than once");
-                    eprintln!("{USAGE}");
+                    say_err!("error: --reference-digest given more than once");
+                    say_err!("{USAGE}");
                     return ExitCode::from(2);
                 }
                 let Some(value) = args.next() else {
-                    eprintln!("error: --reference-digest requires a digest");
-                    eprintln!("{USAGE}");
+                    say_err!("error: --reference-digest requires a digest");
+                    say_err!("{USAGE}");
                     return ExitCode::from(2);
                 };
 
@@ -100,20 +161,20 @@ fn main() -> ExitCode {
                 match value.to_str().map(Sha256Digest::from_hex) {
                     Some(Ok(digest)) => options.reference = Some(digest),
                     Some(Err(e)) => {
-                        eprintln!("error: --reference-digest: {e}");
-                        eprintln!("{USAGE}");
+                        say_err!("error: --reference-digest: {e}");
+                        say_err!("{USAGE}");
                         return ExitCode::from(2);
                     }
                     None => {
-                        eprintln!("error: --reference-digest is not valid utf-8");
-                        eprintln!("{USAGE}");
+                        say_err!("error: --reference-digest is not valid utf-8");
+                        say_err!("{USAGE}");
                         return ExitCode::from(2);
                     }
                 }
             }
             _ => {
-                eprintln!("error: unexpected argument");
-                eprintln!("{USAGE}");
+                say_err!("error: unexpected argument");
+                say_err!("{USAGE}");
                 return ExitCode::from(2);
             }
         }
@@ -125,8 +186,8 @@ fn main() -> ExitCode {
     // compare, and implying --recover would enable reading a deleted file's
     // content without the operator asking for it.
     if options.reference.is_some() && !options.recover {
-        eprintln!("error: --reference-digest needs --recover, which reads content");
-        eprintln!("{USAGE}");
+        say_err!("error: --reference-digest needs --recover, which reads content");
+        say_err!("{USAGE}");
         return ExitCode::from(2);
     }
 
@@ -146,8 +207,8 @@ fn main() -> ExitCode {
     // `ADR-0015` Decision A. Writing is more than reading, so it inherits
     // `ADR-0010` Decision B's requirement that the operator ask.
     if options.output.is_some() && !options.recover {
-        eprintln!("error: --output needs --recover, which reads content");
-        eprintln!("{USAGE}");
+        say_err!("error: --output needs --recover, which reads content");
+        say_err!("{USAGE}");
         return ExitCode::from(2);
     }
 
@@ -158,19 +219,36 @@ fn main() -> ExitCode {
     if let Some(directory) = options.output
         && let Err(message) = check_destination(directory, Path::new(&path))
     {
-        eprintln!("error: {message}");
-        eprintln!("{USAGE}");
+        say_err!("error: {message}");
+        say_err!("{USAGE}");
         return ExitCode::from(2);
     }
 
-    match inspect(&path, options) {
+    let mut out = Report::new();
+    let status = match inspect(&mut out, &path, options) {
         Ok(Coverage::NothingAnalysed) => ExitCode::from(3),
         Ok(Coverage::Complete | Coverage::Incomplete) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            say_err!("error: {e}");
             ExitCode::FAILURE
         }
+    };
+
+    // `ADR-0018` Appendix A, Decision G. A report that could not be written
+    // is not a success whatever the coverage was, so 4 takes precedence over
+    // 0, 1 and 3. `directory` is the argument as the operator gave it.
+    if let Some(e) = out.failed {
+        match options.output {
+            Some(directory) => say_err!(
+                "error: the report could not be written ({e}); the run stopped; \
+                 files already written to {} may be missing from the report",
+                directory.display()
+            ),
+            None => say_err!("error: the report could not be written ({e}); the run stopped"),
+        }
+        return ExitCode::from(4);
     }
+    status
 }
 
 /// Refuses a destination that is, or would contain, the evidence.
@@ -228,29 +306,33 @@ fn check_destination(directory: &Path, evidence: &Path) -> Result<(), String> {
 /// `ADR-0018` Decision A: opening and hashing the evidence and every digest
 /// line stay here, and the walk that follows is `taphonomy::analysis::run`,
 /// rendered by [`StdoutSink`] below.
-fn inspect(path: &std::ffi::OsStr, options: Options<'_>) -> Result<Coverage, taphonomy::Error> {
+fn inspect(
+    out: &mut Report,
+    path: &std::ffi::OsStr,
+    options: Options<'_>,
+) -> Result<Coverage, taphonomy::Error> {
     let mut evidence = EvidenceFile::open(path)?;
     let reported = evidence.reported_size();
     let result = evidence.digest()?;
 
-    println!("path         {}", evidence.path().display());
-    println!("size         {reported} bytes");
-    println!("read         {} bytes", result.bytes_read);
-    println!("sha256       {}", result.digest);
+    say!(out, "path         {}", evidence.path().display());
+    say!(out, "size         {reported} bytes");
+    say!(out, "read         {} bytes", result.bytes_read);
+    say!(out, "sha256       {}", result.digest);
 
     if result.bytes_read != reported {
-        println!();
-        println!("WARNING: bytes read does not match reported size.");
-        println!("The digest covers {} bytes only.", result.bytes_read);
+        say!(out);
+        say!(out, "WARNING: bytes read does not match reported size.");
+        say!(out, "The digest covers {} bytes only.", result.bytes_read);
     }
 
-    println!();
+    say!(out);
 
-    let mut sink = StdoutSink::default();
+    let mut sink = StdoutSink::new(out);
     let counts = taphonomy::analysis::run(&mut evidence, result.bytes_read, options, &mut sink);
 
-    print_summary(&counts, options);
-    print_caveats(&counts, options);
+    print_summary(out, &counts, options);
+    print_caveats(out, &counts, options);
 
     Ok(counts.coverage())
 }
@@ -266,8 +348,11 @@ fn inspect(path: &std::ffi::OsStr, options: Options<'_>) -> Result<Coverage, tap
 /// which now reports `listing` and `part` as findings on every content
 /// event and lets a sink do whatever rendering, or none, it likes with
 /// them. A `Directory` event starts a new directory and resets both.
-#[derive(Default)]
-struct StdoutSink {
+struct StdoutSink<'a> {
+    /// The run's one writer of standard output, which the summary after the
+    /// run shares (`ADR-0018` Appendix A).
+    out: &'a mut Report,
+
     /// Whether this directory's current-listing heading has printed.
     entries_heading_printed: bool,
 
@@ -279,7 +364,16 @@ struct StdoutSink {
     exfat_deleted_heading_printed: bool,
 }
 
-impl StdoutSink {
+impl<'a> StdoutSink<'a> {
+    fn new(out: &'a mut Report) -> Self {
+        Self {
+            out,
+            entries_heading_printed: false,
+            residue_heading_printed: false,
+            exfat_deleted_heading_printed: false,
+        }
+    }
+
     /// Prints a content heading before the first finding of a
     /// `(listing, part)` pass and never again for the same directory,
     /// exactly as `report_recovery` used to decide for itself.
@@ -299,7 +393,7 @@ impl StdoutSink {
             Listing::Walked => "deleted content",
             Listing::Orphaned => "orphaned content",
         };
-        println!("      {title}");
+        say!(self.out, "      {title}");
     }
 
     /// Prints the heading of an exFAT volume's deleted sets once, before
@@ -307,18 +401,25 @@ impl StdoutSink {
     fn head_exfat_deleted(&mut self) {
         if !self.exfat_deleted_heading_printed {
             self.exfat_deleted_heading_printed = true;
-            println!("    deleted entry sets");
+            say!(self.out, "    deleted entry sets");
         }
     }
 }
 
-impl Sink for StdoutSink {
+impl Sink for StdoutSink<'_> {
+    fn stopped(&self) -> bool {
+        self.out.failed.is_some()
+    }
+
     fn record(&mut self, event: Event<'_>) {
         match event {
-            Event::TableUnread(error) => eprintln!("error: {error}"),
-            Event::TableRejected(error) => eprintln!("error: {error}"),
-            Event::DiskSignature(signature) => println!("disk signature  {signature:#010x}"),
-            Event::PartitionListed(p) => println!(
+            Event::TableUnread(error) => say_err!("error: {error}"),
+            Event::TableRejected(error) => say_err!("error: {error}"),
+            Event::DiskSignature(signature) => {
+                say!(self.out, "disk signature  {signature:#010x}");
+            }
+            Event::PartitionListed(p) => say!(
+                self.out,
                 "partition {}   type {:#04x}   start {}   sectors {}   bootable {}",
                 p.index,
                 p.partition_type,
@@ -326,69 +427,92 @@ impl Sink for StdoutSink {
                 p.sector_count,
                 p.is_bootable()
             ),
-            Event::PartitionsListed => println!(),
-            Event::GptDetected => println!("GPT detected: not supported"),
+            Event::PartitionsListed => say!(self.out),
+            Event::GptDetected => say!(self.out, "GPT detected: not supported"),
             Event::Anomalies(anomalies) => {
-                println!();
-                println!("anomalies");
+                say!(self.out);
+                say!(self.out, "anomalies");
                 for a in anomalies {
-                    println!("  {a}");
+                    say!(self.out, "  {a}");
                 }
             }
             Event::PartitionUnread { partition, error } => {
-                eprintln!("error: partition {}: {error}", partition.index);
+                say_err!("error: partition {}: {error}", partition.index);
             }
             Event::PartitionIdentified {
                 partition,
                 identification,
                 type_match,
-            } => print_partition_identified(partition, identification, type_match),
+            } => print_partition_identified(self.out, partition, identification, type_match),
             Event::ExFatIdentifiedFromBackup {
                 partition,
                 sector_zero,
             } => {
-                println!(
+                say!(
+                    self.out,
                     "partition {}   filesystem exFAT, identified from its backup boot region",
                     partition.index
                 );
-                println!("    sector 0             {sector_zero}");
+                say!(self.out, "    sector 0             {sector_zero}");
             }
-            Event::BootSectorRejected(error) => println!("    BOOT SECTOR REJECTED: {error}"),
-            Event::BootSector(boot) => print_boot_sector(boot),
+            Event::BootSectorRejected(error) => {
+                say!(self.out, "    BOOT SECTOR REJECTED: {error}");
+            }
+            Event::BootSector(boot) => print_boot_sector(self.out, boot),
             Event::RootDirectoryUnread(error) => {
-                println!("    ROOT DIRECTORY NOT ENUMERATED: {error}");
+                say!(self.out, "    ROOT DIRECTORY NOT ENUMERATED: {error}");
             }
             Event::Directory { reached, directory } => {
                 self.entries_heading_printed = false;
                 self.residue_heading_printed = false;
-                print_directory(&heading_of(reached), directory);
+                print_directory(self.out, &heading_of(reached), directory);
             }
             Event::DirectoryNotRead { reached, reason } => {
-                println!("    {}", heading_of(reached));
+                say!(self.out, "    {}", heading_of(reached));
                 match reason {
                     NotReadReason::TooDeep => {
-                        println!("      NOT READ: deeper than {MAX_DEPTH} levels below the root");
+                        say!(
+                            self.out,
+                            "      NOT READ: deeper than {MAX_DEPTH} levels below the root"
+                        );
                     }
-                    NotReadReason::AlreadyRead { cluster } => println!(
+                    NotReadReason::AlreadyRead { cluster } => say!(
+                        self.out,
                         "      NOT READ: cluster {cluster} was already read as a directory"
                     ),
-                    NotReadReason::Refused(reason) => println!("      NOT READ: {reason}"),
-                    NotReadReason::Enumeration(error) => println!("      NOT READ: {error}"),
+                    NotReadReason::Refused(reason) => {
+                        say!(self.out, "      NOT READ: {reason}");
+                    }
+                    NotReadReason::Enumeration(error) => {
+                        say!(self.out, "      NOT READ: {error}");
+                    }
                 }
             }
             Event::ListingMayContinue(cluster) => {
-                println!("      listing may continue: cluster {cluster} holds no terminator");
+                say!(
+                    self.out,
+                    "      listing may continue: cluster {cluster} holds no terminator"
+                );
             }
             Event::OrphanSearchStopped { cluster, error } => {
-                println!("    ORPHAN SEARCH STOPPED at cluster {cluster}: {error}");
+                say!(
+                    self.out,
+                    "    ORPHAN SEARCH STOPPED at cluster {cluster}: {error}"
+                );
             }
             Event::OrphanedListingUnread {
                 holder,
                 name,
                 first_cluster,
             } => {
-                println!("    directory {name}, listed in orphaned directory c{holder}");
-                println!("      NOT READ: cluster {first_cluster} was not found by the search");
+                say!(
+                    self.out,
+                    "    directory {name}, listed in orphaned directory c{holder}"
+                );
+                say!(
+                    self.out,
+                    "      NOT READ: cluster {first_cluster} was not found by the search"
+                );
             }
             Event::NotAssessed {
                 listing,
@@ -397,7 +521,11 @@ impl Sink for StdoutSink {
                 error,
             } => {
                 self.head_content(listing, part);
-                println!("        {:<9} NOT ASSESSED: {error}", entry_position(entry));
+                say!(
+                    self.out,
+                    "        {:<9} NOT ASSESSED: {error}",
+                    entry_position(entry)
+                );
             }
             Event::Ineligible {
                 listing,
@@ -406,7 +534,11 @@ impl Sink for StdoutSink {
                 reason,
             } => {
                 self.head_content(listing, part);
-                println!("        {:<9} no content: {reason}", entry_position(entry));
+                say!(
+                    self.out,
+                    "        {:<9} no content: {reason}",
+                    entry_position(entry)
+                );
             }
             Event::RunBroken {
                 listing,
@@ -422,7 +554,7 @@ impl Sink for StdoutSink {
                     run.last_cluster(),
                     run.file_size
                 );
-                println!("        {:<9} {detail}", entry_position(entry));
+                say!(self.out, "        {:<9} {detail}", entry_position(entry));
             }
             Event::Recoverable {
                 listing,
@@ -438,7 +570,7 @@ impl Sink for StdoutSink {
                     run.file_size,
                     run.slack_bytes
                 );
-                println!("        {:<9} {detail}", entry_position(entry));
+                say!(self.out, "        {:<9} {detail}", entry_position(entry));
             }
             Event::Extracted {
                 listing: _,
@@ -447,39 +579,42 @@ impl Sink for StdoutSink {
                 extraction,
                 validation,
                 readback_matches,
-            } => print_extraction(extraction, validation, readback_matches),
+            } => print_extraction(self.out, extraction, validation, readback_matches),
             Event::NotExtracted {
                 listing: _,
                 part: _,
                 entry: _,
                 error,
-            } => print_not_extracted(error),
+            } => print_not_extracted(self.out, error),
             Event::ExFatBootRegion(boot) => {
                 self.exfat_deleted_heading_printed = false;
-                print_exfat_boot_region(boot);
+                print_exfat_boot_region(self.out, boot);
             }
             Event::ExFatBootRejected(failure) => {
-                println!("    BOOT REGION REJECTED: {failure}");
+                say!(self.out, "    BOOT REGION REJECTED: {failure}");
             }
             Event::ExFatTexFat(region) => {
-                println!(
+                say!(
+                    self.out,
                     "    TexFAT: two FATs in the {} boot region, not supported",
                     exfat_region_name(region)
                 );
             }
             Event::ExFatRootDirectoryUnread(error) => {
-                println!("    ROOT DIRECTORY NOT ENUMERATED: {error}");
+                say!(self.out, "    ROOT DIRECTORY NOT ENUMERATED: {error}");
             }
             Event::ExFatDirectoryStart { reached } => {
-                println!("    {}", exfat_heading(reached));
+                say!(self.out, "    {}", exfat_heading(reached));
             }
             Event::ExFatEntry { position, file } => {
                 let name = escaped_name(&file.name);
                 let place = exfat_position(position);
                 if file.is_directory() {
-                    println!(
+                    say!(
+                        self.out,
                         "      {place} {:<13} {name:<13} cluster {}",
-                        "directory", file.first_cluster
+                        "directory",
+                        file.first_cluster
                     );
                 } else {
                     let valid = if file.valid_data_length == file.data_length {
@@ -487,65 +622,86 @@ impl Sink for StdoutSink {
                     } else {
                         format!(", {} valid", file.valid_data_length)
                     };
-                    println!(
+                    say!(
+                        self.out,
                         "      {place} {:<13} {name:<13} {} bytes{valid}, cluster {}",
-                        "file", file.data_length, file.first_cluster
+                        "file",
+                        file.data_length,
+                        file.first_cluster
                     );
                 }
             }
-            Event::ExFatVolumeLabel { position, label } => println!(
+            Event::ExFatVolumeLabel { position, label } => say!(
+                self.out,
                 "      {} {:<13} {}",
                 exfat_position(position),
                 "volume label",
                 escaped_name(label)
             ),
-            Event::ExFatBitmap { position, bitmap } => println!(
+            Event::ExFatBitmap { position, bitmap } => say!(
+                self.out,
                 "      {} {:<13} cluster {}, {} bytes",
                 exfat_position(position),
                 "bitmap",
                 bitmap.first_cluster,
                 bitmap.data_length
             ),
-            Event::ExFatSetRefused { position, refusal } => println!(
+            Event::ExFatSetRefused { position, refusal } => say!(
+                self.out,
                 "      {} {:<13} {refusal}",
                 exfat_position(position),
                 "not used"
             ),
             Event::ExFatDirectoryEnd { summary, .. } => {
-                println!(
+                say!(
+                    self.out,
                     "      entries            {}, {} files, {} directories",
-                    summary.entries_read, summary.files, summary.directories
+                    summary.entries_read,
+                    summary.files,
+                    summary.directories
                 );
                 if summary.unused_file_sets > 0 {
-                    println!("      deleted entry sets {}", summary.unused_file_sets);
+                    say!(
+                        self.out,
+                        "      deleted entry sets {}",
+                        summary.unused_file_sets
+                    );
                 }
                 if summary.entries_after_end_marker > 0 {
-                    println!(
+                    say!(
+                        self.out,
                         "      entries after end marker {}, not read",
                         summary.entries_after_end_marker
                     );
                 }
             }
             Event::ExFatDirectoryNotRead { reached, reason } => {
-                println!("    {}", exfat_heading(reached));
+                say!(self.out, "    {}", exfat_heading(reached));
                 match reason {
                     ExFatNotRead::TooDeep => {
-                        println!("      NOT READ: deeper than {MAX_DEPTH} levels below the root");
+                        say!(
+                            self.out,
+                            "      NOT READ: deeper than {MAX_DEPTH} levels below the root"
+                        );
                     }
-                    ExFatNotRead::Error(error) => println!("      NOT READ: {error}"),
+                    ExFatNotRead::Error(error) => {
+                        say!(self.out, "      NOT READ: {error}");
+                    }
                 }
             }
             Event::ExFatDirectoryCapReached {
                 cap,
                 directories_unread,
-            } => println!(
+            } => say!(
+                self.out,
                 "    {directories_unread} {} not read: the volume has more than {cap} directory clusters",
                 directories(directories_unread)
             ),
             Event::ExFatQueueBoundReached {
                 bound,
                 directories_unread,
-            } => println!(
+            } => say!(
+                self.out,
                 "    {directories_unread} {} not read: more than {bound} were waiting to be read",
                 directories(directories_unread)
             ),
@@ -553,7 +709,7 @@ impl Sink for StdoutSink {
             Event::ExFatDeletedDirectoriesRead(_) | Event::ExFatClaimsAssessed(_) => {}
             Event::ExFatDeletedSetDecided { position, outcome } => {
                 self.head_exfat_deleted();
-                println!("{}", exfat_decision_line(position, outcome));
+                say!(self.out, "{}", exfat_decision_line(position, outcome));
             }
             Event::ExFatExtracted {
                 position: _,
@@ -561,15 +717,16 @@ impl Sink for StdoutSink {
                 extraction,
                 validation,
                 readback_matches,
-            } => print_extraction(extraction, validation, readback_matches),
+            } => print_extraction(self.out, extraction, validation, readback_matches),
             Event::ExFatNotExtracted {
                 position: _,
                 file: _,
                 error,
-            } => print_not_extracted(error),
+            } => print_not_extracted(self.out, error),
             Event::ExFatDeletedSetsNotAssessed { reason, sets } => {
                 self.head_exfat_deleted();
-                println!(
+                say!(
+                    self.out,
                     "      NOT ASSESSED: {sets} deleted sets: {}",
                     phase_two_stopped(reason)
                 );
@@ -716,30 +873,32 @@ fn exfat_region_name(region: BootRegion) -> &'static str {
 
 /// Prints an exFAT volume's boot region, in the lines FAT32's boot sector
 /// has where the meaning is the same.
-fn print_exfat_boot_region(boot: &ExFatBootSector) {
+fn print_exfat_boot_region(out: &mut Report, boot: &ExFatBootSector) {
     let found = if boot.located_by_search {
         ", found by trying each sector size"
     } else {
         ""
     };
-    println!(
+    say!(
+        out,
         "    boot region          {}{found}",
         exfat_region_name(boot.region)
     );
-    println!("    bytes per sector     {}", boot.bytes_per_sector());
-    println!(
+    say!(out, "    bytes per sector     {}", boot.bytes_per_sector());
+    say!(
+        out,
         "    sectors per cluster  {}",
         1u32 << boot.sectors_per_cluster_shift
     );
-    println!("    cluster count        {}", boot.cluster_count);
-    println!("    first data sector    {}", boot.cluster_heap_offset);
-    println!("    root cluster         {}", boot.root_cluster);
-    println!("    volume id            {:#010x}", boot.volume_serial);
+    say!(out, "    cluster count        {}", boot.cluster_count);
+    say!(out, "    first data sector    {}", boot.cluster_heap_offset);
+    say!(out, "    root cluster         {}", boot.root_cluster);
+    say!(out, "    volume id            {:#010x}", boot.volume_serial);
 
     if !boot.observations.is_empty() {
-        println!("    boot region observations");
+        say!(out, "    boot region observations");
         for o in &boot.observations {
-            println!("      {o}");
+            say!(out, "      {o}");
         }
     }
 }
@@ -791,16 +950,22 @@ fn heading_of(reached: Reached<'_>) -> String {
 
 /// Prints what a partition's volume boot record identified.
 fn print_partition_identified(
+    out: &mut Report,
     partition: &MbrPartition,
     identification: &Identification,
     type_match: Option<bool>,
 ) {
     match identification {
         Identification::Identified { filesystem, .. } => {
-            println!("partition {}   filesystem {filesystem}", partition.index);
+            say!(
+                out,
+                "partition {}   filesystem {filesystem}",
+                partition.index
+            );
         }
         Identification::Unknown { reason } => {
-            println!(
+            say!(
+                out,
                 "partition {}   filesystem unknown ({reason})",
                 partition.index
             );
@@ -811,16 +976,17 @@ fn print_partition_identified(
         geometry: Some(g), ..
     } = identification
     {
-        println!("    bytes per sector     {}", g.bytes_per_sector);
-        println!("    sectors per cluster  {}", g.sectors_per_cluster);
-        println!("    cluster count        {}", g.cluster_count);
-        println!("    first data sector    {}", g.first_data_sector());
+        say!(out, "    bytes per sector     {}", g.bytes_per_sector);
+        say!(out, "    sectors per cluster  {}", g.sectors_per_cluster);
+        say!(out, "    cluster count        {}", g.cluster_count);
+        say!(out, "    first data sector    {}", g.first_data_sector());
     }
 
     if type_match == Some(false)
         && let Some(filesystem) = identification.filesystem()
     {
-        println!(
+        say!(
+            out,
             "    MISMATCH: declared type {:#04x} disagrees with observed filesystem {filesystem}",
             partition.partition_type
         );
@@ -829,35 +995,35 @@ fn print_partition_identified(
     if let Identification::Identified { observations, .. } = identification
         && !observations.is_empty()
     {
-        println!("    observations");
+        say!(out, "    observations");
         for o in observations {
-            println!("      {o}");
+            say!(out, "      {o}");
         }
     }
 }
 
 /// Prints a FAT32 volume's validated boot sector.
-fn print_boot_sector(boot: &Fat32BootSector) {
-    println!("    root cluster         {}", boot.root_cluster);
-    println!("    backup boot sector   {}", boot.backup_boot_sector);
+fn print_boot_sector(out: &mut Report, boot: &Fat32BootSector) {
+    say!(out, "    root cluster         {}", boot.root_cluster);
+    say!(out, "    backup boot sector   {}", boot.backup_boot_sector);
 
     match boot.active_fat() {
-        Some(n) => println!("    FAT mirroring        disabled, FAT {n} active"),
-        None => println!("    FAT mirroring        enabled"),
+        Some(n) => say!(out, "    FAT mirroring        disabled, FAT {n} active"),
+        None => say!(out, "    FAT mirroring        enabled"),
     }
 
     if let Some(id) = boot.volume_id {
-        println!("    volume id            {id:#010x}");
+        say!(out, "    volume id            {id:#010x}");
     }
 
     if let Some(label) = &boot.volume_label {
-        println!("    volume label         {label}");
+        say!(out, "    volume label         {label}");
     }
 
     if !boot.observations.is_empty() {
-        println!("    boot sector observations");
+        say!(out, "    boot sector observations");
         for o in &boot.observations {
-            println!("      {o}");
+            say!(out, "      {o}");
         }
     }
 }
@@ -866,31 +1032,43 @@ fn print_boot_sector(boot: &Fat32BootSector) {
 ///
 /// The root's block is printed exactly as it was before subdirectories were
 /// read, so every heading below the root reuses it unchanged.
-fn print_directory(heading: &str, directory: &Directory) {
+fn print_directory(out: &mut Report, heading: &str, directory: &Directory) {
     let chain: Vec<String> = directory.clusters.iter().map(|c| c.to_string()).collect();
 
-    println!("    {heading}");
-    println!("      cluster chain      {}", chain.join(" -> "));
-    println!("      entries            {}", directory.entries.len());
-    println!("      short entries      {}", directory.short_entry_count());
-    println!("      long name entries  {}", directory.long_name_count());
-    println!("      deleted entries    {}", directory.deleted_count());
+    say!(out, "    {heading}");
+    say!(out, "      cluster chain      {}", chain.join(" -> "));
+    say!(out, "      entries            {}", directory.entries.len());
+    say!(
+        out,
+        "      short entries      {}",
+        directory.short_entry_count()
+    );
+    say!(
+        out,
+        "      long name entries  {}",
+        directory.long_name_count()
+    );
+    say!(
+        out,
+        "      deleted entries    {}",
+        directory.deleted_count()
+    );
 
     for (index, entry) in directory.entries.iter().enumerate() {
-        print_entry(entry, &directory.entries, index);
+        print_entry(out, entry, &directory.entries, index);
     }
 
     if !directory.residue.is_empty() {
-        println!("      past the terminator");
+        say!(out, "      past the terminator");
         for (index, entry) in directory.residue.iter().enumerate() {
-            print_entry(entry, &directory.residue, index);
+            print_entry(out, entry, &directory.residue, index);
         }
     }
 
     if !directory.observations.is_empty() {
-        println!("      directory observations");
+        say!(out, "      directory observations");
         for o in &directory.observations {
-            println!("        {o}");
+            say!(out, "        {o}");
         }
     }
 }
@@ -899,27 +1077,39 @@ fn print_directory(heading: &str, directory: &Directory) {
 /// comparison with the reference. The same lines for a FAT32 run and an
 /// exFAT set, with no level word on them (`ADR-0014` Appendix A.10).
 fn print_extraction(
+    out: &mut Report,
     extraction: &Extraction,
     validation: Validation,
     readback_matches: Option<bool>,
 ) {
     // `docs/SAFETY.md` section 10 requires the recovered-file hash and the
     // validation hash to be distinguishable where both are reported.
-    println!(
+    say!(
+        out,
         "        {:<9} recovered sha256 {} over {} bytes",
-        "", extraction.digest, extraction.bytes_hashed
+        "",
+        extraction.digest,
+        extraction.bytes_hashed
     );
 
     if let Some(output) = &extraction.output {
-        print_output(output, readback_matches);
+        print_output(out, output, readback_matches);
     }
 
     match (validation.outcome, validation.reference) {
         (Outcome::Match, Some(reference)) => {
-            println!("        {:<9} reference sha256 {reference} MATCHES", "");
+            say!(
+                out,
+                "        {:<9} reference sha256 {reference} MATCHES",
+                ""
+            );
         }
         (Outcome::Differs, Some(reference)) => {
-            println!("        {:<9} reference sha256 {reference} DIFFERS", "");
+            say!(
+                out,
+                "        {:<9} reference sha256 {reference} DIFFERS",
+                ""
+            );
         }
         // `NotAttempted` carries no reference, and a reference is always
         // carried where a comparison happened.
@@ -928,8 +1118,8 @@ fn print_extraction(
 }
 
 /// Prints an extraction that failed, for either filesystem.
-fn print_not_extracted(error: &dyn std::fmt::Display) {
-    println!("        {:<9} NOT EXTRACTED: {error}", "");
+fn print_not_extracted(out: &mut Report, error: &dyn std::fmt::Display) {
+    say!(out, "        {:<9} NOT EXTRACTED: {error}", "");
 }
 
 /// Says what became of a written artifact, where one was asked for.
@@ -940,7 +1130,7 @@ fn print_not_extracted(error: &dyn std::fmt::Display) {
 /// a differing reference the same way, and the exit status is unchanged by
 /// either. `readback_matches` carries that comparison's answer; it is
 /// `Some` exactly where `output` is [`Output::Written`].
-fn print_output(output: &Output, readback_matches: Option<bool>) {
+fn print_output(out: &mut Report, output: &Output, readback_matches: Option<bool>) {
     match output {
         Output::Written { path, .. } => {
             let verdict = if readback_matches == Some(true) {
@@ -949,20 +1139,32 @@ fn print_output(output: &Output, readback_matches: Option<bool>) {
                 "DIFFERS from what was read"
             };
 
-            println!("        {:<9} written {} {verdict}", "", path.display());
+            say!(
+                out,
+                "        {:<9} written {} {verdict}",
+                "",
+                path.display()
+            );
         }
         Output::Unverified { path, message } => {
-            println!(
+            say!(
+                out,
                 "        {:<9} written {} NOT VERIFIED: {message}",
                 "",
                 path.display()
             );
         }
         Output::Exists { path } => {
-            println!("        {:<9} NOT WRITTEN: {} exists", "", path.display());
+            say!(
+                out,
+                "        {:<9} NOT WRITTEN: {} exists",
+                "",
+                path.display()
+            );
         }
         Output::NotCreated { path, message } => {
-            println!(
+            say!(
+                out,
                 "        {:<9} NOT WRITTEN: {} could not be created: {message}",
                 "",
                 path.display()
@@ -975,7 +1177,8 @@ fn print_output(output: &Output, readback_matches: Option<bool>) {
         } => {
             let partial = if *removed { "" } else { ", partial file left" };
 
-            println!(
+            say!(
+                out,
                 "        {:<9} NOT WRITTEN: {}: {message}{partial}",
                 "",
                 path.display()
@@ -1005,51 +1208,70 @@ const GAP_LABEL_WIDTH: usize = 26;
 /// Appendix A.4 measured that such a run reports its error on stderr and
 /// says nothing on stdout, so a reader capturing stdout alone sees a digest
 /// and no indication that nothing else was analysed.
-fn print_summary(counts: &RunCounts, options: Options<'_>) {
-    println!();
-    println!("coverage     {}", counts.coverage());
+fn print_summary(out: &mut Report, counts: &RunCounts, options: Options<'_>) {
+    say!(out);
+    say!(out, "coverage     {}", counts.coverage());
 
-    print_count("volumes analysed", counts.volumes_analysed());
-    print_gap("partition table not read", counts.table_unread());
-    print_gap("partition table not parsed", counts.table_rejected());
-    print_gap("partition entries rejected", counts.partitions_anomalous());
-    print_gap("GPT not analysed", counts.gpt());
-    print_gap("partitions not read", counts.partition_unread());
-    print_gap("filesystems not identified", counts.unidentified());
-    print_gap("filesystems not analysed", counts.unsupported());
-    print_gap("boot sectors rejected", counts.boot_rejected());
-    print_gap("root directories not read", counts.root_unread());
+    print_count(out, "volumes analysed", counts.volumes_analysed());
+    print_gap(out, "partition table not read", counts.table_unread());
+    print_gap(out, "partition table not parsed", counts.table_rejected());
     print_gap(
+        out,
+        "partition entries rejected",
+        counts.partitions_anomalous(),
+    );
+    print_gap(out, "GPT not analysed", counts.gpt());
+    print_gap(out, "partitions not read", counts.partition_unread());
+    print_gap(out, "filesystems not identified", counts.unidentified());
+    print_gap(out, "filesystems not analysed", counts.unsupported());
+    print_gap(out, "boot sectors rejected", counts.boot_rejected());
+    print_gap(out, "root directories not read", counts.root_unread());
+    print_gap(
+        out,
         "entries not assessed",
         counts.not_assessed() + counts.exfat_not_assessed(),
     );
     print_gap(
+        out,
         "entries not extracted",
         counts.not_extracted() + counts.exfat_not_extracted(),
     );
     print_gap(
+        out,
         "artifacts not written",
         counts.not_delivered() + counts.exfat_not_delivered(),
     );
-    print_gap("directories not read", counts.directories_unread());
-    print_gap("listings that may continue", counts.listings_may_continue());
-    print_gap("orphan searches stopped", counts.orphan_search_stopped());
-    print_gap("entry sets not used", counts.exfat_sets_refused());
+    print_gap(out, "directories not read", counts.directories_unread());
     print_gap(
+        out,
+        "listings that may continue",
+        counts.listings_may_continue(),
+    );
+    print_gap(
+        out,
+        "orphan searches stopped",
+        counts.orphan_search_stopped(),
+    );
+    print_gap(out, "entry sets not used", counts.exfat_sets_refused());
+    print_gap(
+        out,
         "entries after end marker",
         counts.exfat_end_marker_residue(),
     );
-    print_gap("deleted sets not usable", counts.exfat_sets_unusable());
+    print_gap(out, "deleted sets not usable", counts.exfat_sets_unusable());
     print_gap(
+        out,
         "claimants not followed",
         counts.exfat_claimants_not_followed(),
     );
     print_gap(
+        out,
         "deleted directories unread",
         counts.exfat_deleted_directories_unread(),
     );
     // ADR-0022 Decision K's words for a set inside a deleted directory.
     print_gap(
+        out,
         "deleted sets not examined",
         counts.exfat_sets_inside_not_examined(),
     );
@@ -1059,7 +1281,7 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     // `ADR-0022` section 3: each level with a count above zero; a run with
     // no exFAT artifact prints the line it printed before.
     if options.recover {
-        println!("artifacts    {}", artifacts_by_level(counts, options));
+        say!(out, "artifacts    {}", artifacts_by_level(counts, options));
     }
 
     // Only where a reference was supplied. Where none was, the caveat block
@@ -1069,7 +1291,7 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     if options.reference.is_some() {
         let matched = counts.matched() + counts.exfat_matched();
         let differed = counts.differed(options) + counts.exfat_differed(options);
-        println!("compared     {matched} matched, {differed} differed");
+        say!(out, "compared     {matched} matched, {differed} differed");
     }
 
     // Deleted entries that produced no artifact, by what stopped them.
@@ -1116,7 +1338,7 @@ fn print_summary(counts: &RunCounts, options: Options<'_>) {
     );
 
     if !unrecovered.is_empty() {
-        println!("unrecovered  {}", unrecovered.join(", "));
+        say!(out, "unrecovered  {}", unrecovered.join(", "));
     }
 }
 
@@ -1141,16 +1363,16 @@ fn artifacts_by_level(counts: &RunCounts, options: Options<'_>) -> String {
 }
 
 /// One line of the coverage block.
-fn print_count(label: &str, count: usize) {
-    println!("  {label:<width$} {count}", width = GAP_LABEL_WIDTH);
+fn print_count(out: &mut Report, label: &str, count: usize) {
+    say!(out, "  {label:<width$} {count}", width = GAP_LABEL_WIDTH);
 }
 
 /// One line of the coverage block, printed only where there is something to
 /// report. A zero would state that a kind of gap did not occur, which reads
 /// as a finding about the evidence rather than about the run.
-fn print_gap(label: &str, count: usize) {
+fn print_gap(out: &mut Report, label: &str, count: usize) {
     if count > 0 {
-        print_count(label, count);
+        print_count(out, label, count);
     }
 }
 
@@ -1176,7 +1398,7 @@ fn push_part(parts: &mut Vec<String>, count: usize, label: &str) {
 /// Indented to zero for the same reason. At volume indentation it would
 /// read as a statement about the last volume printed rather than about the
 /// run it now covers.
-fn print_caveats(counts: &RunCounts, options: Options<'_>) {
+fn print_caveats(out: &mut Report, counts: &RunCounts, options: Options<'_>) {
     let fat32 = counts.free_runs() > 0;
     let exfat = counts.exfat_recoverable() + counts.exfat_passed() > 0;
     if !fat32 && !exfat {
@@ -1188,10 +1410,10 @@ fn print_caveats(counts: &RunCounts, options: Options<'_>) {
         // run is free would let a reader take it for a finding. It is the
         // absence of contrary evidence, which is not the same thing and never
         // becomes it.
-        println!();
-        println!("A free run means nothing has claimed those");
-        println!("clusters since the entry lost them. It is not");
-        println!("evidence that the content there is this file's.");
+        say!(out);
+        say!(out, "A free run means nothing has claimed those");
+        say!(out, "clusters since the entry lost them. It is not");
+        say!(out, "evidence that the content there is this file's.");
     }
 
     // ADR-0013 section 8.2. A match is byte equality with what the operator
@@ -1199,40 +1421,40 @@ fn print_caveats(counts: &RunCounts, options: Options<'_>) {
     // evidence than it reads as. Nothing in it is FAT32's, so a match on
     // either filesystem prints it.
     if counts.matched() + counts.exfat_matched() > 0 {
-        println!();
-        println!("A match establishes that these bytes are the");
-        println!("reference's, byte for byte. Where content is not");
-        println!("distinctive, other clusters could hold the same");
-        println!("bytes.");
+        say!(out);
+        say!(out, "A match establishes that these bytes are the");
+        say!(out, "reference's, byte for byte. Where content is not");
+        say!(out, "distinctive, other clusters could hold the same");
+        say!(out, "bytes.");
     }
 
     // ADR-0013 Decision E. The causes are listed and none is chosen, because
     // the evidence does not distinguish between them. They are a FAT32 run's
     // causes, so only FAT32's differences print it.
     if fat32 && counts.differed(options) > 0 {
-        println!();
-        println!("A differing digest does not say which of these");
-        println!("happened: the file was fragmented, clusters of");
-        println!("the run were reused, the recorded size is wrong,");
-        println!("or the reference is another file.");
+        say!(out);
+        say!(out, "A differing digest does not say which of these");
+        say!(out, "happened: the file was fragmented, clusters of");
+        say!(out, "the run were reused, the recorded size is wrong,");
+        say!(out, "or the reference is another file.");
     }
 
     // ADR-0019 section 5 and ADR-0022 section 15: a set states the checks it
     // passed and never that the data is the file's. True with content read
     // or not.
     if exfat {
-        println!();
+        say!(out);
         for line in EXFAT_CAVEAT {
-            println!("{line}");
+            say!(out, "{line}");
         }
     }
 
     // Attached to the paragraph above rather than set apart: each is one
     // line about the invocation, not a caveat of its own.
     if !options.recover {
-        println!("No content read. Pass --recover to read it.");
+        say!(out, "No content read. Pass --recover to read it.");
     } else if options.reference.is_none() {
-        println!("No reference supplied. Nothing was validated.");
+        say!(out, "No reference supplied. Nothing was validated.");
     }
 }
 
@@ -1265,11 +1487,11 @@ fn rendered(name: Option<&str>) -> &str {
 /// `entries` and `index` locate the entry among its neighbours, which a
 /// deleted short entry needs: the checksum that recovers its first byte is
 /// held by the entries before it.
-fn print_entry(entry: &Entry, entries: &[Entry], index: usize) {
+fn print_entry(out: &mut Report, entry: &Entry, entries: &[Entry], index: usize) {
     let position = format!("c{} s{}", entry.cluster, entry.slot);
     let (label, detail) = describe(&entry.kind, entries, index);
 
-    println!("      {position:<9} {label:<13} {detail}");
+    say!(out, "      {position:<9} {label:<13} {detail}");
 }
 
 /// A label and a one-line description for one classified entry.

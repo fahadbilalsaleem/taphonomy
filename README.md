@@ -147,6 +147,7 @@ taphonomy <evidence-image> [--recover] [--output <directory>] [--reference-diges
 | 1 | The evidence could not be opened or hashed |
 | 2 | An argument error; no evidence was opened |
 | 3 | Nothing past the evidence digest was analysed |
+| 4 | The report could not be written (standard output was closed or failed); the run stopped, and files already written may be missing from the report |
 
 A gap in coverage does not by itself change the status: it is reported on
 standard output. A digest that differs from the reference is a finding

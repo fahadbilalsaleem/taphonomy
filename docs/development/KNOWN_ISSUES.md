@@ -593,14 +593,20 @@ Decided in S6-6 (`ADR-0022` Appendix E); the limit is recorded in
 
 ---
 
-## The command line panics when its output is closed early
+## A report cut short may not list every file written
 
-Piping the output into a command that stops reading, such as `| head`,
-makes the process panic with "failed printing to stdout: Broken pipe".
-Rust's `println!` panics when standard output is a closed pipe, and the
-command line prints through it.
+When standard output is closed early, as by `| head`, or cannot be
+written, the run stops with exit status 4 (`ADR-0018` Appendix A). The
+failure is seen at the first write after the reader has gone, and a run
+can be ahead of its reader by what a pipe holds, so a file written in
+between is on disk, complete, while the line reporting it never reached
+the reader. The line on standard error says that files already written
+may be missing from the report: after a run that exits 4, read the
+output directory, not only the report.
 
-Found 2026-11-19. Not fixed.
+Found 2026-11-19 as a panic; the panic is gone since `ADR-0018`
+Appendix A. The gap between the reader's exit and the first failed
+write is not closed.
 
 ---
 

@@ -312,6 +312,9 @@ fn report_volume<R: EvidenceReader>(
     // the one being read, and every one still queued.
     let mut cap_unread = 0usize;
     while let Some(next) = pending.pop_front() {
+        if sink.stopped() {
+            break;
+        }
         let components = PathNode::components(&next.path);
         let reached = ExFatReached::Walked {
             components: &components,
@@ -371,6 +374,12 @@ fn report_volume<R: EvidenceReader>(
             bound: limits.queued_directories,
             directories_unread: unqueued,
         });
+    }
+
+    // `ADR-0018` Decision F: a stopped sink gets no phase 2, which would
+    // open the bitmap and read the deleted directories for events it drops.
+    if sink.stopped() {
+        return;
     }
 
     let every_directory_read = counts.directories_unread == unread_before;
@@ -448,6 +457,9 @@ fn report_deleted_sets<R: EvidenceReader>(
 
     let recorded = reader.deleted_sets_recorded();
     for index in 0..recorded {
+        if sink.stopped() {
+            break;
+        }
         let recover = volume.options.recover;
         match reader.decide_deleted_set(index, &mut bitmap, &claims, recover) {
             Ok(decision) => {
@@ -480,6 +492,12 @@ fn report_extraction<R: EvidenceReader>(
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
+    // `ADR-0018` Decision F: a stopped sink gets no further file, and the
+    // decision above may have stopped it after the loop's own check.
+    if sink.stopped() {
+        return;
+    }
+
     // The path is composed from the partition, the File entry's position
     // and the first cluster; no byte of evidence reaches it.
     let destination = volume.options.output.map(|directory| Destination {

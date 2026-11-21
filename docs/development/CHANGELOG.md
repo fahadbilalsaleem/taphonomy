@@ -7,7 +7,20 @@ history.
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- A report that cannot be written stops the run with exit status 4
+  instead of a panic (`ADR-0018` Appendix A). When standard output is
+  closed early, for example by `| head`, or cannot be written, the run
+  writes no further recovered file, and one line on standard error says
+  the report is incomplete and, with `--output`, that files already
+  written may be missing from it.
+
+### Changed
+
+- `Sink` has a second method, `stopped`, which returns `false` unless
+  a sink overrides it; a sink that returns `true` stops the run
+  (`ADR-0018` Decision F).
 
 ## 0.2.0 - 2026-11-19
 

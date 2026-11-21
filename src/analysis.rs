@@ -418,6 +418,16 @@ pub enum Event<'a> {
 pub trait Sink {
     /// Records one event.
     fn record(&mut self, event: Event<'_>);
+
+    /// Whether this sink can no longer record events.
+    ///
+    /// `ADR-0018` Decision F. Once it returns `true` the run extracts no
+    /// further file and leaves each of its loops at the next pass; events it
+    /// still delivers are the sink's to drop. A sink that never stops need
+    /// not implement it.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// Deepest level below the root at which a directory is read.
@@ -1008,11 +1018,17 @@ pub fn run<R: EvidenceReader>(
                         } => {
                             sink.record(Event::DiskSignature(*disk_signature));
                             for p in partitions {
+                                if sink.stopped() {
+                                    break;
+                                }
                                 sink.record(Event::PartitionListed(p));
                             }
                             sink.record(Event::PartitionsListed);
 
                             for p in partitions {
+                                if sink.stopped() {
+                                    break;
+                                }
                                 report_partition(evidence, p, options, &mut counts, sink);
                             }
                         }
@@ -1204,6 +1220,9 @@ fn report_root_directory<R: EvidenceReader>(
     );
 
     while let Some(next) = pending.pop_front() {
+        if sink.stopped() {
+            break;
+        }
         named.insert(next.first_cluster);
         report_subdirectory(
             evidence,
@@ -1251,6 +1270,9 @@ fn search_orphaned_directories<R: EvidenceReader>(
     let mut listed: Vec<(u32, String, u32)> = Vec::new();
 
     for cluster in boot.geometry.data_clusters() {
+        if sink.stopped() {
+            break;
+        }
         if seen.contains(&cluster) || named.contains(&cluster) {
             continue;
         }
@@ -1610,6 +1632,9 @@ fn report_recovery<R: EvidenceReader>(
     // findings carried on every event; whether and when to head them is
     // a rendering choice left entirely to the sink.
     for entry in entries {
+        if sink.stopped() {
+            break;
+        }
         let assessment = match assess_listed(entry, listing, boot, extent, evidence) {
             Ok(None) => continue,
             Ok(Some(assessment)) => assessment,
@@ -1675,7 +1700,9 @@ fn report_recovery<R: EvidenceReader>(
                     run: *found.run(),
                 });
 
-                if options.recover {
+                // `ADR-0018` Decision F: a stopped sink gets no further file,
+                // and this is the check that stops one the event above made.
+                if options.recover && !sink.stopped() {
                     // `ADR-0015` Decision D. The partition, the entry's
                     // location and the first cluster are facts the run
                     // established; no byte of evidence reaches the path.
