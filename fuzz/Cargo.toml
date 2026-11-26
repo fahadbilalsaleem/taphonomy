@@ -1,0 +1,33 @@
+[package]
+name = "taphonomy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+
+[dependencies.taphonomy]
+path = ".."
+
+# Its own workspace: the crate's Cargo.lock and `cargo test --workspace`
+# never see this directory.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "analyse_image"
+path = "fuzz_targets/analyse_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exfat_reader"
+path = "fuzz_targets/exfat_reader.rs"
+test = false
+doc = false
+bench = false

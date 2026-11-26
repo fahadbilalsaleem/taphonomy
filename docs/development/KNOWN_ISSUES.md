@@ -354,14 +354,25 @@ those images first.
 
 ---
 
-## No fuzz testing exists
+## Fuzzing covers two targets and runs no campaign in CI
 
-`SECURITY.md` sections 35 and 36 call for fuzzing the parsers. None exists:
-there is no fuzz target and no fuzzing dependency. The MBR, boot sector and
-directory entry parsers read untrusted bytes, are bounds-checked, and have
-tests for the malformed inputs the fixtures and unit tests construct.
-Inputs nobody thought to construct are untested, and that is the gap
-fuzzing closes.
+`SECURITY.md` sections 35 and 36 call for fuzzing the parsers. Two fuzz
+targets exist in `fuzz/` (`ADR-0023`): `analyse_image`, which runs the
+whole analysis over a sparse image, and `exfat_reader`, which drives the
+exFAT reader directly. CI replays their seeds and four committed
+regression inputs, which shows they still run and that a recorded input
+still does not crash; it runs no campaign, so it finds nothing new.
+Campaigns are run locally. The campaigns so far (`EXP-0012`) found no
+crash; absence of a crash is not evidence that none exists.
+
+What remains uncovered:
+
+* FAT12, FAT16, GPT and NTFS have no target, because the crate does not
+  analyse them.
+* The command line's rendering of the report in `src/main.rs` is reached
+  by no target.
+* The seeds are fixtures and a few made volumes, so inputs far from them
+  are reached only by mutation.
 
 ---
 

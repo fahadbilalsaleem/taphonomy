@@ -7,6 +7,12 @@ history.
 
 ## Unreleased
 
+### Added
+
+- Fuzz targets in `fuzz/`, seeds made by `scripts/fuzz-seeds.sh`, four
+  regression inputs, and a CI job that replays them; no campaign runs in
+  CI (`ADR-0023`).
+
 ### Fixed
 
 - A report that cannot be written stops the run with exit status 4

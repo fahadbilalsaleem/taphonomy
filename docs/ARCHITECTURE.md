@@ -1198,8 +1198,9 @@ holds: recovery is `src/fat_recovery.rs`, `src/exfat_recovery.rs` and
 comparison against a reference is `src/validation.rs`. 10 holds: every
 capability has a decision record in `docs/decisions`. 3 and 9 hold for the
 library. 4 has nothing to act on yet, since there is no acquisition. 7 holds
-as far as parsing is bounds-checked; no fuzz testing exists (`SECURITY.md`
-section 36).
+as far as parsing is bounds-checked. Fuzz targets exist in `fuzz/`, and CI
+replays their seeds and regression inputs, but no fuzzing campaign runs in CI
+(`ADR-0023`, `SECURITY.md` section 36).
 
 **Invariant 8 holds.** `ADR-0018`. The partition loop, the directory walk,
 the orphan search and the run's counts are `src/analysis.rs`, called from
