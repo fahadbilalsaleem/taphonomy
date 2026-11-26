@@ -802,6 +802,7 @@ fn exfat_decision_line(position: ExFatPosition, outcome: &DeletedSetOutcome) -> 
                 "REFUSED, condition 2: {}",
                 match verdict {
                     ConditionTwo::Later => "a later claim",
+                    ConditionTwo::SameTime => "a claim at the same time",
                     ConditionTwo::Unordered => "claims not ordered",
                     // Never built: a set that holds is not refused. Should
                     // it reach here, the line must not read as a finding.
@@ -1718,6 +1719,13 @@ mod tests {
                     verdict: ConditionTwo::Later,
                 },
                 "f.bin         REFUSED, condition 2: a later claim".to_string(),
+            ),
+            (
+                O::ConditionTwo {
+                    file: file(),
+                    verdict: ConditionTwo::SameTime,
+                },
+                "f.bin         REFUSED, condition 2: a claim at the same time".to_string(),
             ),
             (
                 O::ConditionTwo {

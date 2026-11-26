@@ -653,3 +653,22 @@ outside the repository, of 2^20 claimants and 2^20 runs, showed about
 
 Recorded in `ADR-0022` section 12 and the docs of `MAX_CLAIMED_RUNS` in
 `src/exfat_directory.rs`.
+
+---
+
+## A clock that does not move refuses every overlapping deleted exFAT file
+
+Condition 2 refuses a deleted set when another claim on its clusters has
+the same time, because neither can be shown to be the later (`ADR-0019`
+section 4). A device that writes one time for every file, or whose
+clock was reset, gives every deleted file the same time, so each one
+whose clusters another deleted file also claims is refused, the intact
+one included. The report says so: such a refusal reads `a claim at the
+same time` (`ADR-0022` Appendix G).
+
+Seen on a card written with a frozen clock in the video chat's third set
+of scenarios, rebuilt here byte for byte on 2026-11-26: the photo
+written last, intact on the card, was refused with the two files it had
+overwritten. The same card with a clock that moves recovers it. No tie
+is broken by any other evidence; doing so needs research and a
+benchmark first.

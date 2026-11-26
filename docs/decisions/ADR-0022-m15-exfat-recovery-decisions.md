@@ -1037,3 +1037,53 @@ make it small through a volume with few clusters.
 
 **Not measured:** NIST's nine GPT images, until GPT is read;
 recovery inside deleted directories, which is M16.
+
+---
+
+## Appendix G: a refusal on equal times says so (2026-11-26)
+
+Condition 2 refuses a deleted set when a claim on one of its clusters
+was created, or last modified, at or after the set's creation (section
+5; `ADR-0019` section 4 and Appendix C). `ADR-0019` gives the reason for
+equal times: they "refuse every file that shares them, because neither
+can be shown to be the later". Until this appendix `decide` returned one
+verdict, `Later`, for both cases, and the report printed `a later claim`
+for each, which is untrue where the times are equal.
+
+**How it was found.** The third set of scenarios from a separate
+research session wrote a card with a frozen clock, so every deleted
+entry carries the same creation time. Rebuilt here byte for byte on
+2026-11-26, it shows the photo written last, intact at its clusters,
+refused with `a later claim`, as are the two files it overwrote.
+
+**Decision (the author, 2026-11-26): the rule does not change; the
+report says which case refused.** `ConditionTwo` gains `SameTime`: a
+claim on one of the set's clusters was created or last modified at the
+set's creation, and none after it. `Later` now means after it. The
+report prints `a claim at the same time` for `SameTime`. A set with
+both kinds of rival is `Later`; a set with a rival that cannot be
+ordered stays `Unordered` (`claims not ordered`), as before.
+
+**How it is decided.** Section 5's second step runs twice: first
+counting rivals whose later key is after the set's creation, then those
+at or after it; each pass marks only a set that still holds. A set's
+own claim counts in a pass only where its own later key meets that
+pass's test. The test that compares the sweep with a direct check of
+every pair compares all four verdicts.
+
+**What changed in the output.** `scripts/experiments/report-diff.sh`
+ran the release builds of `3de038e` and of this change over 106 images:
+the 34 fixtures, three CFReDS FAT images, NIST's 20 exFAT images, the
+Linux image, Nordvik and Axelsson's 22, 14 exFAT volumes made here
+with exfatprogs, relan's exfat and FatFs, and set 3's 12 rebuilt exFAT
+cards. Every exit
+status is the same. One image differs, the frozen-clock card, in its
+three condition-2 lines and nothing else; every set is refused or
+recovered as before. No public image holds a refusal on equal times, so
+the new verdict is reached through the binary only on that card, which
+is not committed: making it needs libfaketime, a loop device and
+exfat-fuse. Unit tests hold it otherwise.
+
+**Not decided here.** Breaking a tie by other evidence; it needs
+research and a benchmark first. `docs/development/KNOWN_ISSUES.md`
+records the cost.

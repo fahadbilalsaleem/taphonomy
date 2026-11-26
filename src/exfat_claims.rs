@@ -148,9 +148,14 @@ pub enum ConditionTwo {
     /// every one can be ordered against it.
     Holds,
 
-    /// A claimant sharing a cluster was created or last modified at the
-    /// same time as this set's creation or later.
+    /// A claimant sharing a cluster was created or last modified after this
+    /// set's creation.
     Later,
+
+    /// A claimant sharing a cluster was created or last modified at the same
+    /// time as this set's creation, and none after it: neither can be shown
+    /// to be the later.
+    SameTime,
 
     /// A claimant sharing a cluster has no time, or a time that cannot be
     /// compared with this set's creation: the two cannot be ordered.
@@ -214,7 +219,31 @@ pub(crate) fn decide(claimants: &[Claimant], runs: &[ClaimRun]) -> Vec<Option<Co
         spans.add(&mut tree, owner, -1);
     }
 
-    // Step 2: among claimants that can be ordered, a later one.
+    // Step 2: among claimants that can be ordered, a later one. Two passes,
+    // because ADR-0019 section 4 refuses equal times too but neither claim
+    // is the later: a strictly later claim is `Later`, and only a set with
+    // no such claim and an equal one is `SameTime`.
+    order_pass(claimants, &spans, &mut tree, &mut verdicts, true);
+    order_pass(claimants, &spans, &mut tree, &mut verdicts, false);
+
+    verdicts
+}
+
+/// One pass of step 2: marks a set still `Holds` that shares a stretch with a
+/// rival whose later key is after its creation (`strictly`, `Later`) or at or
+/// after it (`SameTime`).
+fn order_pass(
+    claimants: &[Claimant],
+    spans: &Spans,
+    tree: &mut Tree,
+    verdicts: &mut [Option<ConditionTwo>],
+    strictly: bool,
+) {
+    let (verdict, after): (_, fn(u64, u64) -> bool) = if strictly {
+        (ConditionTwo::Later, |latest, created| latest > created)
+    } else {
+        (ConditionTwo::SameTime, |latest, created| latest >= created)
+    };
     for (byte, mut members) in by_created_offset(claimants) {
         let mut pure: Vec<usize> = members
             .iter()
@@ -229,27 +258,31 @@ pub(crate) fn decide(claimants: &[Claimant], runs: &[ClaimRun]) -> Vec<Option<Co
             let Some(created) = claimants[s].created else {
                 continue;
             };
-            while added < pure.len() && claimants[pure[added]].latest() >= Some(created.value) {
-                spans.add(&mut tree, pure[added], 1);
+            while added < pure.len()
+                && claimants[pure[added]]
+                    .latest()
+                    .is_some_and(|latest| after(latest, created.value))
+            {
+                spans.add(tree, pure[added], 1);
                 added += 1;
             }
-            // A set whose two keys carry this byte was added: its later key
-            // is at or after its creation.
-            let own = if claimants[s].class() == Some(byte) {
-                1
-            } else {
-                0
-            };
-            if verdicts[s] == Some(ConditionTwo::Holds) && spans.most(&tree, s) > own {
-                verdicts[s] = Some(ConditionTwo::Later);
+            // A set whose two keys carry this byte is added where its own
+            // later key passes the same test: always in the non-strict pass,
+            // only if it was modified after its creation in the strict one.
+            let own = i32::from(
+                claimants[s].class() == Some(byte)
+                    && claimants[s]
+                        .latest()
+                        .is_some_and(|latest| after(latest, created.value)),
+            );
+            if verdicts[s] == Some(ConditionTwo::Holds) && spans.most(tree, s) > own {
+                verdicts[s] = Some(verdict);
             }
         }
         for &o in &pure[..added] {
-            spans.add(&mut tree, o, -1);
+            spans.add(tree, o, -1);
         }
     }
-
-    verdicts
 }
 
 /// The timed claimants with a creation key, grouped by its offset byte, in
@@ -459,7 +492,7 @@ mod tests {
         }
     }
 
-    use ConditionTwo::{Holds, Later, Unordered};
+    use ConditionTwo::{Holds, Later, SameTime, Unordered};
 
     // --- keys --------------------------------------------------------------
 
@@ -538,14 +571,46 @@ mod tests {
     fn a_rival_modified_at_or_after_this_creation_refuses_it() {
         let c = [timed(k(4, 0x90), k(4, 0x90)), timed(k(0, 0x90), k(4, 0x90))];
         let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1)]);
-        assert_eq!(v, vec![Some(Later), Some(Later)]);
+        assert_eq!(v, vec![Some(SameTime), Some(Later)]);
     }
 
     #[test]
     fn equal_creations_refuse_both() {
         let c = [timed(k(4, 0x90), k(4, 0x90)), timed(k(4, 0x90), k(4, 0x90))];
         let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1)]);
-        assert_eq!(v, vec![Some(Later), Some(Later)]);
+        assert_eq!(v, vec![Some(SameTime), Some(SameTime)]);
+    }
+
+    /// A rival at the same time and another after: some claim is later, so
+    /// the set is `Later`, not `SameTime`.
+    #[test]
+    fn an_equal_rival_and_a_later_rival_make_it_later() {
+        let c = [
+            timed(k(4, 0x90), k(4, 0x90)),
+            timed(k(4, 0x90), k(4, 0x90)),
+            timed(k(8, 0x90), k(8, 0x90)),
+        ];
+        let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1), run(2, 5, 1)]);
+        assert_eq!(v[0], Some(Later));
+    }
+
+    /// A set whose own two keys are equal does not count as a later rival to
+    /// itself, so a rival created after it still makes it `Later`.
+    #[test]
+    fn a_set_with_equal_keys_and_a_rival_created_after_it_is_later() {
+        let c = [timed(k(4, 0x90), k(4, 0x90)), timed(k(8, 0x90), k(8, 0x90))];
+        let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1)]);
+        assert_eq!(v, vec![Some(Later), Some(Holds)]);
+    }
+
+    /// A set modified after its creation, whose only rival was modified at
+    /// its creation instant, is `SameTime`; the rival, created before it, is
+    /// `Later`. The set's own claim counts in the strict pass.
+    #[test]
+    fn a_set_modified_after_its_creation_with_a_rival_at_its_creation_is_same_time() {
+        let c = [timed(k(4, 0x90), k(8, 0x90)), timed(k(0, 0x90), k(4, 0x90))];
+        let v = decide(&c, &[run(0, 5, 1), run(1, 5, 1)]);
+        assert_eq!(v, vec![Some(SameTime), Some(Later)]);
     }
 
     #[test]
@@ -696,8 +761,10 @@ mod tests {
                     for t in keys {
                         match (me.created, t) {
                             (Some(c), Some(t)) if c.offset == t.offset => {
-                                if t.value >= c.value && verdict == Holds {
+                                if t.value > c.value && matches!(verdict, Holds | SameTime) {
                                     verdict = Later;
+                                } else if t.value == c.value && verdict == Holds {
+                                    verdict = SameTime;
                                 }
                             }
                             _ => verdict = Unordered,
@@ -733,7 +800,7 @@ mod tests {
     #[test]
     fn the_sweep_agrees_with_a_direct_pairwise_check() {
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-        let mut verdicts = [0u64; 3];
+        let mut verdicts = [0u64; 4];
         for case in 0..20_000 {
             let n = 1 + rng.below(8) as usize;
             let draw_key = |rng: &mut XorShift| match rng.below(10) {
