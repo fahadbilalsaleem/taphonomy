@@ -7,6 +7,10 @@ history.
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.2.1 - 2026-11-26
+
 ### Added
 
 - Fuzz targets in `fuzz/`, seeds made by `scripts/fuzz-seeds.sh`, four

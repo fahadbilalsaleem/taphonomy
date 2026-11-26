@@ -1,8 +1,8 @@
 # Taphonomy Project Specification
 
 **Project:** Taphonomy
-**Status:** Active development; M12 complete
-**Version:** 0.2.0
+**Status:** Active development; M15 complete
+**Version:** 0.2.1
 **Owner:** Fahad Bilal Saleem
 **Repository:** <https://github.com/fahadbilalsaleem/taphonomy>
 **Primary Environment:** Linux via WSL2 on Windows
@@ -367,11 +367,11 @@ M13 added the shared artifact writer (`ADR-0020`), M14 the reading of
 exFAT volumes (`ADR-0021`), and M15 the recovery of deleted exFAT files
 (`ADR-0022`), accepted on 2026-11-19 (Appendix F).
 
-The test fixtures are 31 disk images that `scripts/generate-fixtures.sh`
+The test fixtures are 32 disk images that `scripts/generate-fixtures.sh`
 generates from ordinary filesystem tools, byte-identical on every build,
 and EXP-0009's two exFAT images, which Windows made: they are committed
 compressed in `fixtures/exfat/` and expanded by the same script. The
-digests of all 33 are committed in `fixtures/partition/MANIFEST.sha256`.
+digests of all 34 are committed in `fixtures/partition/MANIFEST.sha256`.
 EXP-0008 measured the tool
 against three NIST CFReDS deleted-file-recovery images and The Sleuth Kit:
 every file it recovered from their FAT32 partitions equals the sectors NIST
