@@ -1087,3 +1087,61 @@ exfat-fuse. Unit tests hold it otherwise.
 **Not decided here.** Breaking a tie by other evidence; it needs
 research and a benchmark first. `docs/development/KNOWN_ISSUES.md`
 records the cost.
+
+---
+
+## Appendix H: a `._` file must hold AppleDouble data (2026-11-28)
+
+Section 15 recorded two wrong recoveries that every rule measured left
+in place: `/.Trashes/._501` on NIST's dfr-02 and dfr-05, recovered
+holding fseventsd gzip data. Both are on GPT images, which the binary
+did not read, so no run showed them. Reading GPT (`ADR-0025`) would show
+them, and the author decided on 2026-11-26 that nothing ships while a
+known wrong result stands.
+
+**What they are.** A file whose name starts `._` is, by macOS's
+convention on volumes without Apple's metadata, an AppleDouble header
+file, and RFC 1740 fixes its first four bytes: "The magic number for the
+AppleDouble format is $00051607 or 0x00051607." Neither `._501` starts
+so. Their metadata is no different from the `._501` files recovered
+right on dfr-05-braid, dfr-06, dfr-07-one and dfr-08: ValidDataLength
+equals DataLength (4096), and creation and modification lie within
+hundredths of a second. Nordvik and Axelsson's
+`ExFAT-Experiment-C-Linux-MacOpenFiles` shows how this arises: of its
+live `._` files, 20 were created and never written again, about twelve
+minutes before their neighbours were written, and hold bytes that are
+not AppleDouble. A `._` file that macOS allocated and never wrote holds
+whatever its clusters held before; condition 3 already refuses that case
+when the older data is zeros.
+
+**Decision (the author, 2026-11-28).** Condition 3 gains one test: a
+deleted set whose name starts `._` is refused unless the data up to
+ValidDataLength begins with `00 05 16 07`. The report reads `REFUSED,
+condition 3: a ._ name and data that is not AppleDouble`. Nothing else
+changes; a set with any other name is decided as before.
+
+**Measured** (`scripts/experiments/appledouble-recovered.py` over the
+reports of a `--recover --output` run;
+`scripts/experiments/appledouble-live.py` over live files read with The
+Sleuth Kit), on the binary before this change:
+
+* NIST's 20 exFAT images, the nine GPT ones read through their
+  partition cut out as a volume of its own: 658 files recovered (section
+  5's 656 right and 2 wrong); 15 named `._`, of which 13 begin with the
+  AppleDouble magic and 2 do not, the two `._501` above.
+* The Linux image, Nordvik and Axelsson's 22, the 14 volumes made here,
+  EXP-0009's two and the 12 cards rebuilt from the third set of
+  scenarios, the 14 GPT images among them not read: 230 recovered, one
+  named `._`, AppleDouble.
+* Live files: 520 named `._` on 70 exFAT volumes; 500 begin with the
+  magic and the 20 never-written files above do not; none is a file of
+  another format a user named so.
+
+So the test refuses the two wrong recoveries, keeps every right one
+measured, and on the live corpus would have refused only files whose
+data was never written.
+
+**Not measured here.** Nordvik and Axelsson's eleven GPT images and the
+third set's GPT cards, until `ADR-0025`'s code reads them; their result
+is added to this appendix's acceptance before release. A user file of
+another format named `._` would be refused; none was seen.

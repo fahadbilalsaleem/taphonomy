@@ -590,6 +590,12 @@ detects only zeros, so such data is recovered and labelled `UNVERIFIED`,
 with a caveat that the checks do not show the data is the file's.
 `ADR-0022` section 15 names two such recoveries on NIST's GPT images.
 
+The two named are `._501` files, and a deleted set named `._` whose data
+does not begin with the AppleDouble magic is now refused under condition
+3: macOS names such a file for AppleDouble data, so other data in it is
+stale (`ADR-0022` Appendix H). Stale data under any other name is still
+recovered.
+
 Recorded in `ADR-0022` sections 15 and 16, and `ADR-0019` section 5.
 EXP-0010 is open.
 

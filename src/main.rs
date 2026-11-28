@@ -829,6 +829,10 @@ fn exfat_decision_line(position: ExFatPosition, outcome: &DeletedSetOutcome) -> 
             escaped_name(&file.name),
             "REFUSED, condition 3: zeros only".to_string(),
         ),
+        O::NotAppleDouble { file } => (
+            escaped_name(&file.name),
+            "REFUSED, condition 3: a ._ name and data that is not AppleDouble".to_string(),
+        ),
         // No level word: the level is the summary's (`ADR-0014` Appendix
         // A.10). The extraction lines follow, as for FAT32.
         O::Recoverable { file } => {
@@ -1753,6 +1757,11 @@ mod tests {
                 O::ConditionThreeNotChecked { file: file() },
                 "f.bin         cluster 30, 1024 bytes, conditions 4, 1 and 2 passed, \
                  condition 3 not checked"
+                    .to_string(),
+            ),
+            (
+                O::NotAppleDouble { file: file() },
+                "f.bin         REFUSED, condition 3: a ._ name and data that is not AppleDouble"
                     .to_string(),
             ),
         ];

@@ -592,7 +592,9 @@ fn count_outcome(outcome: &DeletedSetOutcome, counts: &mut RunCounts) {
         }
         O::ConditionOne { .. } => &mut counts.exfat_refused_condition_1,
         O::ConditionTwo { .. } => &mut counts.exfat_refused_condition_2,
-        O::NoValidData { .. } | O::ZerosOnly { .. } => &mut counts.exfat_refused_condition_3,
+        O::NoValidData { .. } | O::ZerosOnly { .. } | O::NotAppleDouble { .. } => {
+            &mut counts.exfat_refused_condition_3
+        }
         // Passed without content read; with it, condition 3 decided too.
         O::ConditionThreeNotChecked { .. } => &mut counts.exfat_passed,
         O::Recoverable { .. } => &mut counts.exfat_recoverable,
@@ -757,6 +759,7 @@ mod tests {
             O::NoValidData { .. } => "condition 3 no valid data",
             O::ConditionThreeNotChecked { .. } => "passed",
             O::ZerosOnly { .. } => "condition 3 zeros",
+            O::NotAppleDouble { .. } => "condition 3 not AppleDouble",
             O::Recoverable { .. } => "recoverable",
         }
     }
@@ -1699,6 +1702,42 @@ mod tests {
         assert_eq!(counts.exfat_not_extracted(), 0);
         assert_eq!(counts.exfat_not_delivered(), 0);
         assert_eq!(counts.coverage(), Coverage::Complete);
+    }
+
+    /// `ADR-0022` Appendix H. A `._` set with gzip data and a set of zeros
+    /// are refused under condition 3 and counted so; a `._` set holding the
+    /// AppleDouble magic is recovered.
+    #[test]
+    fn a_dot_underscore_set_that_is_not_apple_double_counts_as_refused_under_condition_3() {
+        let mut extra = deleted(file("._gz", 30, 512));
+        extra.extend(deleted(file("._ok", 31, 512)));
+        extra.extend(deleted(file("zeros", 32, 512)));
+        let mut vol = with_root(&extra);
+        for c in [30, 31, 32] {
+            vol.chain(&[c]);
+        }
+        vol.image
+            .write(Vol::cluster_offset(30), &[0x1f, 0x8b, 0x08, 0x00]);
+        vol.image
+            .write(Vol::cluster_offset(31), &[0x00, 0x05, 0x16, 0x07]);
+        let boot = vol.boot.clone();
+
+        let (counts, transcript) = analyse_through(
+            &mut vol.image,
+            &boot,
+            Limits::DEFAULT,
+            recovering(None, None),
+        );
+        assert_eq!(
+            decided(&transcript),
+            [
+                "c2 s5 condition 3 not AppleDouble",
+                "c2 s8 recoverable",
+                "c2 s11 condition 3 zeros",
+            ]
+        );
+        assert_eq!(counts.exfat_refused_condition_3(), 2);
+        assert_eq!(counts.exfat_recoverable(), 1);
     }
 
     /// The reference is the content's digest, then another's: one match,

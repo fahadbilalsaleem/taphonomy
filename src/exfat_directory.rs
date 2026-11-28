@@ -250,6 +250,10 @@ pub const MAX_UP_CASE_BYTES: u64 = 131_072;
 /// can be 32 MiB (section 3.1.9), so a cluster is read in pieces of this.
 pub const CONTENT_CHUNK_BYTES: usize = 64 * 1024;
 
+/// The first four bytes of an AppleDouble file (RFC 1740), which a file
+/// named `._` holds when macOS wrote it (`ADR-0022` Appendix H).
+const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
+
 /// A FAT entry marking its cluster bad, and one ending a chain.
 /// Section 4.1.3.
 const FAT_BAD_CLUSTER: u32 = 0xFFFF_FFF7;
@@ -1498,6 +1502,11 @@ pub enum DeletedSetOutcome {
 
     /// Refused under condition 3: every byte up to ValidDataLength is zero.
     ZerosOnly { file: ExFatFile },
+
+    /// Refused under condition 3: the name begins `._` and the data up to
+    /// ValidDataLength does not begin with the AppleDouble magic
+    /// (`ADR-0022` Appendix H).
+    NotAppleDouble { file: ExFatFile },
 
     /// Passed all four conditions among the sets examined. Condition 3 was
     /// settled by the first chunk read (at most `CONTENT_CHUNK_BYTES`, and
@@ -2814,13 +2823,23 @@ impl<'a, R: EvidenceReader> ExFatReader<'a, R> {
 
         let mut chunk = vec![0u8; file.valid_data_length.min(CONTENT_CHUNK_BYTES as u64) as usize];
         let mut zeros = true;
+        // The first bytes of the first chunk, for the AppleDouble test; no
+        // further read is made for it.
+        let mut head = Vec::<u8>::with_capacity(APPLE_DOUBLE_MAGIC.len());
         self.read_valid_data(&file, &mut chunk, &mut |bytes| {
+            if head.is_empty() {
+                head.extend(bytes.iter().take(APPLE_DOUBLE_MAGIC.len()));
+            }
             zeros = bytes.iter().all(|&byte| byte == 0);
             zeros
         })
         .map_err(changed)?;
         Ok(if zeros {
             Outcome::ZerosOnly { file }
+        } else if file.name.starts_with(&[u16::from(b'.'), u16::from(b'_')])
+            && head != APPLE_DOUBLE_MAGIC
+        {
+            Outcome::NotAppleDouble { file }
         } else {
             Outcome::Recoverable { file }
         })
@@ -8072,6 +8091,66 @@ pub(crate) mod tests {
             "{outcomes:?}"
         );
         assert_eq!(reads_from(&reads, 30), Vec::new());
+    }
+
+    /// The outcome for a deleted set called `name` whose cluster 30 begins
+    /// with `data`, the rest zeros, with `valid` bytes valid.
+    fn outcome_for_named_data(name: &str, data: &[u8], valid: u64) -> Outcome {
+        let set = file_set(&utf16(name), 0x20, 30, valid, 512, false);
+        let mut vol = with_root(&deleted(set));
+        vol.chain(&[30]);
+        vol.image.write(Vol::cluster_offset(30), data);
+        decide_one(&mut vol, true)
+    }
+
+    const GZIP: [u8; 4] = [0x1f, 0x8b, 0x08, 0x00];
+
+    /// `ADR-0022` Appendix H: the NIST `._501` shape.
+    #[test]
+    fn a_dot_underscore_set_holding_gzip_data_is_refused_under_condition_3() {
+        let outcome = outcome_for_named_data("._501", &GZIP, 512);
+        assert!(
+            matches!(outcome, Outcome::NotAppleDouble { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_dot_underscore_set_beginning_with_the_apple_double_magic_is_recoverable() {
+        let outcome = outcome_for_named_data("._501", &[0x00, 0x05, 0x16, 0x07, 0x00], 512);
+        assert!(
+            matches!(outcome, Outcome::Recoverable { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Only a name that begins `._` is tested.
+    #[test]
+    fn gzip_data_under_a_name_not_beginning_dot_underscore_is_recoverable() {
+        for name in ["x._", "a.txt", "_.x", ".x"] {
+            let outcome = outcome_for_named_data(name, &GZIP, 512);
+            assert!(
+                matches!(outcome, Outcome::Recoverable { .. }),
+                "{name}: {outcome:?}"
+            );
+        }
+    }
+
+    /// Fewer than four valid bytes cannot hold the magic.
+    #[test]
+    fn a_dot_underscore_set_with_three_valid_bytes_is_refused_under_condition_3() {
+        let outcome = outcome_for_named_data("._501", &[0x00, 0x05, 0x16], 3);
+        assert!(
+            matches!(outcome, Outcome::NotAppleDouble { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// The zeros test keeps its place and its outcome.
+    #[test]
+    fn a_dot_underscore_set_of_zeros_only_is_still_refused_as_zeros_only() {
+        let outcome = outcome_for_named_data("._501", &[], 512);
+        assert!(matches!(outcome, Outcome::ZerosOnly { .. }), "{outcome:?}");
     }
 
     /// The first cluster is zeros and is all the valid data; the second is

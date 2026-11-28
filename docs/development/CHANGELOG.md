@@ -13,6 +13,9 @@ history.
   claim on its clusters has the same time, and none a later one, is
   reported as `a claim at the same time` instead of `a later claim`;
   which files are refused does not change (`ADR-0022` Appendix G).
+- A deleted exFAT file named `._` whose data is not AppleDouble is
+  refused under condition 3 instead of recovered (`ADR-0022`
+  Appendix H).
 
 ## 0.2.1 - 2026-11-26
 
