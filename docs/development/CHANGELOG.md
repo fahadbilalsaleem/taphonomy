@@ -7,6 +7,31 @@ history.
 
 ## Unreleased
 
+### Added
+
+- GPT disks are read (`ADR-0025`). A protective MBR no longer ends the
+  run as unsupported: the primary header is checked (signature, header
+  CRC, MyLBA, entry array and its CRC), the backup header is used when the
+  primary fails a check and the report says which, and each used entry is
+  analysed as an MBR partition is, its artifacts named `p<N>-` by entry
+  index plus one. A disk with no valid header, or with 4096-byte logical
+  blocks, is still not analysed (`coverage none`, exit status 3). Nothing
+  is repaired. A stale GPT behind a legacy MBR is reported and not
+  honoured.
+
+### Changed
+
+- Library API of `taphonomy::analysis` and `taphonomy::extraction`
+  (`ADR-0025`): `Event::GptDetected` is replaced by `Event::GptTable`,
+  `Event::GptPartitionListed` and `Event::GptNotAnalysed`; a partition
+  is named by its number, a `u16`, instead of an `MbrPartition`, in
+  `Event::PartitionUnread`, `Event::PartitionIdentified` (which also
+  gains `declared_type`) and `Event::ExFatIdentifiedFromBackup`; and
+  `Destination::partition` is a `u16` instead of a `u8`. A sector 0 that
+  is a FAT32 or exFAT boot record and also holds a `0xEE` partition type
+  byte is classified as ambiguous, as a boot record listing used entries
+  is.
+
 ### Fixed
 
 - A deleted exFAT file refused under condition 2 because another

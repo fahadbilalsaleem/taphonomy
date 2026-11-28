@@ -34,6 +34,7 @@ use taphonomy::fat_directory::{
 use taphonomy::fat_recovery::{Extraction, Listing, Output};
 use taphonomy::fat32::Fat32BootSector;
 use taphonomy::filesystem::Identification;
+use taphonomy::gpt::{self, HeaderUsed};
 use taphonomy::validation::{Outcome, Validation};
 
 /// One line of usage, printed on any argument error.
@@ -427,7 +428,28 @@ impl Sink for StdoutSink<'_> {
                 p.is_bootable()
             ),
             Event::PartitionsListed => say!(self.out),
-            Event::GptDetected => say!(self.out, "GPT detected: not supported"),
+            Event::GptTable { disk_guid, used } => {
+                let header = match used {
+                    HeaderUsed::Primary => "primary".to_string(),
+                    HeaderUsed::Backup { primary } => format!("backup (primary: {primary})"),
+                };
+                say!(
+                    self.out,
+                    "partition table GPT   disk GUID {}   header {header}",
+                    gpt::guid_text(disk_guid)
+                );
+            }
+            Event::GptPartitionListed(e) => say!(
+                self.out,
+                "partition {}   type {} ({})   start {}   sectors {}   name \"{}\"",
+                e.number,
+                gpt::guid_text(&e.type_guid),
+                gpt::type_name(&e.type_guid),
+                e.start_lba,
+                e.sector_count(),
+                escaped_name(&e.name)
+            ),
+            Event::GptNotAnalysed(reason) => say!(self.out, "GPT not analysed: {reason}"),
             Event::Anomalies(anomalies) => {
                 say!(self.out);
                 say!(self.out, "anomalies");
@@ -436,17 +458,18 @@ impl Sink for StdoutSink<'_> {
                 }
             }
             Event::PartitionUnread { partition, error } => {
-                say_err!("error: partition {}: {error}", partition.index);
+                say_err!("error: partition {partition}: {error}");
             }
             Event::PartitionIdentified {
                 partition,
                 identification,
                 type_match,
+                declared_type,
             } => print_identified(
                 self.out,
-                &format!("partition {}", partition.index),
+                &format!("partition {partition}"),
                 identification,
-                (type_match == Some(false)).then_some(partition.partition_type),
+                declared_type.filter(|_| type_match == Some(false)),
             ),
             Event::WholeImageVolume(identification) => {
                 let filesystem = identification
@@ -477,8 +500,7 @@ impl Sink for StdoutSink<'_> {
             } => {
                 say!(
                     self.out,
-                    "partition {}   filesystem exFAT, identified from its backup boot region",
-                    partition.index
+                    "partition {partition}   filesystem exFAT, identified from its backup boot region"
                 );
                 say!(self.out, "    sector 0             {sector_zero}");
             }

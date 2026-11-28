@@ -15,9 +15,10 @@ the measurement is linked.
 
 * Opens a raw disk image read-only and hashes every byte with SHA-256 before
   reporting anything.
-* Parses the MBR partition table and validates every declared extent
-  against the image's true size. GPT is detected and reported as
-  unsupported.
+* Parses the MBR partition table, or the GPT behind a protective MBR
+  (using the backup header where the primary fails its checks, and
+  repairing nothing), and validates every declared extent against the
+  image's true size.
 * Identifies each partition's filesystem from its structure rather than its
   label: FAT12, FAT16 and FAT32 by cluster count, exFAT and NTFS by
   signature. A partition type that disagrees with the filesystem on it is
@@ -160,14 +161,15 @@ Taphonomy is early, and deliberately narrow.
 * FAT32 and exFAT are analysed and recovered from. FAT12 and FAT16 are
   identified and not read; NTFS and TexFAT are identified and reported
   as unsupported.
-* It reads disk images, not physical devices, and only MBR partition
-  tables with 512-byte sectors. A volume with no partition table is read
-  when sector 0 is a FAT32 or exFAT boot record that lists no partition,
-  as util-linux's libblkid decides; a sector 0 that is neither a table
-  nor a boot record, or is both, is not analysed. GPT disks are not
-  analysed, so NIST's nine GPT exFAT images are
-  unmeasured, among them the two on which ADR-0022 section 15 expects a
-  wrong recovery.
+* It reads disk images, not physical devices, and only MBR and GPT
+  partition tables with 512-byte sectors. A volume with no partition table
+  is read when sector 0 is a FAT32 or exFAT boot record that lists no
+  partition, as util-linux's libblkid decides; a sector 0 that is neither
+  a table nor a boot record, or is both, is not analysed. A GPT with
+  4096-byte logical blocks, or with no valid header, is not analysed.
+  The decisions the binary makes on NIST's nine GPT exFAT images have not
+  yet been compared with EXP-0011's (`ADR-0025` section 6), among them the
+  two on which ADR-0022 section 15 expects a wrong recovery.
 * A FAT32 recovery assumes a file's clusters were contiguous. Deletion
   erases the cluster chain, so for a fragmented file whose clusters have
   since been freed, the run its entry implies can hold content that is

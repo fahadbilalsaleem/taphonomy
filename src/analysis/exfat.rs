@@ -23,7 +23,6 @@ use crate::exfat_directory::{
 use crate::exfat_recovery;
 use crate::extraction::Destination;
 use crate::filesystem::{UnknownReason, VolumeExtent};
-use crate::partition::MbrPartition;
 use crate::validation::{Outcome, validate};
 
 use super::{Event, MAX_DEPTH, Options, RunCounts, Sink, Site, delivery};
@@ -88,8 +87,8 @@ pub enum ExFatPhaseTwoStopped<'a> {
 struct Volume<'a> {
     extent: VolumeExtent,
     limits: Limits,
-    /// MBR entry, 1 to 4, which names the artifacts written from it.
-    partition: u8,
+    /// Partition number, which names the artifacts written from it.
+    partition: u16,
     options: Options<'a>,
 }
 
@@ -144,7 +143,7 @@ struct Pending {
 /// not analysed.
 pub(super) fn report_identified<R: EvidenceReader>(
     evidence: &mut R,
-    site: Site<'_>,
+    site: Site,
     options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
@@ -175,7 +174,7 @@ pub(super) fn report_identified<R: EvidenceReader>(
 /// before.
 pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
     evidence: &mut R,
-    partition: &MbrPartition,
+    partition: u16,
     sector_zero: &UnknownReason,
     extent: VolumeExtent,
     options: Options<'_>,
@@ -191,7 +190,7 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
             let volume = Volume {
                 extent,
                 limits: Limits::DEFAULT,
-                partition: partition.index,
+                partition,
                 options,
             };
             report_volume(evidence, &boot, volume, counts, sink);
@@ -215,7 +214,7 @@ pub(super) fn report_unidentified_0x07<R: EvidenceReader>(
 /// `partition` is `None` for a whole-image volume, which has no partition
 /// to name in an unreadable-region event.
 fn report_boot_failure(
-    partition: Option<&MbrPartition>,
+    partition: Option<u16>,
     failure: ExFatBootFailure,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
@@ -1090,18 +1089,11 @@ mod tests {
 
     #[test]
     fn a_texfat_volume_is_counted_with_the_filesystems_not_analysed() {
-        let partition = MbrPartition {
-            index: 1,
-            boot_indicator: 0,
-            partition_type: 0x07,
-            start_lba: 0,
-            sector_count: 4096,
-        };
         let mut counts = RunCounts::default();
         let mut transcript = Transcript(Vec::new());
 
         report_boot_failure(
-            Some(&partition),
+            Some(1),
             ExFatBootFailure::TexFat(BootRegion::Main),
             &mut counts,
             &mut transcript,
@@ -1114,13 +1106,6 @@ mod tests {
 
     #[test]
     fn refused_boot_regions_are_counted_as_a_rejected_boot_sector() {
-        let partition = MbrPartition {
-            index: 1,
-            boot_indicator: 0,
-            partition_type: 0x07,
-            start_lba: 0,
-            sector_count: 4096,
-        };
         for failure in [
             ExFatBootFailure::Rejected {
                 main: ExFatError::TexFat,
@@ -1132,7 +1117,7 @@ mod tests {
         ] {
             let mut counts = RunCounts::default();
             let mut transcript = Transcript(Vec::new());
-            report_boot_failure(Some(&partition), failure, &mut counts, &mut transcript);
+            report_boot_failure(Some(1), failure, &mut counts, &mut transcript);
 
             assert_eq!(counts.boot_rejected(), 1);
             assert_eq!(counts.coverage(), Coverage::NothingAnalysed);
@@ -1143,20 +1128,13 @@ mod tests {
     /// zero, as `report_partition` does for one that identified nothing.
     fn report_zeroed_0x07(image: &mut MemoryImage) -> (bool, RunCounts, Vec<String>) {
         let extent = boot_tests::extent();
-        let partition = MbrPartition {
-            index: 1,
-            boot_indicator: 0,
-            partition_type: 0x07,
-            start_lba: extent.start_lba,
-            sector_count: extent.sector_count,
-        };
         let sector_zero = UnknownReason::NoSignature { found: [0, 0] };
         let mut counts = RunCounts::default();
         let mut transcript = Transcript(Vec::new());
 
         let reported = report_unidentified_0x07(
             image,
-            &partition,
+            1,
             &sector_zero,
             extent,
             NOT_RECOVERING,
@@ -1177,6 +1155,34 @@ mod tests {
         assert_eq!(counts.unsupported(), 1);
         assert_eq!(counts.boot_rejected(), 0);
         assert_eq!(counts.coverage(), Coverage::NothingAnalysed);
+    }
+
+    /// `ADR-0025` Decision F: the backup boot region is searched behind a
+    /// partition the table declares as a type exFAT uses, and only there.
+    /// `report_partition` is told so by its flag, which the MBR sets for
+    /// type 0x07 and the GPT for Microsoft basic data.
+    #[test]
+    fn the_backup_search_runs_only_where_the_caller_says_the_declared_type_allows_it() {
+        let backup = boot_tests::texfat();
+        for (search, expected) in [
+            (true, vec!["exfat from backup", "texfat"]),
+            (false, vec!["identified"]),
+        ] {
+            let mut image = boot_tests::image_with_regions(&[(12 << 9, &backup)]);
+            let mut counts = RunCounts::default();
+            let mut transcript = Transcript(Vec::new());
+            crate::analysis::report_partition(
+                &mut image,
+                3,
+                boot_tests::extent(),
+                None,
+                search,
+                NOT_RECOVERING,
+                &mut counts,
+                &mut transcript,
+            );
+            assert_eq!(transcript.0, expected, "search {search}");
+        }
     }
 
     #[test]

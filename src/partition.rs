@@ -26,6 +26,7 @@
 use std::fmt;
 
 use crate::filesystem::{Filesystem, identify};
+use crate::gpt::HeaderFailure;
 
 /// Bytes per sector. Fixed at 512 for now; 4Kn media requires a decision
 /// that has not been made.
@@ -109,9 +110,9 @@ pub enum PartitionTable {
     },
     /// A GPT protective MBR.
     ///
-    /// The disk uses GPT. Its real partition table is at LBA 1 and is not
-    /// parsed. Reporting the protective entry as a real partition would be a
-    /// false positive; see ADR-0005 section 4.
+    /// The disk uses GPT. Its real partition table is at LBA 1 and is read by
+    /// [`crate::gpt`]. Reporting the protective entry as a real partition
+    /// would be a false positive; see ADR-0005 section 4.
     GptProtective,
 }
 
@@ -123,13 +124,23 @@ pub enum PartitionTable {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Anomaly {
     /// Boot indicator is neither 0x00 nor 0x80.
-    InvalidBootIndicator { index: u8, value: u8 },
+    InvalidBootIndicator {
+        index: u8,
+        value: u8,
+    },
     /// More than one partition is marked bootable.
-    MultipleBootablePartitions { count: usize },
+    MultipleBootablePartitions {
+        count: usize,
+    },
     /// Two partitions occupy overlapping sectors.
-    OverlappingPartitions { first: u8, second: u8 },
+    OverlappingPartitions {
+        first: u8,
+        second: u8,
+    },
     /// An entry is marked unused but is not zero-filled.
-    NonZeroUnusedEntry { index: u8 },
+    NonZeroUnusedEntry {
+        index: u8,
+    },
     /// Entries are not in ascending start order.
     EntriesOutOfOrder,
     /// A partition claims sectors beyond the end of the evidence. The entry
@@ -142,12 +153,194 @@ pub enum Anomaly {
     },
     /// A partition has a type but occupies no sectors. The entry is left
     /// out of the table.
-    ZeroLengthPartition { index: u8, partition_type: u8 },
+    ZeroLengthPartition {
+        index: u8,
+        partition_type: u8,
+    },
+    /// A protective record whose StartingLBA is not 1. `ADR-0025` Decision A.
+    ProtectiveStartNotOne {
+        start_lba: u32,
+    },
+    /// A protective record whose size is neither the image's sectors minus
+    /// one nor `0xFFFFFFFF`.
+    ProtectiveSizeUnexpected {
+        size: u32,
+        expected: u32,
+    },
+    /// A record other than the protective one is in use beside it, so the
+    /// MBR is a hybrid; it is not analysed as a partition.
+    HybridMbr {
+        index: u8,
+        partition_type: u8,
+    },
+    /// A valid GPT header lies at LBA 1 behind a legacy MBR and is not
+    /// honoured (UEFI 5.3.2). `ADR-0025` Decision B.
+    GptBehindLegacyMbr,
+    /// Sector 1, or the entry array a header there names, could not be read,
+    /// so whether a GPT lies behind the legacy MBR is not known.
+    GptCheckNotMade {
+        reason: String,
+    },
+    /// `ADR-0025` Decisions C to E, reported by [`crate::gpt`].
+    GptRevision {
+        revision: u32,
+    },
+    GptReservedNonZero,
+    GptUsableBeyondEnd {
+        last_usable: u64,
+        image_sectors: u64,
+    },
+    GptBackupMissing {
+        alternate_lba: u64,
+    },
+    GptBackupInvalid {
+        lba: u64,
+        reason: HeaderFailure,
+    },
+    GptBackupNotAtLastLba {
+        alternate_lba: u64,
+        last_lba: u64,
+    },
+    GptHeadersDisagree {
+        field: &'static str,
+    },
+    GptUnusedEntryNotZero {
+        number: u16,
+    },
+    /// Left out of the table, like the three after it.
+    GptEntryStartsAfterEnd {
+        number: u16,
+        start: u64,
+        end: u64,
+    },
+    GptEntryBeyondEnd {
+        number: u16,
+        start: u64,
+        end: u64,
+        image_sectors: u64,
+    },
+    GptEntryTooLarge {
+        number: u16,
+        start: u64,
+        end: u64,
+    },
+    GptEntryOutsideUsable {
+        number: u16,
+        start: u64,
+        end: u64,
+        first_usable: u64,
+        last_usable: u64,
+    },
+    GptOverlappingEntries {
+        first: u16,
+        second: u16,
+    },
+}
+
+impl Anomaly {
+    /// Whether the anomaly is a partition declared and not analysed: a gap
+    /// in the run, not only a remark on the table.
+    pub const fn leaves_partition_out(&self) -> bool {
+        matches!(
+            self,
+            Anomaly::PartitionBeyondEnd { .. }
+                | Anomaly::ZeroLengthPartition { .. }
+                | Anomaly::GptEntryStartsAfterEnd { .. }
+                | Anomaly::GptEntryBeyondEnd { .. }
+                | Anomaly::GptEntryTooLarge { .. }
+        )
+    }
 }
 
 impl fmt::Display for Anomaly {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Anomaly::ProtectiveStartNotOne { start_lba } => write!(
+                f,
+                "protective MBR record starts at sector {start_lba}, expected 1"
+            ),
+            Anomaly::ProtectiveSizeUnexpected { size, expected } => write!(
+                f,
+                "protective MBR record covers {size} sectors, expected {expected} or 4294967295"
+            ),
+            Anomaly::HybridMbr {
+                index,
+                partition_type,
+            } => write!(
+                f,
+                "hybrid MBR: record {index} of type {partition_type:#04x} beside the protective record, not analysed as a partition"
+            ),
+            Anomaly::GptBehindLegacyMbr => {
+                f.write_str("a GPT header lies at sector 1 behind a legacy MBR and is not honoured")
+            }
+            Anomaly::GptCheckNotMade { reason } => write!(
+                f,
+                "sector 1 or the GPT entry array it names could not be read: the check for a GPT behind a legacy MBR was not made ({reason})"
+            ),
+            Anomaly::GptRevision { revision } => {
+                write!(f, "GPT revision is {revision:#010x}, expected 0x00010000")
+            }
+            Anomaly::GptReservedNonZero => f.write_str("GPT header reserved bytes are not zero"),
+            Anomaly::GptUsableBeyondEnd {
+                last_usable,
+                image_sectors,
+            } => write!(
+                f,
+                "GPT usable range ends at sector {last_usable} but evidence has {image_sectors} sectors"
+            ),
+            Anomaly::GptBackupMissing { alternate_lba } => write!(
+                f,
+                "GPT primary header names its backup at sector {alternate_lba}, which is not a sector of the evidence that can hold one"
+            ),
+            Anomaly::GptBackupInvalid { lba, reason } => {
+                write!(f, "GPT backup header at sector {lba} is invalid: {reason}")
+            }
+            Anomaly::GptBackupNotAtLastLba {
+                alternate_lba,
+                last_lba,
+            } => write!(
+                f,
+                "GPT primary header names its backup at sector {alternate_lba}, not the last sector {last_lba}"
+            ),
+            Anomaly::GptHeadersDisagree { field } => {
+                write!(f, "GPT primary and backup headers disagree in {field}")
+            }
+            Anomaly::GptUnusedEntryNotZero { number } => {
+                write!(f, "GPT entry {number} is unused but is not zero-filled")
+            }
+            Anomaly::GptEntryStartsAfterEnd { number, start, end } => write!(
+                f,
+                "GPT entry {number} starts at sector {start} after it ends at {end}; left out"
+            ),
+            Anomaly::GptEntryBeyondEnd {
+                number,
+                start,
+                end,
+                image_sectors,
+            } => write!(
+                f,
+                "GPT entry {number} claims sectors {start}..={end} but evidence has {image_sectors} sectors; left out"
+            ),
+            Anomaly::GptEntryTooLarge { number, start, end } => write!(
+                f,
+                "GPT entry {number} (sectors {start}..={end}) is beyond what the analysis counts; left out"
+            ),
+            Anomaly::GptEntryOutsideUsable {
+                number,
+                start,
+                end,
+                first_usable,
+                last_usable,
+            } => write!(
+                f,
+                "GPT entry {number} (sectors {start}..={end}) is outside the usable range {first_usable}..={last_usable}"
+            ),
+            Anomaly::GptOverlappingEntries { first, second } => {
+                write!(
+                    f,
+                    "GPT entries {first} and {second} occupy overlapping sectors"
+                )
+            }
             Anomaly::InvalidBootIndicator { index, value } => write!(
                 f,
                 "partition {index} boot indicator is {value:#04x}, expected 0x00 or 0x80"
@@ -278,8 +471,31 @@ pub fn classify_sector_zero(sector: &[u8]) -> SectorZero {
 
     let entries =
         || (0..ENTRY_COUNT).map(|slot| &sector[TABLE_OFFSET + slot * ENTRY_SIZE..][..ENTRY_SIZE]);
-    let indicators_valid = entries().all(|e| e[0] == 0x00 || e[0] == 0x80);
+
     let boot_record = identify(sector).filesystem();
+
+    // `ADR-0025` Decision A: UEFI 5.2.3 says a protective record's boot
+    // indicator "Must be ignored", so a 0xEE record makes this a table
+    // whatever the other records' indicators say. Only where the sector is
+    // no boot record: the type offsets lie inside a volume's boot code, so a
+    // 0xEE there on a FAT32 or exFAT boot record leaves it ambiguous, as a
+    // boot record listing used entries is (`ADR-0024`), the 0xEE record
+    // counted as used.
+    if entries().any(|e| e[4] == TYPE_GPT_PROTECTIVE) {
+        return match boot_record {
+            None => SectorZero::Table,
+            Some(filesystem) => SectorZero::Ambiguous {
+                filesystem,
+                used_entries: entries()
+                    .filter(|e| {
+                        e[4] == TYPE_GPT_PROTECTIVE || (e[4] != TYPE_UNUSED && e[12..16] != [0; 4])
+                    })
+                    .count(),
+            },
+        };
+    }
+
+    let indicators_valid = entries().all(|e| e[0] == 0x00 || e[0] == 0x80);
 
     if !indicators_valid {
         return boot_record.map_or(SectorZero::Neither, SectorZero::VolumeBootRecord);
@@ -298,6 +514,44 @@ pub fn classify_sector_zero(sector: &[u8]) -> SectorZero {
             filesystem,
             used_entries,
         }
+    }
+}
+
+/// A GPT protective MBR: the real table is at LBA 1, so no record is reported
+/// as a partition, which would be a false positive (`ADR-0005` section 4).
+/// `ADR-0025` Decision A: the protective record is checked against what UEFI
+/// 5.2.3 requires of it, and any other record in use is a hybrid-MBR anomaly.
+fn protective_outcome(sector: &[u8], protective: usize, image_sectors: u64) -> ParseOutcome {
+    let mut anomalies = Vec::new();
+
+    for slot in 0..ENTRY_COUNT {
+        let base = TABLE_OFFSET + slot * ENTRY_SIZE;
+        let entry = &sector[base..base + ENTRY_SIZE];
+        let index = (slot + 1) as u8;
+        let start_lba = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+        let size = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
+
+        if slot == protective {
+            if start_lba != 1 {
+                anomalies.push(Anomaly::ProtectiveStartNotOne { start_lba });
+            }
+            let expected = u32::try_from(image_sectors.saturating_sub(1)).unwrap_or(u32::MAX);
+            if size != expected && size != u32::MAX {
+                anomalies.push(Anomaly::ProtectiveSizeUnexpected { size, expected });
+            }
+        } else if entry[4] != TYPE_UNUSED {
+            anomalies.push(Anomaly::HybridMbr {
+                index,
+                partition_type: entry[4],
+            });
+        } else if entry.iter().any(|&b| b != 0) {
+            anomalies.push(Anomaly::NonZeroUnusedEntry { index });
+        }
+    }
+
+    ParseOutcome {
+        table: PartitionTable::GptProtective,
+        anomalies,
     }
 }
 
@@ -331,6 +585,12 @@ pub fn parse_mbr(sector: &[u8], image_sectors: u64) -> Result<ParseOutcome, Pars
     let mut anomalies = Vec::new();
     let mut partitions = Vec::new();
 
+    if let Some(protective) = (0..ENTRY_COUNT)
+        .find(|&slot| sector[TABLE_OFFSET + slot * ENTRY_SIZE + 4] == TYPE_GPT_PROTECTIVE)
+    {
+        return Ok(protective_outcome(sector, protective, image_sectors));
+    }
+
     for slot in 0..ENTRY_COUNT {
         let base = TABLE_OFFSET + slot * ENTRY_SIZE;
         let entry = &sector[base..base + ENTRY_SIZE];
@@ -340,15 +600,6 @@ pub fn parse_mbr(sector: &[u8], image_sectors: u64) -> Result<ParseOutcome, Pars
         let partition_type = entry[4];
         let start_lba = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
         let sector_count = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]);
-
-        // A GPT protective entry means the real table is elsewhere. Stop
-        // rather than report the protective partition as a real one.
-        if partition_type == TYPE_GPT_PROTECTIVE {
-            return Ok(ParseOutcome {
-                table: PartitionTable::GptProtective,
-                anomalies,
-            });
-        }
 
         if partition_type == TYPE_UNUSED {
             if entry.iter().any(|&b| b != 0) {
@@ -683,6 +934,236 @@ mod tests {
 
         let outcome = parse_mbr(&s, 131_072).expect("protective MBR parses");
         assert_eq!(outcome.table, PartitionTable::GptProtective);
+    }
+
+    /// A protective MBR as sgdisk writes it: one 0xEE record, boot indicator
+    /// zero, from sector 1 to the end of an image of `sectors` sectors.
+    fn protective_sector(sectors: u64) -> Vec<u8> {
+        let mut s = blank_sector();
+        write_entry(
+            &mut s,
+            0,
+            0x00,
+            TYPE_GPT_PROTECTIVE,
+            1,
+            (sectors - 1) as u32,
+        );
+        s
+    }
+
+    fn anomalies_of(sector: &[u8], sectors: u64) -> Vec<Anomaly> {
+        parse_mbr(sector, sectors)
+            .expect("a protective MBR parses")
+            .anomalies
+    }
+
+    // `ADR-0025` Decision A.
+
+    #[test]
+    fn a_protective_mbr_matching_the_image_has_no_anomaly() {
+        assert_eq!(anomalies_of(&protective_sector(131_072), 131_072), []);
+    }
+
+    #[test]
+    fn a_protective_record_in_any_slot_makes_the_table_a_gpt() {
+        let mut s = blank_sector();
+        write_entry(&mut s, 2, 0x00, TYPE_GPT_PROTECTIVE, 1, 131_071);
+        let outcome = parse_mbr(&s, 131_072).expect("parses");
+        assert_eq!(outcome.table, PartitionTable::GptProtective);
+        assert_eq!(outcome.anomalies, []);
+    }
+
+    #[test]
+    fn a_protective_record_not_starting_at_sector_1_is_an_anomaly() {
+        let mut s = protective_sector(131_072);
+        write_entry(&mut s, 0, 0x00, TYPE_GPT_PROTECTIVE, 2, 131_071);
+        assert_eq!(
+            anomalies_of(&s, 131_072),
+            [Anomaly::ProtectiveStartNotOne { start_lba: 2 }]
+        );
+    }
+
+    #[test]
+    fn a_protective_size_other_than_the_image_or_the_maximum_is_an_anomaly() {
+        let mut s = protective_sector(131_072);
+        write_entry(&mut s, 0, 0x00, TYPE_GPT_PROTECTIVE, 1, 1000);
+        assert_eq!(
+            anomalies_of(&s, 131_072),
+            [Anomaly::ProtectiveSizeUnexpected {
+                size: 1000,
+                expected: 131_071
+            }]
+        );
+    }
+
+    #[test]
+    fn a_protective_size_of_0xffffffff_is_expected_on_any_image() {
+        let mut s = protective_sector(131_072);
+        write_entry(&mut s, 0, 0x00, TYPE_GPT_PROTECTIVE, 1, u32::MAX);
+        assert_eq!(anomalies_of(&s, 131_072), []);
+        assert_eq!(anomalies_of(&s, 1 << 40), []);
+    }
+
+    #[test]
+    fn another_record_in_use_beside_the_protective_one_is_a_hybrid_mbr() {
+        let mut s = protective_sector(131_072);
+        write_entry(&mut s, 1, 0x00, 0x0c, 2048, 1000);
+        let outcome = parse_mbr(&s, 131_072).expect("parses");
+        assert_eq!(outcome.table, PartitionTable::GptProtective);
+        assert_eq!(
+            outcome.anomalies,
+            [Anomaly::HybridMbr {
+                index: 2,
+                partition_type: 0x0c
+            }]
+        );
+    }
+
+    #[test]
+    fn junk_in_an_unused_record_beside_the_protective_one_is_not_a_hybrid() {
+        let mut s = protective_sector(131_072);
+        s[TABLE_OFFSET + ENTRY_SIZE + 1] = 0xFF;
+        assert_eq!(
+            anomalies_of(&s, 131_072),
+            [Anomaly::NonZeroUnusedEntry { index: 2 }]
+        );
+    }
+
+    #[test]
+    fn a_protective_record_is_a_table_whatever_the_boot_indicators() {
+        // A protective record's indicator "Must be ignored" (UEFI 5.2.3):
+        // 0x42 would make the sector neither table nor volume otherwise.
+        let mut s = protective_sector(131_072);
+        s[TABLE_OFFSET] = 0x42;
+        assert_eq!(classify_sector_zero(&s), SectorZero::Table);
+    }
+
+    #[test]
+    fn a_bad_indicator_beside_a_protective_record_is_still_a_table() {
+        let mut s = protective_sector(131_072);
+        write_entry(&mut s, 1, 0x33, 0x0c, 2048, 1000);
+        assert_eq!(classify_sector_zero(&s), SectorZero::Table);
+    }
+
+    #[test]
+    fn a_protective_record_on_a_boot_record_is_ambiguous_not_a_table() {
+        let mut s = fat32_boot_record();
+        write_entry(&mut s, 0, 0x00, TYPE_GPT_PROTECTIVE, 1, 131_071);
+        assert_eq!(
+            classify_sector_zero(&s),
+            SectorZero::Ambiguous {
+                filesystem: Filesystem::Fat32,
+                used_entries: 1
+            }
+        );
+    }
+
+    /// A 0xEE byte at a type offset inside boot code must not make a
+    /// partitionless volume a GPT disk (`ADR-0024` regression guard).
+    #[test]
+    fn a_0xee_byte_at_a_type_offset_of_a_boot_record_is_not_a_table() {
+        for (name, mut s) in [
+            ("fat32", fat32_boot_record()),
+            ("exfat", exfat_boot_record()),
+        ] {
+            s[TABLE_OFFSET + 4] = TYPE_GPT_PROTECTIVE; // offset 450
+            let class = classify_sector_zero(&s);
+            assert_ne!(class, SectorZero::Table, "{name}");
+            assert!(
+                matches!(
+                    class,
+                    SectorZero::Ambiguous {
+                        used_entries: 1,
+                        ..
+                    }
+                ),
+                "{name}: {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_protective_record_is_counted_beside_other_used_entries_on_a_boot_record() {
+        let mut s = fat32_boot_record();
+        write_entry(&mut s, 0, 0x00, TYPE_GPT_PROTECTIVE, 0, 0);
+        write_entry(&mut s, 1, 0x00, 0x0c, 2048, 1000);
+        assert_eq!(
+            classify_sector_zero(&s),
+            SectorZero::Ambiguous {
+                filesystem: Filesystem::Fat32,
+                used_entries: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_new_anomalies_render_without_debug_syntax() {
+        let anomalies = [
+            Anomaly::ProtectiveStartNotOne { start_lba: 2 },
+            Anomaly::ProtectiveSizeUnexpected {
+                size: 1,
+                expected: 2,
+            },
+            Anomaly::HybridMbr {
+                index: 2,
+                partition_type: 0x0c,
+            },
+            Anomaly::GptBehindLegacyMbr,
+            Anomaly::GptCheckNotMade { reason: "x".into() },
+            Anomaly::GptRevision { revision: 1 },
+            Anomaly::GptReservedNonZero,
+            Anomaly::GptUsableBeyondEnd {
+                last_usable: 9,
+                image_sectors: 5,
+            },
+            Anomaly::GptBackupMissing { alternate_lba: 9 },
+            Anomaly::GptBackupInvalid {
+                lba: 9,
+                reason: HeaderFailure::ArrayCrc,
+            },
+            Anomaly::GptBackupNotAtLastLba {
+                alternate_lba: 9,
+                last_lba: 10,
+            },
+            Anomaly::GptHeadersDisagree { field: "DiskGUID" },
+            Anomaly::GptUnusedEntryNotZero { number: 1 },
+            Anomaly::GptEntryStartsAfterEnd {
+                number: 1,
+                start: 5,
+                end: 4,
+            },
+            Anomaly::GptEntryBeyondEnd {
+                number: 1,
+                start: 5,
+                end: 40,
+                image_sectors: 9,
+            },
+            Anomaly::GptEntryTooLarge {
+                number: 1,
+                start: 5,
+                end: 40,
+            },
+            Anomaly::GptEntryOutsideUsable {
+                number: 1,
+                start: 5,
+                end: 40,
+                first_usable: 34,
+                last_usable: 90,
+            },
+            Anomaly::GptOverlappingEntries {
+                first: 1,
+                second: 2,
+            },
+        ];
+        for a in &anomalies {
+            let text = a.to_string();
+            assert!(!text.is_empty() && !text.contains('{') && !text.contains('\n'));
+        }
+        let left_out = anomalies
+            .iter()
+            .filter(|a| a.leaves_partition_out())
+            .count();
+        assert_eq!(left_out, 3, "the three GPT entries left out are gaps");
     }
 
     #[test]

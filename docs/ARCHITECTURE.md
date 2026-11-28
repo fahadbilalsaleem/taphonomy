@@ -1162,7 +1162,7 @@ it remains intent. `ADR-0011` Decision A defines the distinction.
 | Section | Where |
 | --- | --- |
 | 5.2 Evidence Management | `src/evidence.rs` opens evidence read-only; `src/hash.rs` computes SHA-256 (`ADR-0004`) |
-| 5.4 Analysis | `src/partition.rs` (MBR, `ADR-0005`), `src/filesystem.rs`, `src/fat.rs`, `src/fat32.rs`, `src/fat_directory.rs`; exFAT in `src/exfat_boot.rs`, `src/exfat_directory.rs`, `src/exfat_claims.rs` and `src/analysis/exfat.rs` (`ADR-0019`, `ADR-0021`, `ADR-0022`) |
+| 5.4 Analysis | `src/partition.rs` (MBR, `ADR-0005`), `src/gpt.rs` (GPT, `ADR-0025`), `src/filesystem.rs`, `src/fat.rs`, `src/fat32.rs`, `src/fat_directory.rs`; exFAT in `src/exfat_boot.rs`, `src/exfat_directory.rs`, `src/exfat_claims.rs` and `src/analysis/exfat.rs` (`ADR-0019`, `ADR-0021`, `ADR-0022`) |
 | 5.5 Recovery | `src/fat_recovery.rs` assesses and reads a deleted FAT32 file (`ADR-0010`); `src/exfat_recovery.rs` extracts a deleted exFAT set that passed its conditions (`ADR-0022`); `src/extraction.rs` hashes and writes the artifact for both (`ADR-0015`, `ADR-0020`) |
 | 15 Evidence Boundary | `EvidenceFile`; asserted by `tests/read_only.rs` |
 | 16 Reader Abstraction | The `EvidenceReader` trait, `read_exact_at` (`ADR-0007`) |

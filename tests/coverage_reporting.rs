@@ -58,6 +58,19 @@ fn summary(output: &Output) -> String {
     stdout[start + 1..].to_string()
 }
 
+/// A copy of `gpt-protective.img` in `CARGO_TARGET_TMPDIR` whose primary and
+/// backup header CRCs are both wrong (a flipped byte in each DiskGUID), so
+/// no header is valid.
+fn broken_gpt_copy(name: &str) -> String {
+    let mut bytes = fs::read(fixture("gpt-protective.img")).expect("reading the fixture");
+    let backup = bytes.len() - 512;
+    bytes[512 + 56] ^= 0xFF;
+    bytes[backup + 56] ^= 0xFF;
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    fs::write(&path, bytes).expect("writing the damaged copy");
+    path.to_string_lossy().into_owned()
+}
+
 #[test]
 fn a_run_that_analysed_nothing_says_so_and_exits_three() {
     // Four different ways to reach it: a GPT disk, a volume whose boot
@@ -66,15 +79,24 @@ fn a_run_that_analysed_nothing_says_so_and_exits_three() {
     // Each states its own kind, because `CLAUDE.md` section 14 requires an
     // unsupported format, unreadable metadata and an absence to be told
     // apart rather than counted together.
+    // `gpt-protective.img` is read since `ADR-0025`, so the GPT case is a
+    // copy of it with both headers' CRCs broken: a GPT disk with no valid
+    // GPT.
+    let both_headers_broken = broken_gpt_copy("coverage-gpt-both-broken.img");
     let cases = [
-        ("gpt-protective.img", "GPT not analysed           1"),
+        (both_headers_broken.as_str(), "GPT not analysed           1"),
         ("fat32-bad-root-cluster.img", "boot sectors rejected      1"),
         ("mbr-four-partitions.img", "filesystems not identified 4"),
         ("partition-beyond-end.img", "partition entries rejected 1"),
     ];
 
     for (name, gap) in cases {
-        let output = run(&[&fixture(name)]);
+        let path = if name == both_headers_broken {
+            name.to_string()
+        } else {
+            fixture(name)
+        };
+        let output = run(&[&path]);
 
         assert_eq!(output.status.code(), Some(3), "{name} did not exit 3");
 

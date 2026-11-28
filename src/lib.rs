@@ -74,6 +74,7 @@ pub mod fat32;
 pub mod fat_directory;
 pub mod fat_recovery;
 pub mod filesystem;
+pub mod gpt;
 pub mod hash;
 pub mod partition;
 pub mod validation;

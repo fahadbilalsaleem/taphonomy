@@ -42,8 +42,9 @@ pub struct Destination<'a> {
     /// Directory the artifact is created in.
     pub directory: &'a Path,
 
-    /// MBR entry, 1 to 4, of the partition holding the volume.
-    pub partition: u8,
+    /// Number of the partition holding the volume: the MBR entry, 1 to 4, or
+    /// the GPT entry's index plus one (`ADR-0025` Decision G).
+    pub partition: u16,
 
     /// Directory cluster the entry being recovered was read from.
     pub cluster: u32,

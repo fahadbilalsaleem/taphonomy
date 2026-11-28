@@ -557,13 +557,26 @@ Found running the images published with Nordvik and Axelsson's study
 
 ---
 
-## GPT disks are not analysed
+## Some GPT disks are not analysed
 
-A GPT disk is detected and reported as unsupported. NIST's nine GPT
-exFAT deleted-file-recovery images are therefore measured only by
-EXP-0011's scripts, never through the binary. Among them are dfr-02 and
-dfr-05, on which `ADR-0022` section 15 expects two wrong recoveries;
-that they are not seen is not evidence that they are fixed.
+GPT disks are read (`ADR-0025`), including NIST's dfr-02 and dfr-05, on
+which `ADR-0022` section 15 expects two wrong recoveries. Still not
+analysed, each a gap with `coverage none` and exit status 3 where it
+leaves nothing to analyse:
+
+* a GPT with 4096-byte logical blocks;
+* a disk on which neither the primary nor the backup header passes the
+  checks of `ADR-0025` Decision C;
+* an entry that starts after it ends, lies past the image, or reaches
+  past 2 TiB (the analysis counts a volume's sectors in 32 bits), each
+  reported and counted as a partition declared and not analysed.
+
+A mismatch between a partition's type GUID and the filesystem found is
+not reported (`ADR-0025` section 8), and the part of a partition that
+lies inside a truncated image is not read. The Table 5.7 names of
+partition types are those the code knows (EFI System Partition, a
+partition containing a legacy MBR, Microsoft basic data); any other type
+prints as `unknown`.
 
 Recorded in `ADR-0022` section 14 and Appendix F.
 

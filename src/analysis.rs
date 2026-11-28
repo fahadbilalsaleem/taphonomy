@@ -41,6 +41,7 @@ use crate::filesystem::{
     Filesystem, Identification, UnknownReason, VBR_SIZE, VolumeExtent, declared_type_matches,
     identify,
 };
+use crate::gpt::{self, ARRAY_BOUND, Entry as GptEntry, HeaderUsed, NotAnalysed as GptNotAnalysed};
 use crate::hash::Sha256Digest;
 use crate::partition::{
     Anomaly, MbrPartition, ParseError, PartitionTable, SECTOR_SIZE, SectorZero,
@@ -156,8 +157,18 @@ pub enum Event<'a> {
     /// left out as an anomaly is not among them.
     PartitionsListed,
 
-    /// A GPT protective MBR, which this tool does not analyse.
-    GptDetected,
+    /// A GPT was read: its disk GUID and which header was believed.
+    /// Recorded in place of the disk signature. `ADR-0025`.
+    GptTable {
+        disk_guid: &'a [u8; 16],
+        used: &'a HeaderUsed,
+    },
+
+    /// One partition the GPT lists and the analysis keeps, in index order.
+    GptPartitionListed(&'a GptEntry),
+
+    /// A protective MBR whose GPT was not read, and why. A gap.
+    GptNotAnalysed(&'a GptNotAnalysed),
 
     /// Sector 0 is a volume boot record and no partition table, so the
     /// whole image is one volume, analysed as a partition is. Recorded in
@@ -186,10 +197,7 @@ pub enum Event<'a> {
     Anomalies(&'a [Anomaly]),
 
     /// A partition's first sector could not be read.
-    PartitionUnread {
-        partition: &'a MbrPartition,
-        error: &'a Error,
-    },
+    PartitionUnread { partition: u16, error: &'a Error },
 
     /// What a partition's volume boot record identified.
     ///
@@ -197,10 +205,13 @@ pub enum Event<'a> {
     /// type against the identified filesystem: `Some(true)` or
     /// `Some(false)` where one was identified, `None` where none was, or
     /// where the declared type carries no expectation to compare against.
+    /// A GPT partition has no MBR type byte, so `declared_type` is `None`
+    /// and no mismatch is reported for it (`ADR-0025` Decision F).
     PartitionIdentified {
-        partition: &'a MbrPartition,
+        partition: u16,
         identification: &'a Identification,
         type_match: Option<bool>,
+        declared_type: Option<u8>,
     },
 
     /// A partition whose first sector identified nothing, identified as
@@ -210,7 +221,7 @@ pub enum Event<'a> {
     /// the volume's analysis, or by why the region found is not analysed.
     /// `sector_zero` is why the volume's first sector identified nothing.
     ExFatIdentifiedFromBackup {
-        partition: &'a MbrPartition,
+        partition: u16,
         sector_zero: &'a UnknownReason,
     },
 
@@ -512,7 +523,8 @@ pub struct RunCounts {
     /// image, and not analysed. The table's other entries were.
     partitions_anomalous: usize,
 
-    /// A GPT disk, which this tool does not analyse.
+    /// A GPT disk with no valid GPT, or with 4096-byte logical blocks, which
+    /// this tool does not analyse (`ADR-0025`).
     gpt: usize,
 
     /// A partition whose first sector could not be read.
@@ -689,7 +701,8 @@ impl RunCounts {
         self.partitions_anomalous
     }
 
-    /// A GPT disk, which this tool does not analyse.
+    /// A GPT disk with no valid GPT, or with 4096-byte logical blocks, which
+    /// this tool does not analyse.
     pub const fn gpt(&self) -> usize {
         self.gpt
     }
@@ -1081,6 +1094,7 @@ pub fn run<R: EvidenceReader>(
 
             match parse_mbr(&sector, image_sectors) {
                 Ok(outcome) => {
+                    let mut anomalies = outcome.anomalies.clone();
                     match &outcome.table {
                         PartitionTable::Mbr {
                             disk_signature,
@@ -1099,31 +1113,48 @@ pub fn run<R: EvidenceReader>(
                                 if sink.stopped() {
                                     break;
                                 }
-                                report_partition(evidence, p, options, &mut counts, sink);
+                                let extent = VolumeExtent {
+                                    start_lba: p.start_lba,
+                                    sector_count: p.sector_count,
+                                };
+                                report_partition(
+                                    evidence,
+                                    u16::from(p.index),
+                                    extent,
+                                    Some(p.partition_type),
+                                    p.partition_type == EXFAT_OR_NTFS_TYPE,
+                                    options,
+                                    &mut counts,
+                                    sink,
+                                );
                             }
+
+                            // `ADR-0025` Decision B: a GPT left behind a
+                            // legacy MBR is not honoured, and is said so; a
+                            // sector 1 that cannot be read is said too.
+                            anomalies.extend(gpt::stale_header_finding(evidence, image_sectors));
                         }
                         PartitionTable::GptProtective => {
-                            sink.record(Event::GptDetected);
-                            counts.gpt += 1;
+                            report_gpt(
+                                evidence,
+                                image_sectors,
+                                &mut anomalies,
+                                options,
+                                &mut counts,
+                                sink,
+                            );
                         }
                     }
 
                     // A dropped entry is an anomaly of the table and a gap
                     // in the run: a partition was declared and not analysed.
-                    counts.partitions_anomalous += outcome
-                        .anomalies
+                    counts.partitions_anomalous += anomalies
                         .iter()
-                        .filter(|a| {
-                            matches!(
-                                a,
-                                Anomaly::PartitionBeyondEnd { .. }
-                                    | Anomaly::ZeroLengthPartition { .. }
-                            )
-                        })
+                        .filter(|a| a.leaves_partition_out())
                         .count();
 
-                    if !outcome.anomalies.is_empty() {
-                        sink.record(Event::Anomalies(&outcome.anomalies));
+                    if !anomalies.is_empty() {
+                        sink.record(Event::Anomalies(&anomalies));
                     }
                 }
                 Err(e) => {
@@ -1147,17 +1178,27 @@ pub fn run<R: EvidenceReader>(
 /// not stop the others: hashing already succeeded and that result stands on
 /// its own. Each is counted, so that the coverage line states what the run
 /// did not analyse.
+///
+/// A partition of an MBR and one of a GPT go through here alike (`ADR-0025`
+/// Decision F): `declared_type` is the MBR type byte, `None` for a GPT entry,
+/// and `exfat_backup_search` says the table declares a type an exFAT volume
+/// may have (0x07 in an MBR, Microsoft basic data in a GPT).
+#[allow(clippy::too_many_arguments)]
 fn report_partition<R: EvidenceReader>(
     evidence: &mut R,
-    p: &MbrPartition,
+    number: u16,
+    extent: VolumeExtent,
+    declared_type: Option<u8>,
+    exfat_backup_search: bool,
     options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
 ) {
     let mut vbr = [0u8; VBR_SIZE];
-    if let Err(e) = evidence.read_exact_at(p.start_byte(), &mut vbr) {
+    let start_byte = u64::from(extent.start_lba) * SECTOR_SIZE as u64;
+    if let Err(e) = evidence.read_exact_at(start_byte, &mut vbr) {
         sink.record(Event::PartitionUnread {
-            partition: p,
+            partition: number,
             error: &e,
         });
         counts.partition_unread += 1;
@@ -1165,54 +1206,113 @@ fn report_partition<R: EvidenceReader>(
     }
 
     let id = identify(&vbr);
-    let extent = VolumeExtent {
-        start_lba: p.start_lba,
-        sector_count: p.sector_count,
-    };
 
     // `ADR-0019` section 3. An exFAT volume keeps a second copy of its boot
     // region, so a damaged first sector can hide one. Only a partition the
-    // table declares as 0x07, which NTFS also uses, is tried, and a real
-    // NTFS volume never gets here because its first sector identifies it.
-    // It is tried before the partition's heading is recorded, because what
-    // it finds decides what the heading says.
+    // table declares as a type exFAT uses, which NTFS also uses, is tried,
+    // and a real NTFS volume never gets here because its first sector
+    // identifies it. It is tried before the partition's heading is recorded,
+    // because what it finds decides what the heading says.
     if let Identification::Unknown { reason } = &id
-        && p.partition_type == EXFAT_OR_NTFS_TYPE
-        && exfat::report_unidentified_0x07(evidence, p, reason, extent, options, counts, sink)
+        && exfat_backup_search
+        && exfat::report_unidentified_0x07(evidence, number, reason, extent, options, counts, sink)
     {
         return;
     }
 
-    let type_match = id
-        .filesystem()
-        .and_then(|filesystem| declared_type_matches(p.partition_type, filesystem));
+    let type_match = declared_type.and_then(|declared| {
+        id.filesystem()
+            .and_then(|filesystem| declared_type_matches(declared, filesystem))
+    });
     sink.record(Event::PartitionIdentified {
-        partition: p,
+        partition: number,
         identification: &id,
         type_match,
+        declared_type,
     });
 
     let site = Site {
         extent,
-        number: p.index,
-        partition: Some(p),
+        number,
+        partition: Some(number),
     };
     report_volume(evidence, &vbr, &id, site, options, counts, sink);
 }
 
+/// Reads the GPT a protective MBR announces, reports it, and analyses each
+/// partition it keeps as an MBR partition is. `ADR-0025`.
+fn report_gpt<R: EvidenceReader>(
+    evidence: &mut R,
+    image_sectors: u64,
+    anomalies: &mut Vec<Anomaly>,
+    options: Options<'_>,
+    counts: &mut RunCounts,
+    sink: &mut dyn Sink,
+) {
+    match gpt::read(evidence, image_sectors, ARRAY_BOUND) {
+        Err(not_analysed) => {
+            sink.record(Event::GptNotAnalysed(&not_analysed));
+            counts.gpt += 1;
+        }
+        Ok(table) => {
+            sink.record(Event::GptTable {
+                disk_guid: &table.disk_guid,
+                used: &table.used,
+            });
+            for entry in &table.entries {
+                if sink.stopped() {
+                    break;
+                }
+                sink.record(Event::GptPartitionListed(entry));
+            }
+            sink.record(Event::PartitionsListed);
+
+            for entry in &table.entries {
+                if sink.stopped() {
+                    break;
+                }
+                // `gpt` keeps only entries whose first sector and length
+                // fit `u32`, so neither conversion fails; an entry that
+                // somehow did would be skipped, not analysed wrongly.
+                let (Ok(start_lba), Ok(sector_count)) = (
+                    u32::try_from(entry.start_lba),
+                    u32::try_from(entry.sector_count()),
+                ) else {
+                    continue;
+                };
+                report_partition(
+                    evidence,
+                    entry.number,
+                    VolumeExtent {
+                        start_lba,
+                        sector_count,
+                    },
+                    None,
+                    entry.is_basic_data(),
+                    options,
+                    counts,
+                    sink,
+                );
+            }
+            anomalies.extend(table.anomalies);
+        }
+    }
+}
+
 /// Where a volume lies and what names its artifacts.
 #[derive(Clone, Copy)]
-struct Site<'a> {
+struct Site {
     extent: VolumeExtent,
 
-    /// The MBR entry's position, 1 to 4, or 0 for a whole-image volume.
+    /// The partition's number (an MBR entry's position, 1 to 4, or a GPT
+    /// entry's index plus one), or 0 for a whole-image volume.
     /// `ADR-0024` Decision C.
-    number: u8,
+    number: u16,
 
-    /// The MBR entry, or `None` for a whole-image volume, which has none:
-    /// a failure to read it is [`Event::WholeImageUnread`], not a partition
-    /// event.
-    partition: Option<&'a MbrPartition>,
+    /// The partition's number, or `None` for a whole-image volume, which has
+    /// none: a failure to read it is [`Event::WholeImageUnread`], not a
+    /// partition event.
+    partition: Option<u16>,
 }
 
 /// The extent of a volume that is the whole image.
@@ -1255,7 +1355,7 @@ fn report_volume<R: EvidenceReader>(
     evidence: &mut R,
     vbr: &[u8; VBR_SIZE],
     id: &Identification,
-    site: Site<'_>,
+    site: Site,
     options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
@@ -1304,7 +1404,7 @@ fn report_root_directory<R: EvidenceReader>(
     evidence: &mut R,
     boot: &Fat32BootSector,
     extent: VolumeExtent,
-    partition: u8,
+    partition: u16,
     options: Options<'_>,
     counts: &mut RunCounts,
     sink: &mut dyn Sink,
@@ -1398,7 +1498,7 @@ fn search_orphaned_directories<R: EvidenceReader>(
     evidence: &mut R,
     boot: &Fat32BootSector,
     extent: VolumeExtent,
-    partition: u8,
+    partition: u16,
     seen: &mut HashSet<u32>,
     named: &HashSet<u32>,
     options: Options<'_>,
@@ -1605,7 +1705,7 @@ fn report_subdirectory<R: EvidenceReader>(
     evidence: &mut R,
     boot: &Fat32BootSector,
     extent: VolumeExtent,
-    partition: u8,
+    partition: u16,
     next: Pending,
     seen: &mut HashSet<u32>,
     pending: &mut VecDeque<Pending>,
@@ -1758,7 +1858,7 @@ fn report_recovery<R: EvidenceReader>(
     evidence: &mut R,
     boot: &Fat32BootSector,
     extent: VolumeExtent,
-    partition: u8,
+    partition: u16,
     entries: &[Entry],
     listing: Listing,
     part: DirectoryPart,
